@@ -15,8 +15,10 @@ use std::path::{Component, Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
+use xxhash_rust::xxh3::Xxh3;
 
+use crate::config::Verify;
 use crate::fsops::{FsOps, Lease, Stat};
 use crate::metadata::{self, AllowedLosses};
 
@@ -66,9 +68,20 @@ impl Branch {
 }
 
 pub enum MoveOutcome {
-    Moved,
+    /// The move unit was moved; its content has this hash.
+    Moved(Hash),
     /// The move unit was left where it is, untouched.
     Skipped(Skip),
+}
+
+/// The XXH3-128 hash of a file's content, computed while copying it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Hash(u128);
+
+impl fmt::Display for Hash {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{:032x}", self.0)
+    }
 }
 
 /// Why a move unit was skipped.
@@ -124,6 +137,7 @@ pub struct Mover<'a> {
     backing_branch: &'a Branch,
     guard: &'a Guard,
     allowed_losses: AllowedLosses,
+    verify: Verify,
     /// Directories that moves created on the backing branch, by relpath.
     created_dirs: Vec<PathBuf>,
     retiring: VecDeque<Retiring<'a>>,
@@ -137,6 +151,7 @@ struct Retiring<'a> {
     /// directory, which holds the retired source.
     retired_parent: OwnedFd,
     published: Published<'a>,
+    hash: Hash,
     retired_at: Instant,
 }
 
@@ -147,6 +162,7 @@ impl<'a> Mover<'a> {
         backing_branch: &'a Branch,
         guard: &'a Guard,
         allowed_losses: AllowedLosses,
+        verify: Verify,
     ) -> Mover<'a> {
         Mover {
             fs,
@@ -154,6 +170,7 @@ impl<'a> Mover<'a> {
             backing_branch,
             guard,
             allowed_losses,
+            verify,
             created_dirs: Vec::new(),
             retiring: VecDeque::new(),
             finished: Vec::new(),
@@ -227,11 +244,11 @@ impl<'a> Mover<'a> {
     /// wait is over has its source unlinked.
     fn service(&mut self) {
         for retiring in std::mem::take(&mut self.retiring) {
-            let rel = retiring.source.rel;
+            let (rel, hash) = (retiring.source.rel, retiring.hash);
             let finished = match retiring.source.check_lease() {
-                Err(abort) => Some(retiring.roll_back(self.fs).and(Err(abort))),
+                Err(abort) => Some(retiring.roll_back(self.fs).and_then(|()| Err(abort))),
                 Ok(()) if retiring.retired_at.elapsed() >= retire_wait() => {
-                    Some(retiring.unlink(self.fs))
+                    Some(retiring.unlink(self.fs).map(|()| hash))
                 }
                 Ok(()) => {
                     self.retiring.push_back(retiring);
@@ -257,22 +274,8 @@ impl<'a> Mover<'a> {
         let temp = fs
             .create_new(staged_parent.as_fd(), name, TEMP_MODE)
             .context("create temp file")?;
-        let staged = self
-            .copy(&source, &temp)
-            .and_then(|()| {
-                Ok(metadata::copy_file(
-                    fs,
-                    &source.stat,
-                    source.file.as_fd(),
-                    temp.as_fd(),
-                    self.allowed_losses,
-                    &self.backing_branch.path.join(rel),
-                )
-                .context("metadata")?)
-            })
-            .and_then(|()| Ok(fs.fsync(temp.as_fd()).context("fsync temp file")?))
-            .and_then(|()| source.revalidate());
-        let published = staged.and_then(|()| {
+        let staged = self.stage(&source, &temp, rel);
+        let published = staged.and_then(|hash| {
             let dest_parent = make_dirs_like(
                 fs,
                 self.backing_branch,
@@ -282,7 +285,8 @@ impl<'a> Mover<'a> {
                 &mut self.created_dirs,
             )
             .context("create destination directory")?;
-            Ok(publish(fs, dest_parent, name, &staged_parent, &temp)?)
+            let published = publish(fs, dest_parent, name, &staged_parent, &temp)?;
+            Ok((published, hash))
         });
         drop(temp);
         if published.is_err() {
@@ -290,41 +294,134 @@ impl<'a> Mover<'a> {
         }
         remove_empty_dirs(fs, &backing_staging, parent);
 
-        let retiring = retire(fs, source, published?)?;
+        let (published, hash) = published?;
+        let retiring = retire(fs, source, published, hash)?;
         self.retiring.push_back(retiring);
         Ok(())
     }
 
-    /// Copies the source into `dst`, aborting as soon as the source's lease
-    /// breaks. Retiring moves are serviced between chunks, so a long copy
-    /// does not hold them up.
-    fn copy(&mut self, src: &Source, dst: &OwnedFd) -> Result<(), Abort> {
+    /// Writes the staged copy of `source` into the temp file `temp`, makes it
+    /// durable and checks that it is still current. Returns the hash of its
+    /// content.
+    fn stage(&mut self, source: &Source, temp: &OwnedFd, rel: &Path) -> Result<Hash, Abort> {
+        let fs = self.fs;
+        let hash = self.copy(source, temp)?;
+        metadata::copy_file(
+            fs,
+            &source.stat,
+            source.file.as_fd(),
+            temp.as_fd(),
+            self.allowed_losses,
+            &self.backing_branch.path.join(rel),
+        )
+        .context("metadata")?;
+        fs.fsync(temp.as_fd()).context("fsync temp file")?;
+        if self.verify == Verify::Readback {
+            self.read_back(source, temp, hash)?;
+        }
+        source.revalidate()?;
+        Ok(hash)
+    }
+
+    /// Copies the source into `dst`, leaving its holes as holes, and returns
+    /// the hash of its content (holes read as zeros). Aborts as soon as the
+    /// source's lease breaks. Retiring moves are serviced between chunks, so
+    /// a long copy does not hold them up.
+    fn copy(&mut self, src: &Source, dst: &OwnedFd) -> Result<Hash, Abort> {
+        let fs = self.fs;
+        let size = src.stat.st_size.max(0) as u64;
+        let mut hasher = Xxh3::new();
         let mut buf = vec![0; COPY_BUF];
+        let mut offset = 0;
+        while offset < size {
+            let data = fs
+                .seek_data(src.file.as_fd(), offset)
+                .context("copy: find data in source")?;
+            let Some(data) = data.filter(|&data| data < size) else {
+                break;
+            };
+            let hole = fs
+                .seek_hole(src.file.as_fd(), data)
+                .context("copy: find hole in source")?
+                .min(size);
+            hash_zeros(&mut hasher, data - offset);
+            offset = data;
+            while offset < hole {
+                self.service();
+                src.check_lease()?;
+                let len = (hole - offset).min(COPY_BUF as u64) as usize;
+                let n = fs
+                    .read_at(src.file.as_fd(), &mut buf[..len], offset)
+                    .context("copy: read source")?;
+                if n == 0 {
+                    // Truncated, which only a writer can do.
+                    return Err(Abort::Skip(Skip::Changed));
+                }
+                let mut written = 0;
+                while written < n {
+                    match fs
+                        .write_at(dst.as_fd(), &buf[written..n], offset + written as u64)
+                        .context("copy: write temp file")?
+                    {
+                        0 => return Err(anyhow!("copy: write temp file: wrote nothing").into()),
+                        w => written += w,
+                    }
+                }
+                hasher.update(&buf[..n]);
+                offset += n as u64;
+            }
+        }
+        hash_zeros(&mut hasher, size - offset);
+        // Gives the copy the source's size, even if it ends in a hole.
+        fs.set_len(dst.as_fd(), size)
+            .context("copy: set size of temp file")?;
+        Ok(Hash(hasher.digest128()))
+    }
+
+    /// Reads the fsynced copy in the temp file `temp` back from storage, and
+    /// fails the move unless its hash is `hash`.
+    fn read_back(&mut self, src: &Source, temp: &OwnedFd, hash: Hash) -> Result<(), Abort> {
+        let fs = self.fs;
+        fs.drop_cache(temp.as_fd())
+            .context("read back: drop cached pages of temp file")?;
+        let mut hasher = Xxh3::new();
+        let mut buf = vec![0; COPY_BUF];
+        let mut offset = 0;
         loop {
             self.service();
             src.check_lease()?;
-            let n = self
-                .fs
-                .read(src.file.as_fd(), &mut buf)
-                .context("copy: read source")?;
+            let n = fs
+                .read_at(temp.as_fd(), &mut buf, offset)
+                .context("read back: read temp file")?;
             if n == 0 {
-                return Ok(());
+                break;
             }
-            let mut chunk = &buf[..n];
-            while !chunk.is_empty() {
-                let written = self
-                    .fs
-                    .write(dst.as_fd(), chunk)
-                    .context("copy: write temp file")?;
-                chunk = &chunk[written..];
-            }
+            hasher.update(&buf[..n]);
+            offset += n as u64;
         }
+        let read = Hash(hasher.digest128());
+        if read != hash {
+            return Err(Abort::Fail(anyhow!(
+                "read back: the copy's hash {read} differs from the source's {hash}"
+            )));
+        }
+        Ok(())
     }
 }
 
-fn outcome(result: Result<(), Abort>) -> Result<MoveOutcome> {
+/// Feeds `len` zero bytes to `hasher`.
+fn hash_zeros(hasher: &mut Xxh3, mut len: u64) {
+    static ZEROS: [u8; 64 * 1024] = [0; 64 * 1024];
+    while len > 0 {
+        let n = len.min(ZEROS.len() as u64) as usize;
+        hasher.update(&ZEROS[..n]);
+        len -= n as u64;
+    }
+}
+
+fn outcome(result: Result<Hash, Abort>) -> Result<MoveOutcome> {
     match result {
-        Ok(()) => Ok(MoveOutcome::Moved),
+        Ok(hash) => Ok(MoveOutcome::Moved(hash)),
         Err(Abort::Skip(skip)) => Ok(MoveOutcome::Skipped(skip)),
         Err(Abort::Fail(e)) => Err(e),
     }
@@ -465,6 +562,7 @@ fn retire<'a>(
     fs: &dyn FsOps,
     source: Source<'a>,
     published: Published<'a>,
+    hash: Hash,
 ) -> Result<Retiring<'a>, Abort> {
     let (parent, name) = split(source.rel);
     let renamed = staging_dirs(fs, source.cache_branch, parent)
@@ -487,6 +585,7 @@ fn retire<'a>(
         source,
         retired_parent,
         published,
+        hash,
         retired_at: Instant::now(),
     };
     // From here on, every way out either unlinks the retired source or puts

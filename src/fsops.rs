@@ -11,7 +11,10 @@ use std::os::unix::ffi::OsStringExt;
 use std::path::Path;
 
 pub use rustix::fs::Stat;
-use rustix::fs::{AtFlags, Gid, Mode, OFlags, RenameFlags, Timespec, Timestamps, Uid, XattrFlags};
+use rustix::fs::{
+    Advice, AtFlags, Gid, Mode, OFlags, RenameFlags, SeekFrom, Timespec, Timestamps, Uid,
+    XattrFlags,
+};
 
 /// A kernel file lease (`F_SETLEASE`) on an open file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -41,14 +44,31 @@ pub trait FsOps {
     /// Opens the regular file `path` relative to `dir` for reading, without
     /// following a final symlink.
     fn open_read(&self, dir: BorrowedFd, path: &Path) -> io::Result<OwnedFd>;
-    /// Creates `path` relative to `dir` for writing; fails if it exists.
+    /// Creates `path` relative to `dir` for reading and writing; fails if it
+    /// exists.
     fn create_new(&self, dir: BorrowedFd, path: &Path, mode: u32) -> io::Result<OwnedFd>;
     fn mkdir(&self, dir: BorrowedFd, path: &Path, mode: u32) -> io::Result<()>;
     fn fstat(&self, fd: BorrowedFd) -> io::Result<Stat>;
     /// Stats `path` relative to `dir`, without following a final symlink.
     fn stat_at(&self, dir: BorrowedFd, path: &Path) -> io::Result<Stat>;
     fn read(&self, fd: BorrowedFd, buf: &mut [u8]) -> io::Result<usize>;
-    fn write(&self, fd: BorrowedFd, buf: &[u8]) -> io::Result<usize>;
+    /// Reads at `offset`, leaving the file offset as it is.
+    fn read_at(&self, fd: BorrowedFd, buf: &mut [u8], offset: u64) -> io::Result<usize>;
+    /// Writes at `offset`, leaving the file offset as it is.
+    fn write_at(&self, fd: BorrowedFd, buf: &[u8], offset: u64) -> io::Result<usize>;
+    /// The start of the first data region at or after `offset`, or `None` if
+    /// only a hole follows (`SEEK_DATA`). Moves the file offset there.
+    fn seek_data(&self, fd: BorrowedFd, offset: u64) -> io::Result<Option<u64>>;
+    /// The start of the first hole at or after `offset`, which is the end of
+    /// the file if no other hole follows (`SEEK_HOLE`). Moves the file offset
+    /// there.
+    fn seek_hole(&self, fd: BorrowedFd, offset: u64) -> io::Result<u64>;
+    /// Truncates or extends the file to `len` bytes; an extension is a hole.
+    fn set_len(&self, fd: BorrowedFd, len: u64) -> io::Result<()>;
+    /// Evicts the file's clean pages from the page cache, so that the next
+    /// read comes from storage. A hint: some filesystems, such as ZFS, keep a
+    /// cache of their own.
+    fn drop_cache(&self, fd: BorrowedFd) -> io::Result<()>;
     fn fsync(&self, fd: BorrowedFd) -> io::Result<()>;
     /// Renames without ever replacing an existing `to`.
     fn rename_noreplace(
@@ -96,7 +116,7 @@ impl FsOps for RealFs {
     }
 
     fn create_new(&self, dir: BorrowedFd, path: &Path, mode: u32) -> io::Result<OwnedFd> {
-        let flags = OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC;
+        let flags = OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC;
         Ok(rustix::fs::openat(
             dir,
             path,
@@ -121,8 +141,32 @@ impl FsOps for RealFs {
         Ok(rustix::io::read(fd, buf)?)
     }
 
-    fn write(&self, fd: BorrowedFd, buf: &[u8]) -> io::Result<usize> {
-        Ok(rustix::io::write(fd, buf)?)
+    fn read_at(&self, fd: BorrowedFd, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+        Ok(rustix::io::pread(fd, buf, offset)?)
+    }
+
+    fn write_at(&self, fd: BorrowedFd, buf: &[u8], offset: u64) -> io::Result<usize> {
+        Ok(rustix::io::pwrite(fd, buf, offset)?)
+    }
+
+    fn seek_data(&self, fd: BorrowedFd, offset: u64) -> io::Result<Option<u64>> {
+        match rustix::fs::seek(fd, SeekFrom::Data(offset)) {
+            Ok(data) => Ok(Some(data)),
+            Err(rustix::io::Errno::NXIO) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    fn seek_hole(&self, fd: BorrowedFd, offset: u64) -> io::Result<u64> {
+        Ok(rustix::fs::seek(fd, SeekFrom::Hole(offset))?)
+    }
+
+    fn set_len(&self, fd: BorrowedFd, len: u64) -> io::Result<()> {
+        Ok(rustix::fs::ftruncate(fd, len)?)
+    }
+
+    fn drop_cache(&self, fd: BorrowedFd) -> io::Result<()> {
+        Ok(rustix::fs::fadvise(fd, 0, None, Advice::DontNeed)?)
     }
 
     fn fsync(&self, fd: BorrowedFd) -> io::Result<()> {

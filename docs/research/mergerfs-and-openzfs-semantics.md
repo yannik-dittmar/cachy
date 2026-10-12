@@ -69,6 +69,21 @@ The setup in question is a cache pool with the cache branch first and `category.
 | `fsync` | File or directory fsync goes to `zil_commit`. Namespace operations are sync ZIL records, so fsync makes data and directory entries durable. | Z `module/zfs/zfs_vnops.c#L104-L116`, `zil.c#L2572` |
 | `st_dev`/`st_ino` | `st_dev` is a per-dataset anonymous device, **not stable across remounts**. `st_ino` is the object number, unique within a dataset and reusable after a delete. | Z `zpl_super.c#L865`, `zfs_znode_os.c#L607` |
 
+## 3. Checked on a GitHub-hosted runner
+
+Run on 2026-10-12 on `ubuntu-latest` (Ubuntu 24.04, kernel `6.17.0-1022-azure`, zfs-kmod 2.3.4, userland 2.2.2, mergerfs 2.33.5 from apt), using runs [38247293342](https://github.com/yannik-dittmar/cachy/actions/runs/38247293342) and [38247414120](https://github.com/yannik-dittmar/cachy/actions/runs/38247414120). The runner allows passwordless `sudo`, `modprobe zfs`, loop devices and `/dev/fuse`, so privileged integration tests need no special runner.
+
+- **ZFS pools on loop files** (2 GiB each) are created in seconds.
+- **ZFS, ext4 (loop) and tmpfs:** on all three, the `F_RDLCK` lease is granted, and it is refused with `EAGAIN` while a writer holds the file open. `renameat2(RENAME_NOREPLACE)` fails with `EEXIST` on an existing target, and `SEEK_DATA` skips a 4 MiB hole.
+- **Cross-pool `copy_file_range`** (ZFS → ZFS, 64 MiB) succeeds with identical content.
+- **Snapshot pinning:** after unlinking a 64 MiB file held by a snapshot, `df` Use% fell from 4% to 1% while `available` stayed at exactly 1811677184 bytes. This confirms that a cache's fill level must be measured in free space, not Use%.
+- **`atime=off`** shows as `noatime` in mountinfo for a normal ZFS mount.
+- **mergerfs pool** (ZFS cache branch first, then ext4, `category.create=ff`):
+  - `user.mergerfs.branches` is readable from `<pool>/.mergerfs`.
+  - A file written through the pool lands on the cache branch.
+  - While the file is held open for writing through the pool, a lease on the cache-branch file is refused (`EAGAIN`). The open-file guard therefore sees writers that go through mergerfs.
+- **Gotcha:** mergerfs's default `minfreespace=4G` makes every create in tiny test pools fail with `ENOSPC`, so test pools need e.g. `minfreespace=1M`. The apt mergerfs is old (2.33.5), so CI should install a current release `.deb`.
+
 ## Not verified
 
 - The kernel release that relaxed `linkat(AT_EMPTY_PATH)`.

@@ -141,3 +141,14 @@ fn malformed_byte_size_is_refused() {
     assert!(err.contains("threshold"), "stderr:\n{err}");
     assert!(err.contains("`1.5G`"), "stderr:\n{err}");
 }
+
+#[test]
+fn unknown_metadata_loss_kind_is_refused() {
+    let fx = Fixture::new();
+    let config = fx.config("1G", "2G") + "allow_metadata_loss: [owner]\n";
+
+    let err = assert_exit(&fx.run(&config), 1);
+
+    assert!(err.contains("allow_metadata_loss"), "stderr:\n{err}");
+    assert!(err.contains("owner"), "stderr:\n{err}");
+}

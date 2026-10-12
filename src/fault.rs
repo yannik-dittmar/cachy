@@ -15,7 +15,7 @@
 //! run cachy hundreds of times do not wait a second each time.
 
 use std::cell::Cell;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::io;
 use std::os::fd::{BorrowedFd, OwnedFd};
 use std::path::Path;
@@ -23,6 +23,8 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+
+use rustix::fs::Timespec;
 
 use crate::fsops::{FsOps, Lease, RealFs, Stat};
 
@@ -196,5 +198,40 @@ impl FsOps for FaultyFs {
 
     fn lease(&self, fd: BorrowedFd) -> io::Result<Lease> {
         RealFs.lease(fd)
+    }
+
+    fn set_owner(&self, fd: BorrowedFd, uid: u32, gid: u32) -> io::Result<()> {
+        self.count_op("set_owner")?;
+        RealFs.set_owner(fd, uid, gid)
+    }
+
+    fn set_mode(&self, fd: BorrowedFd, mode: u32) -> io::Result<()> {
+        self.count_op("set_mode")?;
+        RealFs.set_mode(fd, mode)
+    }
+
+    fn set_times(&self, fd: BorrowedFd, atime: Timespec, mtime: Timespec) -> io::Result<()> {
+        self.count_op("set_times")?;
+        RealFs.set_times(fd, atime, mtime)
+    }
+
+    fn list_xattrs(&self, fd: BorrowedFd) -> io::Result<Vec<OsString>> {
+        self.count_op("list_xattrs")?;
+        RealFs.list_xattrs(fd)
+    }
+
+    fn get_xattr(&self, fd: BorrowedFd, name: &OsStr) -> io::Result<Vec<u8>> {
+        self.count_op("get_xattr")?;
+        RealFs.get_xattr(fd, name)
+    }
+
+    fn set_xattr(&self, fd: BorrowedFd, name: &OsStr, value: &[u8]) -> io::Result<()> {
+        self.count_op("set_xattr")?;
+        RealFs.set_xattr(fd, name, value)
+    }
+
+    fn remove_xattr(&self, fd: BorrowedFd, name: &OsStr) -> io::Result<()> {
+        self.count_op("remove_xattr")?;
+        RealFs.remove_xattr(fd, name)
     }
 }

@@ -2,6 +2,7 @@ mod config;
 #[cfg(feature = "fault-injection")]
 mod fault;
 mod fsops;
+mod metadata;
 mod recovery;
 mod run;
 mod scan;

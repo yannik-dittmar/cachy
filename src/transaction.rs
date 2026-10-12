@@ -11,13 +11,14 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::io;
 use std::os::fd::{AsFd, OwnedFd};
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 
 use crate::fsops::{FsOps, Lease, Stat};
+use crate::metadata::{self, AllowedLosses};
 
 /// Name of the staging directory at the root of each filesystem cachy writes to.
 pub const STAGING: &str = ".cachy-staging";
@@ -122,6 +123,9 @@ pub struct Mover<'a> {
     cache_branch: &'a Branch,
     backing_branch: &'a Branch,
     guard: &'a Guard,
+    allowed_losses: AllowedLosses,
+    /// Directories that moves created on the backing branch, by relpath.
+    created_dirs: Vec<PathBuf>,
     retiring: VecDeque<Retiring<'a>>,
     finished: Vec<(&'a Path, Result<MoveOutcome>)>,
 }
@@ -142,12 +146,15 @@ impl<'a> Mover<'a> {
         cache_branch: &'a Branch,
         backing_branch: &'a Branch,
         guard: &'a Guard,
+        allowed_losses: AllowedLosses,
     ) -> Mover<'a> {
         Mover {
             fs,
             cache_branch,
             backing_branch,
             guard,
+            allowed_losses,
+            created_dirs: Vec::new(),
             retiring: VecDeque::new(),
             finished: Vec::new(),
         }
@@ -186,6 +193,28 @@ impl<'a> Mover<'a> {
             thread::sleep(RETIRING_POLL);
             self.service();
         }
+    }
+
+    /// Gives each directory that moves created on the backing branch the
+    /// atime and mtime of its cache directory, now that no move adds to it
+    /// any more. Call it after [`Mover::finish`]. Returns the relpaths of the
+    /// directories whose times could not be set, with the error.
+    pub fn date_created_dirs(&mut self) -> Vec<(PathBuf, anyhow::Error)> {
+        let mut failed = Vec::new();
+        for rel in std::mem::take(&mut self.created_dirs) {
+            let dated = open_dirs(self.fs, &self.cache_branch.fd, &rel)
+                .and_then(|cache_dir| self.fs.fstat(cache_dir.as_fd()))
+                .context("stat cache directory")
+                .and_then(|stat| {
+                    let created = open_dirs(self.fs, &self.backing_branch.fd, &rel)
+                        .context("open created directory")?;
+                    metadata::copy_times(self.fs, &stat, created.as_fd()).context("metadata")
+                });
+            if let Err(e) = dated {
+                failed.push((rel, e));
+            }
+        }
+        failed
     }
 
     /// The outcomes of the moves that finished since the last call.
@@ -230,17 +259,30 @@ impl<'a> Mover<'a> {
             .context("create temp file")?;
         let staged = self
             .copy(&source, &temp)
+            .and_then(|()| {
+                Ok(metadata::copy_file(
+                    fs,
+                    &source.stat,
+                    source.file.as_fd(),
+                    temp.as_fd(),
+                    self.allowed_losses,
+                    &self.backing_branch.path.join(rel),
+                )
+                .context("metadata")?)
+            })
             .and_then(|()| Ok(fs.fsync(temp.as_fd()).context("fsync temp file")?))
             .and_then(|()| source.revalidate());
         let published = staged.and_then(|()| {
-            Ok(publish(
+            let dest_parent = make_dirs_like(
                 fs,
                 self.backing_branch,
                 parent,
-                name,
-                &staged_parent,
-                &temp,
-            )?)
+                &self.cache_branch.fd,
+                self.allowed_losses,
+                &mut self.created_dirs,
+            )
+            .context("create destination directory")?;
+            Ok(publish(fs, dest_parent, name, &staged_parent, &temp)?)
         });
         drop(temp);
         if published.is_err() {
@@ -319,20 +361,16 @@ impl Published<'_> {
     }
 }
 
-/// Makes the staged temp file `copy` visible as
-/// `<backing branch>/<parent>/<name>`, never replacing an existing file. An
-/// existing file identical to the copy is adopted as the published copy
-/// instead.
+/// Makes the staged temp file `copy` visible as `<dest_parent>/<name>`,
+/// never replacing an existing file. An existing file identical to the copy
+/// is adopted as the published copy instead.
 fn publish<'a>(
     fs: &dyn FsOps,
-    backing_branch: &Branch,
-    parent: &Path,
+    dest_parent: OwnedFd,
     name: &'a Path,
     staged_parent: &OwnedFd,
     copy: &OwnedFd,
 ) -> Result<Published<'a>> {
-    let dest_parent = make_dirs(fs, &backing_branch.fd, parent, DIR_MODE)
-        .context("create destination directory")?;
     match fs.rename_noreplace(staged_parent.as_fd(), name, dest_parent.as_fd(), name) {
         Ok(()) => {}
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
@@ -402,7 +440,7 @@ fn adopt_identical<'a>(
     let before = Identity::of(&fs.stat_at(dest_parent.as_fd(), name)?);
     let staged = fs.open_read(staged_parent.as_fd(), name)?;
     let existing = fs.open_read(dest_parent.as_fd(), name)?;
-    if !same_content(fs, &staged, &existing)? {
+    if !identical(fs, &staged, &existing)? {
         return Ok(None);
     }
     let identity = Identity::of(&fs.stat_at(dest_parent.as_fd(), name)?);
@@ -530,6 +568,8 @@ struct Source<'a> {
     lease: Lease,
     /// The source as it was when the lease was taken.
     identity: Identity,
+    /// Its metadata then, before the copy read it and changed its atime.
+    stat: Stat,
     /// Space the source takes up on the cache branch.
     allocated: u64,
 }
@@ -606,6 +646,7 @@ impl<'a> Source<'a> {
             lease,
             identity,
             allocated: stat.st_blocks.max(0) as u64 * 512,
+            stat,
         })
     }
 
@@ -649,11 +690,17 @@ impl<'a> Source<'a> {
 }
 
 /// Whether the open files `a` and `b`, read from their start, are regular
-/// files with the same content.
-pub fn same_content(fs: &dyn FsOps, a: &OwnedFd, b: &OwnedFd) -> io::Result<bool> {
+/// files with the same content, owner, group, mode and mtime: either can
+/// stand in for the other without losing anything a move preserves (xattrs
+/// and ACLs aside).
+pub fn identical(fs: &dyn FsOps, a: &OwnedFd, b: &OwnedFd) -> io::Result<bool> {
     let (a_stat, b_stat) = (fs.fstat(a.as_fd())?, fs.fstat(b.as_fd())?);
     let regular = |stat: &Stat| stat.st_mode & libc::S_IFMT == libc::S_IFREG;
-    if !regular(&a_stat) || !regular(&b_stat) || a_stat.st_size != b_stat.st_size {
+    if !regular(&a_stat)
+        || !regular(&b_stat)
+        || a_stat.st_size != b_stat.st_size
+        || !metadata::same(&a_stat, &b_stat)
+    {
         return Ok(false);
     }
     let (mut a_buf, mut b_buf) = (vec![0; COPY_BUF], vec![0; COPY_BUF]);
@@ -697,6 +744,123 @@ pub fn make_dirs(fs: &dyn FsOps, root: &OwnedFd, path: &Path, mode: u32) -> io::
         dir = child;
     }
     Ok(dir)
+}
+
+/// Opens `path` below `branch`, creating missing directories. Each one it
+/// creates gets the owner, mode, xattrs and ACLs of the directory at the same
+/// relpath below `template`, or mode [`DIR_MODE`] if there is none there, and
+/// its relpath is added to `created`. Existing directories are left as they
+/// are.
+pub fn make_dirs_like(
+    fs: &dyn FsOps,
+    branch: &Branch,
+    path: &Path,
+    template: &OwnedFd,
+    allowed_losses: AllowedLosses,
+    created: &mut Vec<PathBuf>,
+) -> Result<OwnedFd> {
+    let mut dir = fs.open_dir(branch.fd.as_fd(), Path::new("."))?;
+    let mut template = Some(fs.open_dir(template.as_fd(), Path::new("."))?);
+    let mut rel = PathBuf::new();
+    for component in normal_components(path) {
+        rel.push(component);
+        template = match template.map(|t| fs.open_dir(t.as_fd(), component)) {
+            Some(Ok(t)) => Some(t),
+            Some(Err(e)) if e.kind() != io::ErrorKind::NotFound => {
+                return Err(e).context("open template directory");
+            }
+            _ => None,
+        };
+        match fs.open_dir(dir.as_fd(), component) {
+            Ok(child) => {
+                dir = child;
+                continue;
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        let new = match &template {
+            Some(template) => {
+                create_dir_like(fs, branch, &dir, component, template, allowed_losses, &rel)?
+            }
+            None => match fs.mkdir(dir.as_fd(), component, DIR_MODE) {
+                Ok(()) => {
+                    fs.fsync(dir.as_fd())?;
+                    true
+                }
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => false,
+                Err(e) => return Err(e.into()),
+            },
+        };
+        if new {
+            created.push(rel.clone());
+        }
+        dir = fs.open_dir(dir.as_fd(), component)?;
+    }
+    Ok(dir)
+}
+
+/// Creates the directory `<parent>/<name>` on `branch` with the metadata of
+/// `template`, except its times. It is built in the staging directory and
+/// renamed into place, so that it never shows without its metadata, not
+/// even after a crash: recovery removes an empty directory left in the
+/// staging directory. Returns false if `<parent>/<name>` appeared meanwhile.
+///
+/// The directories are built in `<staging>/.cachy-staging`, which mirrors no
+/// relpath, since the scanner never descends into the cache branch's staging
+/// directory.
+fn create_dir_like(
+    fs: &dyn FsOps,
+    branch: &Branch,
+    parent: &OwnedFd,
+    name: &Path,
+    template: &OwnedFd,
+    allowed_losses: AllowedLosses,
+    rel: &Path,
+) -> Result<bool> {
+    let new_dirs_path = Path::new(STAGING).join(STAGING);
+    let new_dirs = make_dirs(fs, &branch.fd, &new_dirs_path, STAGING_MODE)
+        .context("create staging directory")?;
+    match fs.mkdir(new_dirs.as_fd(), name, STAGING_MODE) {
+        Ok(()) => {}
+        // Left by a crash and not recovered.
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            fs.rmdir(new_dirs.as_fd(), name)
+                .context("remove leftover directory")?;
+            fs.mkdir(new_dirs.as_fd(), name, STAGING_MODE)
+                .context("create directory")?;
+        }
+        Err(e) => return Err(e).context("create directory"),
+    }
+    let created = (|| {
+        let new = fs.open_dir(new_dirs.as_fd(), name)?;
+        let stat = fs
+            .fstat(template.as_fd())
+            .context("stat template directory")?;
+        metadata::copy_attributes(
+            fs,
+            &stat,
+            template.as_fd(),
+            new.as_fd(),
+            allowed_losses,
+            &branch.path.join(rel),
+        )
+        .context("metadata")?;
+        fs.fsync(new.as_fd()).context("fsync new directory")?;
+        match fs.rename_noreplace(new_dirs.as_fd(), name, parent.as_fd(), name) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return Ok(false),
+            Err(e) => return Err(e).context("rename new directory into place"),
+        }
+        fs.fsync(parent.as_fd()).context("fsync parent directory")?;
+        fs.fsync(new_dirs.as_fd())
+            .context("fsync staging directory")?;
+        Ok(true)
+    })();
+    // Fails harmlessly once the new directory is in place.
+    let _ = fs.rmdir(new_dirs.as_fd(), name);
+    let _ = fs.rmdir(branch.fd.as_fd(), &new_dirs_path);
+    created
 }
 
 pub fn open_dirs(fs: &dyn FsOps, root: &OwnedFd, path: &Path) -> io::Result<OwnedFd> {

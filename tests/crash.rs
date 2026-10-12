@@ -35,6 +35,7 @@ fn fault_injection_is_unavailable_in_normal_builds() {
 #[cfg(feature = "fault-injection")]
 mod fault_injection {
     use std::fs;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::panic::{self, AssertUnwindSafe};
     use std::process::{Command, Output};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -72,9 +73,22 @@ mod fault_injection {
         &CONTENTS[i]
     }
 
+    /// The mode of each of `FILES`, and an xattr on it.
+    fn mode(i: usize) -> u32 {
+        [0o640, 0o4750, 0o600, 0o2644][i]
+    }
+
+    fn xattr(i: usize) -> (&'static str, Vec<u8>) {
+        ("user.cachy-test", format!("file {i}").into_bytes())
+    }
+
     fn create_representative_tree(fx: &Fixture) {
         for (i, (rel, _, mtime)) in FILES.into_iter().enumerate() {
             fx.cache_branch_file(rel, content(i), mtime);
+            let path = fx.on_cache_branch(rel);
+            let (name, value) = xattr(i);
+            common::set_xattr(&path, name, &value).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(mode(i))).unwrap();
         }
         for rel in BACKING_FILES {
             fx.backing_branch_file(rel, rel.as_bytes(), 1_000);
@@ -170,8 +184,8 @@ mod fault_injection {
     }
 
     /// The core invariant: each relpath exists exactly once, on the cache
-    /// branch or the backing branch, with its content, and the backing
-    /// branch's own files are untouched.
+    /// branch or the backing branch, with its content and metadata, and the
+    /// backing branch's own files are untouched.
     fn assert_each_exactly_once(fx: &Fixture, context: &str) {
         for (i, (rel, _, _)) in FILES.into_iter().enumerate() {
             let copies: Vec<_> = [fx.on_cache_branch(rel), fx.on_backing_branch(rel)]
@@ -186,6 +200,25 @@ mod fault_injection {
             assert!(
                 fs::read(&copies[0]).unwrap() == content(i),
                 "{context}: {} differs",
+                copies[0].display()
+            );
+            let meta = fs::metadata(&copies[0]).unwrap();
+            assert_eq!(
+                (meta.mode() & 0o7777, meta.mtime(), meta.uid(), meta.gid()),
+                (
+                    mode(i),
+                    FILES[i].2,
+                    rustix::process::geteuid().as_raw(),
+                    rustix::process::getegid().as_raw()
+                ),
+                "{context}: {} has other metadata",
+                copies[0].display()
+            );
+            let (name, value) = xattr(i);
+            assert_eq!(
+                common::xattrs(&copies[0]).get(name),
+                Some(&value),
+                "{context}: {} lost its xattr",
                 copies[0].display()
             );
         }
@@ -486,5 +519,49 @@ mod fault_injection {
                 true
             });
         }
+    }
+
+    /// Owner, mode and mtime are never optional: a failed chown, chmod or
+    /// utimens fails the move even when xattr and ACL losses are allowed.
+    #[test]
+    fn failed_chown_chmod_or_utimens_fails_the_move() {
+        let rel = "dir/file.bin";
+        let found = Mutex::new(Vec::new());
+        for_every_operation(|n| {
+            let fx = Fixture::new();
+            fx.cache_branch_file(rel, b"content", 1_000);
+            let config = fx.move_everything_config() + "allow_metadata_loss: [xattrs, acls]\n";
+
+            let (out, reached) =
+                run_with_faults(with_short_retire_wait(&fx, &config), &format!("eio@{n}"));
+            let err = common::stderr(&out);
+            let Some(op) = ["set_owner", "set_mode", "set_times"]
+                .into_iter()
+                .find(|op| err.contains(&format!("({op})")))
+            else {
+                return reached;
+            };
+            found.lock().unwrap().push(op);
+
+            assert_eq!(out.status.code(), Some(2), "{op}; stderr:\n{err}");
+            assert!(err.contains("metadata: "), "{op}; stderr:\n{err}");
+            if err.contains("cannot set the times of created directory dir: metadata") {
+                // The move itself had finished; only the run fails.
+                assert_eq!(fs::read(fx.on_backing_branch(rel)).unwrap(), b"content");
+                assert!(!fx.on_cache_branch(rel).exists(), "{op}; stderr:\n{err}");
+            } else {
+                assert!(
+                    err.contains("move of dir/file.bin failed"),
+                    "{op}; stderr:\n{err}"
+                );
+                assert_eq!(fs::read(fx.on_cache_branch(rel)).unwrap(), b"content");
+                assert!(!fx.on_backing_branch(rel).exists(), "{op}; stderr:\n{err}");
+            }
+            true
+        });
+        let mut found = found.into_inner().unwrap();
+        found.sort();
+        found.dedup();
+        assert_eq!(found, ["set_mode", "set_owner", "set_times"]);
     }
 }

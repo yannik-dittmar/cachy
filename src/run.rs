@@ -8,6 +8,7 @@ use anyhow::{Context, Result};
 
 use crate::config::{Config, LeaseType};
 use crate::fsops::{FsOps, Lease};
+use crate::metadata::AllowedLosses;
 use crate::recovery::recover;
 use crate::scan::scan;
 use crate::transaction::{Branch, Guard, MoveOutcome, Mover, STAGING};
@@ -17,6 +18,9 @@ pub struct Outcome {
     pub failed: usize,
     /// Number of staging-directory leftovers that recovery could not resolve.
     pub unresolved: usize,
+    /// Number of directories created on the backing branch whose times could
+    /// not be set.
+    pub undated_dirs: usize,
     /// The run stopped early on an error outside any move.
     pub stopped: bool,
 }
@@ -24,7 +28,7 @@ pub struct Outcome {
 impl Outcome {
     /// Every attempted move succeeded and the run was not cut short.
     pub fn succeeded(&self) -> bool {
-        self.failed == 0 && self.unresolved == 0 && !self.stopped
+        self.failed == 0 && self.unresolved == 0 && self.undated_dirs == 0 && !self.stopped
     }
 }
 
@@ -46,7 +50,14 @@ pub fn run(fs: &dyn FsOps, config: &Config) -> Result<Outcome> {
         },
         minimum_age: config.minimum_age,
     };
-    let unresolved = recover(fs, &cache_branch, &backing_branch, guard.lease);
+    let allowed_losses = AllowedLosses::of(&config.allow_metadata_loss);
+    let unresolved = recover(
+        fs,
+        &cache_branch,
+        &backing_branch,
+        guard.lease,
+        allowed_losses,
+    );
     let mut free = match free_space(fs, &cache_branch) {
         Ok(free) => free,
         Err(e) => {
@@ -54,6 +65,7 @@ pub fn run(fs: &dyn FsOps, config: &Config) -> Result<Outcome> {
             return Ok(Outcome {
                 failed: 0,
                 unresolved,
+                undated_dirs: 0,
                 stopped: true,
             });
         }
@@ -66,6 +78,7 @@ pub fn run(fs: &dyn FsOps, config: &Config) -> Result<Outcome> {
         return Ok(Outcome {
             failed: 0,
             unresolved,
+            undated_dirs: 0,
             stopped: false,
         });
     }
@@ -78,7 +91,7 @@ pub fn run(fs: &dyn FsOps, config: &Config) -> Result<Outcome> {
         .with_context(|| format!("cannot scan cache branch {}", cache_branch.path.display()))?;
     let mut tally = Tally::default();
     let mut stopped = false;
-    let mut mover = Mover::new(fs, &cache_branch, &backing_branch, &guard);
+    let mut mover = Mover::new(fs, &cache_branch, &backing_branch, &guard, allowed_losses);
     for unit in &units {
         tally.record(mover.finished());
         // Retiring moves free their space once their sources are unlinked.
@@ -97,6 +110,13 @@ pub fn run(fs: &dyn FsOps, config: &Config) -> Result<Outcome> {
     }
     mover.finish();
     tally.record(mover.finished());
+    let undated = mover.date_created_dirs();
+    for (rel, e) in &undated {
+        eprintln!(
+            "cachy: error: cannot set the times of created directory {}: {e:#}",
+            rel.display()
+        );
+    }
     if let Ok(now) = free_space(fs, &cache_branch) {
         free = now;
     }
@@ -120,6 +140,7 @@ pub fn run(fs: &dyn FsOps, config: &Config) -> Result<Outcome> {
     Ok(Outcome {
         failed,
         unresolved,
+        undated_dirs: undated.len(),
         stopped,
     })
 }

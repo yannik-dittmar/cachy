@@ -11,6 +11,7 @@ A move writes its copy to a named temp file (`O_CREAT|O_EXCL`) inside a staging 
 ## Consequences
 
 - Each staging directory is visible at the root of the cache pool while a run is active, or after a crash until the next run. cachy removes it once it is empty.
+- A directory that cachy creates on a branch is built with its metadata in `<staging directory>/.cachy-staging`, which mirrors no relpath, and renamed into place with `RENAME_NOREPLACE`, so it never shows without its metadata. Recovery removes such a directory if a crash leaves it behind, empty. Its mtime is set only at the end of the run, which keeps no record of it: after a crash, the directory keeps the mtime of its last change.
 - A branch with nested filesystems (for example child ZFS datasets) gets one staging directory per filesystem, because renames cannot cross filesystems.
 - A crash between publish and retire leaves no leftover, only the relpath on both branches. Recovery cannot find this without walking the backing pool. The next move of that relpath finds an identical file at the destination and adopts it instead of publishing.
 - Filesystems without `RENAME_NOREPLACE` (for example OpenZFS < 2.2.0) are unsupported. The startup capability probe refuses to run on them.

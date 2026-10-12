@@ -6,10 +6,10 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
-use crate::config::Config;
-use crate::fsops::FsOps;
+use crate::config::{Config, LeaseType};
+use crate::fsops::{FsOps, Lease};
 use crate::scan::scan;
-use crate::transaction::{Branch, STAGING, move_file};
+use crate::transaction::{Branch, Guard, MoveOutcome, Mover, STAGING};
 
 pub struct Outcome {
     /// Number of moves that were attempted and failed.
@@ -51,22 +51,26 @@ pub fn run(fs: &dyn FsOps, config: &Config) -> Result<Outcome> {
         config.threshold, config.target
     );
 
+    ignore_lease_break_signal();
+    let guard = Guard {
+        lease: match config.lease_type {
+            LeaseType::Read => Lease::Read,
+            LeaseType::Write => Lease::Write,
+        },
+        minimum_age: config.minimum_age,
+    };
     let units = scan(&cache_branch.path)
         .with_context(|| format!("cannot scan cache branch {}", cache_branch.path.display()))?;
-    let mut moved = 0;
-    let mut failed = 0;
+    let mut tally = Tally::default();
     let mut stopped = false;
+    let mut mover = Mover::new(fs, &cache_branch, &backing_branch, &guard);
     for unit in &units {
-        if free >= config.target {
+        tally.record(mover.finished());
+        // Retiring moves free their space once their sources are unlinked.
+        if free + mover.retiring_bytes() >= config.target {
             break;
         }
-        match move_file(fs, &cache_branch, &backing_branch, &unit.rel) {
-            Ok(()) => moved += 1,
-            Err(e) => {
-                failed += 1;
-                eprintln!("cachy: error: move of {} failed: {e:#}", unit.rel.display());
-            }
-        }
+        mover.start(&unit.rel);
         match free_space(fs, &cache_branch) {
             Ok(now) => free = now,
             Err(e) => {
@@ -75,6 +79,11 @@ pub fn run(fs: &dyn FsOps, config: &Config) -> Result<Outcome> {
                 break;
             }
         }
+    }
+    mover.finish();
+    tally.record(mover.finished());
+    if let Ok(now) = free_space(fs, &cache_branch) {
+        free = now;
     }
 
     for branch in [&cache_branch, &backing_branch] {
@@ -87,8 +96,46 @@ pub fn run(fs: &dyn FsOps, config: &Config) -> Result<Outcome> {
             config.target
         );
     }
-    eprintln!("cachy: run finished: {moved} moved, {failed} failed");
+    let Tally {
+        moved,
+        skipped,
+        failed,
+    } = tally;
+    eprintln!("cachy: run finished: {moved} moved, {skipped} skipped, {failed} failed");
     Ok(Outcome { failed, stopped })
+}
+
+/// Counts finished moves by outcome, logging skips and failures.
+#[derive(Default)]
+struct Tally {
+    moved: usize,
+    skipped: usize,
+    failed: usize,
+}
+
+impl Tally {
+    fn record(&mut self, finished: Vec<(&Path, Result<MoveOutcome>)>) {
+        for (rel, outcome) in finished {
+            match outcome {
+                Ok(MoveOutcome::Moved) => self.moved += 1,
+                Ok(MoveOutcome::Skipped(reason)) => {
+                    self.skipped += 1;
+                    eprintln!("cachy: skipped {}: {reason}", rel.display());
+                }
+                Err(e) => {
+                    self.failed += 1;
+                    eprintln!("cachy: error: move of {} failed: {e:#}", rel.display());
+                }
+            }
+        }
+    }
+}
+
+/// A lease break signals its holder with `SIGIO`, which would terminate cachy.
+/// Moves notice a break by querying their lease instead.
+fn ignore_lease_break_signal() {
+    // SAFETY: setting a signal to SIG_IGN installs no handler code.
+    unsafe { libc::signal(libc::SIGIO, libc::SIG_IGN) };
 }
 
 fn free_space(fs: &dyn FsOps, cache_branch: &Branch) -> Result<u64> {

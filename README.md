@@ -6,7 +6,9 @@ cachy is heavily inspired by [mergerfs-cache-mover](https://github.com/monstermu
 
 ## Status
 
-Early development. Do not use it on real data yet: `cachy run` can already move files, but it has no in-use guard, so it can move a file that an application is still writing.
+Early development. Do not use it on real data yet: `cachy run` moves files and skips files in use, but it cannot yet recover from a crash in the middle of a move.
+
+cachy detects files in use with kernel file leases. One race remains that leases cannot close: an application that looked up a file's path just before cachy retired it, but stalled for more than a second before opening it, opens the retired copy, and its writes are lost.
 
 ## Testing
 

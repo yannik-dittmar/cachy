@@ -45,8 +45,8 @@ One transaction that relocates a single move unit from the cache branch to one b
 _Avoid_: copy, transfer, migration
 
 **In use**:
-A move unit is in use while any process has it open for writing; in-use move units are never moved, and a move unit that becomes in use mid-move aborts that move.
-_Avoid_: busy, locked, open (a file open only for reading is not in use)
+A move unit is in use while any process has it open for writing (or open at all, if the user configured a write lease); in-use move units are never moved, and a move unit that becomes in use mid-move aborts that move.
+_Avoid_: busy, locked, open (by default, a file open only for reading is not in use)
 
 **Stale copy**:
 A file on a backing branch at the same relative path as a file on the cache branch, hidden from applications by the cache branch's copy; a move replaces it.

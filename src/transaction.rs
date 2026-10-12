@@ -265,14 +265,18 @@ impl<'a> Mover<'a> {
 
     /// Finishes retiring moves: one whose lease broke is rolled back at once,
     /// because the opener that broke it stays blocked until then; one whose
-    /// wait is over has its source unlinked.
+    /// wait is over has its source unlinked, unless a link to it was added
+    /// meanwhile, which would keep it on the cache branch.
     fn service(&mut self) {
         for retiring in std::mem::take(&mut self.retiring) {
             let (rels, hash) = (retiring.source.rels, retiring.hash);
             let finished = match retiring.source.check_lease() {
                 Err(abort) => Some(retiring.roll_back(self.fs).and_then(|()| Err(abort))),
                 Ok(()) if retiring.retired_at.elapsed() >= retire_wait() => {
-                    Some(retiring.unlink(self.fs).map(|()| hash))
+                    match retiring.source.check_links() {
+                        Ok(()) => Some(retiring.unlink(self.fs).map(|()| hash)),
+                        Err(abort) => Some(retiring.roll_back(self.fs).and_then(|()| Err(abort))),
+                    }
                 }
                 Ok(()) => {
                     self.retiring.push_back(retiring);
@@ -584,6 +588,7 @@ struct Published<'a> {
     identity: Identity,
 }
 
+/// One name that a copy is published under.
 struct PublishedName<'a> {
     dir: OwnedFd,
     name: &'a Path,
@@ -592,6 +597,7 @@ struct PublishedName<'a> {
 }
 
 impl<'a> Published<'a> {
+    /// A copy published under the one name `<dir>/<name>`.
     fn one(dir: OwnedFd, name: &'a Path, identity: Identity, adopted: bool) -> Published<'a> {
         Published {
             names: vec![PublishedName { dir, name, adopted }],
@@ -1011,6 +1017,16 @@ impl<'a> Source<'a> {
         }
         for rel in self.rels {
             still_at_relpath(self.fs, self.cache_branch, rel, &self.identity)?;
+        }
+        Ok(())
+    }
+
+    /// Skips the move as changed if the source has gained or lost a link
+    /// since it was opened. Adding a link does not break the lease.
+    fn check_links(&self) -> Result<(), Abort> {
+        let now = self.fs.fstat(self.file.as_fd()).context("fstat source")?;
+        if now.st_nlink != self.rels.len() as u64 {
+            return Err(Abort::Skip(Skip::Changed));
         }
         Ok(())
     }

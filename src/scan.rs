@@ -56,8 +56,10 @@ struct Found {
     rel: PathBuf,
     kind: Kind,
     mtime: (i64, i64),
+    /// `st_dev` and `st_ino`, which identify its inode.
     dev: u64,
     ino: u64,
+    /// Its link count.
     nlink: u64,
 }
 

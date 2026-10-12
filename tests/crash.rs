@@ -494,12 +494,7 @@ mod fault_injection {
     const GROUP_MTIME: i64 = 1_000;
 
     fn create_group(fx: &Fixture) {
-        fx.cache_branch_file(GROUP[0], b"content", GROUP_MTIME);
-        for name in &GROUP[1..] {
-            let link = fx.on_cache_branch(name);
-            fs::create_dir_all(link.parent().unwrap()).unwrap();
-            fs::hard_link(fx.on_cache_branch(GROUP[0]), link).unwrap();
-        }
+        fx.cache_branch_hardlinks(&GROUP, b"content", GROUP_MTIME);
     }
 
     /// Each name of the group exists exactly once, on the cache branch or

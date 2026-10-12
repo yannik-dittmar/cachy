@@ -3,37 +3,35 @@
 
 mod common;
 
+const MIB: usize = 1 << 20;
+
 use std::fs::{self, OpenOptions};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
-use common::{Fixture, assert_exit, set_times, set_xattr, xattrs};
-
-/// Creates a hardlink group on the cache branch: `names[0]` with the given
-/// content and mtime, and every other name a link to it.
-fn cache_branch_group(fx: &Fixture, names: &[&str], content: &[u8], mtime: i64) {
-    fx.cache_branch_file(names[0], content, mtime);
-    for name in &names[1..] {
-        let link = fx.on_cache_branch(name);
-        fs::create_dir_all(link.parent().unwrap()).unwrap();
-        fs::hard_link(fx.on_cache_branch(names[0]), link).unwrap();
-    }
-}
+use common::{Fixture, assert_exit, set_times, set_xattr, wait_for, xattrs};
 
 #[test]
 fn group_moves_as_one_inode_with_all_its_links() {
+    let _lock = common::free_space_lock();
     let fx = Fixture::new();
     let names = [
         "downloads/show.mkv",
         "media/show/episode.mkv",
         "media/copy.mkv",
     ];
-    cache_branch_group(&fx, &names, b"episode", 1_000);
+    let content = vec![7; MIB];
+    fx.cache_branch_hardlinks(&names, &content, 1_000);
+    let free_before = fx.cache_branch_free();
 
     let err = assert_exit(&fx.run(&fx.move_everything_config()), 0);
 
     assert!(
         err.contains("1 moved, 0 skipped, 0 failed"),
         "stderr:\n{err}"
+    );
+    assert!(
+        fx.cache_branch_free() >= free_before + MIB as u64,
+        "the group's space on the cache branch was not freed"
     );
     let first = fs::metadata(fx.on_backing_branch(names[0])).unwrap();
     assert_eq!(first.nlink(), 3);
@@ -48,7 +46,7 @@ fn group_moves_as_one_inode_with_all_its_links() {
             (first.dev(), first.ino()),
             "{name} is not a link to the moved inode"
         );
-        assert_eq!(fs::read(fx.on_backing_branch(name)).unwrap(), b"episode");
+        assert!(fs::read(fx.on_backing_branch(name)).unwrap() == content);
     }
     fx.assert_no_staging_directories();
 }
@@ -57,7 +55,7 @@ fn group_moves_as_one_inode_with_all_its_links() {
 fn group_with_a_name_in_an_excluded_directory_is_skipped_and_left_unmodified() {
     let fx = Fixture::new();
     let names = ["appdata/seed.mkv", "media/b.mkv", "media/a.mkv"];
-    cache_branch_group(&fx, &names, b"episode", 1_000);
+    fx.cache_branch_hardlinks(&names, b"episode", 1_000);
     fx.cache_branch_file("media/other.mkv", b"other", 2_000);
     let before = fs::metadata(fx.on_cache_branch(names[0])).unwrap();
     let config = fx.move_everything_config() + "exclude:\n  - /appdata/\n";
@@ -92,7 +90,7 @@ fn group_with_a_name_in_an_excluded_directory_is_skipped_and_left_unmodified() {
 fn moved_group_keeps_mode_xattrs_and_timestamps() {
     let fx = Fixture::new();
     let names = ["a/file.bin", "b/link.bin"];
-    cache_branch_group(&fx, &names, b"content", 1_000);
+    fx.cache_branch_hardlinks(&names, b"content", 1_000);
     let source = fx.on_cache_branch(names[0]);
     set_xattr(&source, "user.comment", b"keep me").unwrap();
     fs::set_permissions(&source, fs::Permissions::from_mode(0o6740)).unwrap();
@@ -117,7 +115,7 @@ fn moved_group_keeps_mode_xattrs_and_timestamps() {
 fn group_open_for_writing_through_any_name_is_skipped_as_in_use() {
     let fx = Fixture::new();
     let names = ["a/file.bin", "b/link.bin"];
-    cache_branch_group(&fx, &names, b"content", 1_000);
+    fx.cache_branch_hardlinks(&names, b"content", 1_000);
     let _writer = OpenOptions::new()
         .write(true)
         .open(fx.on_cache_branch(names[1]))
@@ -145,7 +143,7 @@ fn group_open_for_writing_through_any_name_is_skipped_as_in_use() {
 fn group_with_a_stale_copy_at_a_later_name_fails_and_is_rolled_back() {
     let fx = Fixture::new();
     let names = ["a/file.bin", "b/link.bin", "c/link.bin"];
-    cache_branch_group(&fx, &names, b"content", 1_000);
+    fx.cache_branch_hardlinks(&names, b"content", 1_000);
     fx.backing_branch_file(names[1], b"stale", 500);
 
     let err = assert_exit(&fx.run(&fx.move_everything_config()), 2);
@@ -164,5 +162,36 @@ fn group_with_a_stale_copy_at_a_later_name_fails_and_is_rolled_back() {
     assert!(!fx.on_backing_branch(names[0]).exists());
     assert_eq!(fs::read(fx.on_backing_branch(names[1])).unwrap(), b"stale");
     assert!(!fx.on_backing_branch(names[2]).exists());
+    fx.assert_no_staging_directories();
+}
+
+/// A link added to the source while its names wait in the staging directory
+/// would keep the inode on the cache branch after the move: the move is
+/// rolled back instead.
+#[test]
+fn link_added_while_the_group_waits_in_its_retire_rolls_the_move_back() {
+    let fx = Fixture::new();
+    let names = ["a/file.bin", "b/link.bin"];
+    fx.cache_branch_hardlinks(&names, b"content", 1_000);
+    let child = fx.spawn(&fx.move_everything_config());
+
+    wait_for(&fx.staged_on_cache_branch(names[1]));
+    fs::hard_link(
+        fx.staged_on_cache_branch(names[1]),
+        fx.on_cache_branch("late.bin"),
+    )
+    .unwrap();
+
+    let err = assert_exit(&child.wait_with_output().unwrap(), 0);
+    assert!(
+        err.contains("skipped a/file.bin, b/link.bin: changed"),
+        "stderr:\n{err}"
+    );
+    for name in [names[0], names[1], "late.bin"] {
+        assert_eq!(fs::read(fx.on_cache_branch(name)).unwrap(), b"content");
+    }
+    for name in names {
+        assert!(!fx.on_backing_branch(name).exists(), "{name}");
+    }
     fx.assert_no_staging_directories();
 }

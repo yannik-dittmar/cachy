@@ -10,7 +10,7 @@
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::io;
-use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use std::os::fd::BorrowedFd;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
@@ -128,13 +128,13 @@ fn times(stat: &Stat) -> (Timespec, Timespec) {
 /// Copies the owner, group and timestamps of a symlink, whose metadata is
 /// `stat`, to the symlink `<dir>/<name>`, and checks that they arrived
 /// unchanged.
-pub fn copy_symlink(fs: &dyn FsOps, stat: &Stat, dir: &OwnedFd, name: &Path) -> Result<()> {
-    fs.set_owner_at(dir.as_fd(), name, stat.st_uid, stat.st_gid)
+pub fn copy_symlink(fs: &dyn FsOps, stat: &Stat, dir: BorrowedFd, name: &Path) -> Result<()> {
+    fs.set_owner_at(dir, name, stat.st_uid, stat.st_gid)
         .context("chown")?;
     let (atime, mtime) = times(stat);
-    fs.set_times_at(dir.as_fd(), name, atime, mtime)
+    fs.set_times_at(dir, name, atime, mtime)
         .context("set timestamps")?;
-    let copied = fs.stat_at(dir.as_fd(), name).context("stat the copy")?;
+    let copied = fs.stat_at(dir, name).context("stat the copy")?;
     check_preserved(stat, &copied)
 }
 

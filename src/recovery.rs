@@ -13,9 +13,9 @@
 //! - A retired symlink is deleted if its published counterpart is an
 //!   identical symlink, and renamed back otherwise. Nothing can have a
 //!   symlink open, so it takes no lease.
-//! - A temp file or temp symlink (in a backing branch's staging directory) is
-//!   deleted. A move retires its source only once the copy is published, so a
-//!   temp file is never the only copy of anything.
+//! - A temp file (in a backing branch's staging directory) is deleted. A move
+//!   retires its source only once the copy is published, so a temp file is
+//!   never the only copy of anything.
 
 use std::io;
 use std::os::fd::{AsFd, OwnedFd};

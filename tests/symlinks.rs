@@ -172,7 +172,7 @@ fn symlink_younger_than_the_minimum_age_stays() {
 
 /// Recovery resolves the symlinks that unfinished moves left in staging
 /// directories: a retired symlink is deleted if its published copy is
-/// identical, and renamed back otherwise; a temp symlink is deleted.
+/// identical, and renamed back otherwise; a temp file is deleted.
 #[test]
 fn recovery_resolves_symlink_leftovers() {
     let fx = Fixture::new();

@@ -186,8 +186,8 @@ impl<'a> Mover<'a> {
     }
 
     /// Moves `rel`, a file of the given kind, from the cache branch to the
-    /// backing branch, unless the guard finds it in use. A special file is
-    /// skipped. The outcome is reported by [`Mover::finished`], possibly only
+    /// backing branch, unless the guard finds it in use; skips it if it is a
+    /// special file. The outcome is reported by [`Mover::finished`], possibly only
     /// after later moves have started.
     ///
     /// A skipped move, or one that fails before publish, leaves the source
@@ -195,21 +195,21 @@ impl<'a> Mover<'a> {
     /// branch is not replaced yet: the publish fails and the move with it.
     pub fn start(&mut self, rel: &'a Path, kind: Kind) {
         self.service();
-        let result = match kind {
+        let finished = match kind {
             Kind::Regular => {
                 while self.retiring.len() >= MAX_RETIRING {
                     thread::sleep(RETIRING_POLL);
                     self.service();
                 }
-                match self.transact(rel) {
-                    Ok(()) => return,
-                    Err(abort) => Err(abort),
-                }
+                // A move that reaches its retire finishes once serviced.
+                self.transact(rel).err().map(Err)
             }
-            Kind::Symlink => self.transact_symlink(rel),
-            Kind::Special => Err(Abort::Skip(Skip::SpecialFile)),
+            Kind::Symlink => Some(self.transact_symlink(rel)),
+            Kind::Special => Some(Err(Abort::Skip(Skip::SpecialFile))),
         };
-        self.finished.push((rel, outcome(result)));
+        if let Some(result) = finished {
+            self.finished.push((rel, outcome(result)));
+        }
     }
 
     /// Space on the cache branch that retiring moves free once their sources
@@ -327,10 +327,13 @@ impl<'a> Mover<'a> {
         let (backing_staging, staged_parent) = staging_dirs(fs, self.backing_branch, parent)
             .context("create staging directory on the backing branch")?;
 
-        fs.symlink(&source.target, staged_parent.as_fd(), name)
-            .context("create temp symlink")?;
-        let published = metadata::copy_symlink(fs, &source.stat, &staged_parent, name)
-            .context("metadata")
+        let published = fs
+            .symlink(&source.target, staged_parent.as_fd(), name)
+            .context("create temp file")
+            .and_then(|()| {
+                metadata::copy_symlink(fs, &source.stat, staged_parent.as_fd(), name)
+                    .context("metadata")
+            })
             .map_err(Abort::from)
             .and_then(|()| source.revalidate())
             .and_then(|()| {
@@ -572,10 +575,9 @@ fn unpublish(fs: &dyn FsOps, dest_parent: &OwnedFd, name: &Path, copy: &OwnedFd)
 
 /// Removes `<dest_parent>/<name>` if it is still the inode of `copy`.
 fn unpublish_inode(fs: &dyn FsOps, dest_parent: &OwnedFd, name: &Path, copy: &Stat) {
-    let inode = |stat: &Stat| (stat.st_dev, stat.st_ino);
     let ours = fs
         .stat_at(dest_parent.as_fd(), name)
-        .is_ok_and(|at_name| inode(&at_name) == inode(copy));
+        .is_ok_and(|at_name| Identity::of(copy).same_inode(&at_name));
     if ours && fs.unlink(dest_parent.as_fd(), name).is_ok() {
         let _ = fs.fsync(dest_parent.as_fd());
     }
@@ -592,7 +594,7 @@ fn publish_symlink<'a>(
 ) -> Result<Published<'a>> {
     let staged = fs
         .stat_at(staged_parent.as_fd(), name)
-        .context("stat temp symlink")?;
+        .context("stat temp file")?;
     match fs.rename_noreplace(staged_parent.as_fd(), name, dest_parent.as_fd(), name) {
         Ok(()) => {}
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
@@ -605,7 +607,7 @@ fn publish_symlink<'a>(
                     .context("stat existing symlink")?,
             );
             fs.unlink(staged_parent.as_fd(), name)
-                .context("delete temp symlink")?;
+                .context("delete temp file")?;
             fs.fsync(staged_parent.as_fd())
                 .context("fsync staging directory on the backing branch")?;
             return Ok(Published {
@@ -632,14 +634,12 @@ fn publish_symlink<'a>(
             ))
         });
     match identity {
-        Ok(identity) if (identity.dev, identity.ino) == (staged.st_dev, staged.st_ino) => {
-            Ok(Published {
-                dir: dest_parent,
-                name,
-                identity,
-                adopted: false,
-            })
-        }
+        Ok(identity) if identity.same_inode(&staged) => Ok(Published {
+            dir: dest_parent,
+            name,
+            identity,
+            adopted: false,
+        }),
         Ok(_) => Err(anyhow!("publish: the published copy was replaced")),
         Err(e) => {
             unpublish_inode(fs, &dest_parent, name, &staged);
@@ -767,10 +767,7 @@ impl Retiring<'_> {
     }
 
     fn remove_empty_staging_dirs(&self, fs: &dyn FsOps) {
-        let staging = fs.open_dir(self.source.cache_branch.fd.as_fd(), Path::new(STAGING));
-        if let Ok(staging) = staging {
-            remove_empty_dirs(fs, &staging, split(self.source.rel).0);
-        }
+        remove_empty_retired_dirs(fs, self.source.cache_branch, self.source.rel);
     }
 }
 
@@ -818,6 +815,11 @@ impl Identity {
             mtime: (stat.st_mtime, stat.st_mtime_nsec),
             ctime: (stat.st_ctime, stat.st_ctime_nsec),
         }
+    }
+
+    /// Whether `stat` is of the same inode, changed or not.
+    fn same_inode(&self, stat: &Stat) -> bool {
+        (self.dev, self.ino) == (stat.st_dev, stat.st_ino)
     }
 
     /// Whether the source changed (by its later of mtime and ctime) less than
@@ -885,22 +887,7 @@ impl<'a> Source<'a> {
         if Identity::of(&now) != self.identity {
             return Err(Abort::Skip(Skip::Changed));
         }
-        let (parent, name) = split(self.rel);
-        let at_path = open_dirs(self.fs, &self.cache_branch.fd, parent)
-            .and_then(|dir| self.fs.stat_at(dir.as_fd(), name));
-        match at_path {
-            Ok(stat) if Identity::of(&stat) == self.identity => Ok(()),
-            Ok(_) => Err(Abort::Skip(Skip::Changed)),
-            Err(e)
-                if matches!(
-                    e.raw_os_error(),
-                    Some(libc::ENOENT | libc::ENOTDIR | libc::ELOOP)
-                ) =>
-            {
-                Err(Abort::Skip(Skip::Changed))
-            }
-            Err(e) => Err(anyhow::Error::from(e).context("look up source path").into()),
-        }
+        still_at_relpath(self.fs, self.cache_branch, self.rel, &self.identity)
     }
 
     /// Skips the move as in use once a conflicting open has started to break
@@ -911,6 +898,40 @@ impl<'a> Source<'a> {
             return Err(Abort::Skip(Skip::InUse));
         }
         Ok(())
+    }
+}
+
+/// Skips the move as changed unless `rel`, looked up afresh from the cache
+/// branch root, still names the source as `identity` describes it.
+fn still_at_relpath(
+    fs: &dyn FsOps,
+    cache_branch: &Branch,
+    rel: &Path,
+    identity: &Identity,
+) -> Result<(), Abort> {
+    let (parent, name) = split(rel);
+    let at_path =
+        open_dirs(fs, &cache_branch.fd, parent).and_then(|dir| fs.stat_at(dir.as_fd(), name));
+    match at_path {
+        Ok(stat) if Identity::of(&stat) == *identity => Ok(()),
+        Ok(_) => Err(Abort::Skip(Skip::Changed)),
+        Err(e)
+            if matches!(
+                e.raw_os_error(),
+                Some(libc::ENOENT | libc::ENOTDIR | libc::ELOOP)
+            ) =>
+        {
+            Err(Abort::Skip(Skip::Changed))
+        }
+        Err(e) => Err(anyhow::Error::from(e).context("look up source path").into()),
+    }
+}
+
+/// Removes the mirror of `rel`'s parent in the cache branch's staging
+/// directory, and its ancestors, while they are empty.
+fn remove_empty_retired_dirs(fs: &dyn FsOps, cache_branch: &Branch, rel: &Path) {
+    if let Ok(staging) = fs.open_dir(cache_branch.fd.as_fd(), Path::new(STAGING)) {
+        remove_empty_dirs(fs, &staging, split(rel).0);
     }
 }
 
@@ -967,22 +988,7 @@ impl<'a> Link<'a> {
     /// relpath, looked up afresh from the cache branch root, still names the
     /// symlink, unchanged.
     fn revalidate(&self) -> Result<(), Abort> {
-        let (parent, name) = split(self.rel);
-        let at_path = open_dirs(self.fs, &self.cache_branch.fd, parent)
-            .and_then(|dir| self.fs.stat_at(dir.as_fd(), name));
-        match at_path {
-            Ok(stat) if Identity::of(&stat) == self.identity => Ok(()),
-            Ok(_) => Err(Abort::Skip(Skip::Changed)),
-            Err(e)
-                if matches!(
-                    e.raw_os_error(),
-                    Some(libc::ENOENT | libc::ENOTDIR | libc::ELOOP)
-                ) =>
-            {
-                Err(Abort::Skip(Skip::Changed))
-            }
-            Err(e) => Err(anyhow::Error::from(e).context("look up source path").into()),
-        }
+        still_at_relpath(self.fs, self.cache_branch, self.rel, &self.identity)
     }
 
     /// Removes the symlink from the cache branch once `published` is: renames
@@ -1003,21 +1009,32 @@ impl<'a> Link<'a> {
             Ok(retired_parent) => retired_parent,
             Err(e) => {
                 let _ = published.remove(fs);
-                self.remove_empty_staging_dirs();
+                remove_empty_retired_dirs(fs, self.cache_branch, self.rel);
                 return Err(Abort::Fail(e));
             }
         };
         let retired = fs
             .stat_at(retired_parent.as_fd(), name)
             .context("retire: stat retired source");
-        // The rename changed its ctime; its link text cannot change in place.
-        let unlinked = match retired {
-            Ok(stat) if (stat.st_dev, stat.st_ino) == (self.identity.dev, self.identity.ino) => fs
+        // The rename changed its ctime, so the retired symlink's link text is
+        // checked too: a symlink that replaced the source between the
+        // revalidation and the rename may reuse its inode. The published copy
+        // is not read, which would change its atime.
+        let is_source = retired.and_then(|stat| {
+            if !self.identity.same_inode(&stat) || !metadata::same(&stat, &self.stat) {
+                return Ok(false);
+            }
+            let target = fs
+                .read_link(retired_parent.as_fd(), name)
+                .context("retire: read retired source")?;
+            Ok(target == self.target)
+        });
+        let unlinked = match is_source {
+            Ok(true) => fs
                 .unlink(retired_parent.as_fd(), name)
                 .context("retire: unlink source")
                 .map_err(Abort::from),
-            // Replaced between the revalidation and the rename.
-            Ok(_) => Err(Abort::Skip(Skip::Changed)),
+            Ok(false) => Err(Abort::Skip(Skip::Changed)),
             Err(e) => Err(Abort::Fail(e)),
         };
         if let Err(abort) = unlinked {
@@ -1025,8 +1042,12 @@ impl<'a> Link<'a> {
                 .rename_noreplace(retired_parent.as_fd(), name, self.dir.as_fd(), name)
                 .context("roll back: rename source back")
                 .and_then(|()| fs.fsync(self.dir.as_fd()).context("fsync source directory"))
+                .and_then(|()| {
+                    fs.fsync(retired_parent.as_fd())
+                        .context("fsync staging directory on the cache branch")
+                })
                 .and_then(|()| published.remove(fs).context("roll back"));
-            self.remove_empty_staging_dirs();
+            remove_empty_retired_dirs(fs, self.cache_branch, self.rel);
             rolled_back?;
             return Err(abort);
         }
@@ -1034,17 +1055,8 @@ impl<'a> Link<'a> {
             .fsync(retired_parent.as_fd())
             .context("fsync staging directory on the cache branch")
             .and_then(|()| fs.fsync(self.dir.as_fd()).context("fsync source directory"));
-        self.remove_empty_staging_dirs();
+        remove_empty_retired_dirs(fs, self.cache_branch, self.rel);
         Ok(synced?)
-    }
-
-    fn remove_empty_staging_dirs(&self) {
-        let staging = self
-            .fs
-            .open_dir(self.cache_branch.fd.as_fd(), Path::new(STAGING));
-        if let Ok(staging) = staging {
-            remove_empty_dirs(self.fs, &staging, split(self.rel).0);
-        }
     }
 }
 

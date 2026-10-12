@@ -28,10 +28,10 @@ pub enum Kind {
     Special,
 }
 
-/// Regular files, symlinks and special files under `root` that `exclusions` leave, ordered by
-/// mtime, then relpath. The walk prunes excluded directories, the staging
-/// directory and directories on other filesystems. Directories that cannot be
-/// read are skipped with a warning.
+/// Regular files, symlinks and special files under `root` that `exclusions`
+/// leave, ordered by mtime, then relpath. The walk prunes excluded
+/// directories, the staging directory and directories on other filesystems.
+/// Directories that cannot be read are skipped with a warning.
 pub fn scan(root: &Path, exclusions: &Exclusions) -> std::io::Result<Vec<Entry>> {
     let dev = fs::metadata(root)?.dev();
     let mut entries = Vec::new();

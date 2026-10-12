@@ -1,6 +1,7 @@
 mod common;
 
 use std::fs;
+use std::time::{Duration, Instant};
 
 use common::{Fixture, FsKind, assert_exit, free_space_lock, skip};
 
@@ -76,6 +77,25 @@ fn run_moves_oldest_files_until_free_space_reaches_target() {
     for i in 3..5 {
         assert_kept(&fx, i);
     }
+}
+
+/// A retired source waits about a second before it is unlinked; later moves
+/// must not wait for it.
+#[test]
+fn many_small_files_move_without_waiting_for_each_retire() {
+    let fx = Fixture::new();
+    for i in 0..20 {
+        fx.cache_branch_file(&format!("small/{i}.txt"), b"tiny", 1_000 + i);
+    }
+
+    let started = Instant::now();
+    let err = assert_exit(&fx.run(&fx.config("1T", "2T")), 0);
+    let took = started.elapsed();
+
+    assert!(err.contains("20 moved"), "stderr:\n{err}");
+    assert!(took < Duration::from_secs(5), "20 moves took {took:?}");
+    assert_eq!(Fixture::tree(fx.cache_branch.path()), ["small"]);
+    fx.assert_no_staging_directories();
 }
 
 #[test]

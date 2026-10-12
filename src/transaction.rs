@@ -7,12 +7,13 @@
 //! Each staging directory mirrors relpaths (`<root>/.cachy-staging/<relpath>`),
 //! so anything left in it after a crash names the move it belongs to.
 
+use std::collections::VecDeque;
 use std::fmt;
 use std::io;
 use std::os::fd::{AsFd, OwnedFd};
 use std::path::{Component, Path};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 
@@ -25,6 +26,11 @@ pub const STAGING: &str = ".cachy-staging";
 /// unlinked. An open that looked up the source before it was retired, but
 /// reaches the lease check only after this, is not caught.
 const RETIRE_WAIT: Duration = Duration::from_secs(1);
+/// How many moves may be retiring at once. Each holds four descriptors open,
+/// which keeps cachy well below the usual limit of 1024.
+const MAX_RETIRING: usize = 128;
+/// How often retiring moves are serviced while nothing else is running.
+const RETIRING_POLL: Duration = Duration::from_millis(10);
 const COPY_BUF: usize = 1 << 20;
 const DIR_MODE: u32 = 0o755;
 const STAGING_MODE: u32 = 0o700;
@@ -98,62 +104,179 @@ impl From<anyhow::Error> for Abort {
     }
 }
 
-/// Moves the regular file `rel` from the cache branch to the backing branch,
-/// unless `guard` finds it in use. A skipped move, or one that fails before
-/// publish, leaves the source where it was and no copy behind.
-///
-/// A stale copy at `rel` on the backing branch is not replaced yet: the
-/// publish fails and the move with it.
-pub fn move_file(
-    fs: &dyn FsOps,
-    cache_branch: &Branch,
-    backing_branch: &Branch,
-    rel: &Path,
-    guard: &Guard,
-) -> Result<MoveOutcome> {
-    match transact(fs, cache_branch, backing_branch, rel, guard) {
+/// Runs moves one after another. A move's last step, the wait before a
+/// retired source is unlinked, overlaps with the moves after it: such moves
+/// stay in a queue of retiring moves, which is serviced between moves and
+/// between the chunks of every copy.
+pub struct Mover<'a> {
+    fs: &'a dyn FsOps,
+    cache_branch: &'a Branch,
+    backing_branch: &'a Branch,
+    guard: &'a Guard,
+    retiring: VecDeque<Retiring<'a>>,
+    finished: Vec<(&'a Path, Result<MoveOutcome>)>,
+}
+
+/// A move whose source is retired but not yet unlinked.
+struct Retiring<'a> {
+    source: Source<'a>,
+    /// The mirror of the source's parent in the cache branch's staging
+    /// directory, which holds the retired source.
+    retired_parent: OwnedFd,
+    published: Published<'a>,
+    retired_at: Instant,
+}
+
+impl<'a> Mover<'a> {
+    pub fn new(
+        fs: &'a dyn FsOps,
+        cache_branch: &'a Branch,
+        backing_branch: &'a Branch,
+        guard: &'a Guard,
+    ) -> Mover<'a> {
+        Mover {
+            fs,
+            cache_branch,
+            backing_branch,
+            guard,
+            retiring: VecDeque::new(),
+            finished: Vec::new(),
+        }
+    }
+
+    /// Moves the regular file `rel` from the cache branch to the backing
+    /// branch, unless the guard finds it in use. The outcome is reported by
+    /// [`Mover::finished`], possibly only after later moves have started.
+    ///
+    /// A skipped move, or one that fails before publish, leaves the source
+    /// where it was and no copy behind. A stale copy at `rel` on the backing
+    /// branch is not replaced yet: the publish fails and the move with it.
+    pub fn start(&mut self, rel: &'a Path) {
+        self.service();
+        while self.retiring.len() >= MAX_RETIRING {
+            thread::sleep(RETIRING_POLL);
+            self.service();
+        }
+        match self.transact(rel) {
+            Ok(()) => {}
+            Err(Abort::Skip(skip)) => self.finished.push((rel, Ok(MoveOutcome::Skipped(skip)))),
+            Err(Abort::Fail(e)) => self.finished.push((rel, Err(e))),
+        }
+    }
+
+    /// Space on the cache branch that retiring moves free once their sources
+    /// are unlinked.
+    pub fn retiring_bytes(&self) -> u64 {
+        self.retiring.iter().map(|r| r.source.allocated).sum()
+    }
+
+    /// Waits until every retiring move has finished.
+    pub fn finish(&mut self) {
+        self.service();
+        while !self.retiring.is_empty() {
+            thread::sleep(RETIRING_POLL);
+            self.service();
+        }
+    }
+
+    /// The outcomes of the moves that finished since the last call.
+    pub fn finished(&mut self) -> Vec<(&'a Path, Result<MoveOutcome>)> {
+        std::mem::take(&mut self.finished)
+    }
+
+    /// Finishes retiring moves: one whose lease broke is rolled back at once,
+    /// because the opener that broke it stays blocked until then; one whose
+    /// wait is over has its source unlinked.
+    fn service(&mut self) {
+        for retiring in std::mem::take(&mut self.retiring) {
+            let rel = retiring.source.rel;
+            let finished = match retiring.source.check_lease() {
+                Err(abort) => Some(retiring.roll_back(self.fs).and(Err(abort))),
+                Ok(()) if retiring.retired_at.elapsed() >= RETIRE_WAIT => {
+                    Some(retiring.unlink(self.fs))
+                }
+                Ok(()) => {
+                    self.retiring.push_back(retiring);
+                    None
+                }
+            };
+            if let Some(result) = finished {
+                self.finished.push((rel, outcome(result)));
+            }
+        }
+    }
+
+    /// Runs a move up to its retire, after which it waits in the queue of
+    /// retiring moves.
+    fn transact(&mut self, rel: &'a Path) -> Result<(), Abort> {
+        let fs = self.fs;
+        let (parent, name) = split(rel);
+
+        let source = Source::open(fs, self.cache_branch, rel, self.guard)?;
+        let (backing_staging, staged_parent) = staging_dirs(fs, self.backing_branch, parent)
+            .context("create staging directory on the backing branch")?;
+
+        let temp = fs
+            .create_new(staged_parent.as_fd(), name, TEMP_MODE)
+            .context("create temp file")?;
+        let staged = self
+            .copy(&source, &temp)
+            .and_then(|()| Ok(fs.fsync(temp.as_fd()).context("fsync temp file")?))
+            .and_then(|()| source.revalidate());
+        let published = staged.and_then(|()| {
+            Ok(publish(
+                fs,
+                self.backing_branch,
+                parent,
+                name,
+                &staged_parent,
+                &temp,
+            )?)
+        });
+        drop(temp);
+        if published.is_err() {
+            let _ = fs.unlink(staged_parent.as_fd(), name);
+        }
+        remove_empty_dirs(fs, &backing_staging, parent);
+
+        let retiring = retire(fs, source, published?)?;
+        self.retiring.push_back(retiring);
+        Ok(())
+    }
+
+    /// Copies the source into `dst`, aborting as soon as the source's lease
+    /// breaks. Retiring moves are serviced between chunks, so a long copy
+    /// does not hold them up.
+    fn copy(&mut self, src: &Source, dst: &OwnedFd) -> Result<(), Abort> {
+        let mut buf = vec![0; COPY_BUF];
+        loop {
+            self.service();
+            src.check_lease()?;
+            let n = self
+                .fs
+                .read(src.file.as_fd(), &mut buf)
+                .context("copy: read source")?;
+            if n == 0 {
+                return Ok(());
+            }
+            let mut chunk = &buf[..n];
+            while !chunk.is_empty() {
+                let written = self
+                    .fs
+                    .write(dst.as_fd(), chunk)
+                    .context("copy: write temp file")?;
+                chunk = &chunk[written..];
+            }
+        }
+    }
+}
+
+fn outcome(result: Result<(), Abort>) -> Result<MoveOutcome> {
+    match result {
         Ok(()) => Ok(MoveOutcome::Moved),
         Err(Abort::Skip(skip)) => Ok(MoveOutcome::Skipped(skip)),
         Err(Abort::Fail(e)) => Err(e),
     }
-}
-
-fn transact(
-    fs: &dyn FsOps,
-    cache_branch: &Branch,
-    backing_branch: &Branch,
-    rel: &Path,
-    guard: &Guard,
-) -> Result<(), Abort> {
-    let (parent, name) = split(rel);
-
-    let source = Source::open(fs, cache_branch, parent, name, guard)?;
-    let (backing_staging, staged_parent) = staging_dirs(fs, backing_branch, parent)
-        .context("create staging directory on the backing branch")?;
-
-    let temp = fs
-        .create_new(staged_parent.as_fd(), name, TEMP_MODE)
-        .context("create temp file")?;
-    let staged = copy(fs, &source, &temp)
-        .and_then(|()| Ok(fs.fsync(temp.as_fd()).context("fsync temp file")?))
-        .and_then(|()| source.revalidate());
-    let published = staged.and_then(|()| {
-        Ok(publish(
-            fs,
-            backing_branch,
-            parent,
-            name,
-            &staged_parent,
-            &temp,
-        )?)
-    });
-    drop(temp);
-    if published.is_err() {
-        let _ = fs.unlink(staged_parent.as_fd(), name);
-    }
-    remove_empty_dirs(fs, &backing_staging, parent);
-
-    retire(fs, cache_branch, &source, parent, &published?)
 }
 
 /// A published copy, identified so that a rollback removes it only while it
@@ -208,67 +331,85 @@ fn publish<'a>(
     })
 }
 
-/// Removes the source from the cache branch. It is first renamed into the
-/// cache branch's staging directory and kept there for [`RETIRE_WAIT`], so an
+/// Starts removing the source from the cache branch: renames it into the
+/// cache branch's staging directory, where it waits for [`RETIRE_WAIT`] so an
 /// open that looked up the source before the rename reaches the lease check
 /// in time to roll the move back.
-fn retire(
+fn retire<'a>(
     fs: &dyn FsOps,
-    cache_branch: &Branch,
-    source: &Source,
-    parent: &Path,
-    published: &Published,
-) -> Result<(), Abort> {
-    let name = source.name;
-    let (cache_staging, retired_parent) = staging_dirs(fs, cache_branch, parent)
+    source: Source<'a>,
+    published: Published<'a>,
+) -> Result<Retiring<'a>, Abort> {
+    let (parent, name) = split(source.rel);
+    let (_, retired_parent) = staging_dirs(fs, source.cache_branch, parent)
         .context("create staging directory on the cache branch")?;
 
     fs.rename_noreplace(source.dir.as_fd(), name, retired_parent.as_fd(), name)
         .context("retire: rename source into staging directory")?;
+    let retiring = Retiring {
+        source,
+        retired_parent,
+        published,
+        retired_at: Instant::now(),
+    };
     // From here on, every way out either unlinks the retired source or puts
     // it back, so no opener blocked on the lease is left with a hidden file.
-    let unused = fs
-        .fsync(source.dir.as_fd())
+    if let Err(e) = fs
+        .fsync(retiring.source.dir.as_fd())
         .context("fsync source directory")
-        .map_err(Abort::from)
-        .and_then(|()| {
-            thread::sleep(RETIRE_WAIT);
-            source.check_lease()
-        });
-    let retired = match unused {
-        Ok(()) => unlink_retired(fs, &retired_parent, name),
-        Err(abort) => roll_back(fs, source, &retired_parent, published).and(Err(abort)),
-    };
-    remove_empty_dirs(fs, &cache_staging, parent);
-    retired
+    {
+        retiring.roll_back(fs)?;
+        return Err(Abort::Fail(e));
+    }
+    Ok(retiring)
 }
 
-fn unlink_retired(fs: &dyn FsOps, retired_parent: &OwnedFd, name: &Path) -> Result<(), Abort> {
-    fs.unlink(retired_parent.as_fd(), name)
-        .context("retire: unlink source")?;
-    fs.fsync(retired_parent.as_fd())
-        .context("fsync staging directory on the cache branch")?;
-    Ok(())
-}
+impl Retiring<'_> {
+    fn unlink(self, fs: &dyn FsOps) -> Result<(), Abort> {
+        let name = split(self.source.rel).1;
+        let unlinked = fs
+            .unlink(self.retired_parent.as_fd(), name)
+            .context("retire: unlink source")
+            .and_then(|()| {
+                fs.fsync(self.retired_parent.as_fd())
+                    .context("fsync staging directory on the cache branch")
+            });
+        self.remove_empty_staging_dirs(fs);
+        Ok(unlinked?)
+    }
 
-/// Undoes a move whose source is retired but not yet unlinked: renames the
-/// source back and removes the published copy. The source's lease is still
-/// held, so whoever broke it opens the source only once it is back.
-fn roll_back(
-    fs: &dyn FsOps,
-    source: &Source,
-    retired_parent: &OwnedFd,
-    published: &Published,
-) -> Result<(), Abort> {
-    let name = source.name;
-    fs.rename_noreplace(retired_parent.as_fd(), name, source.dir.as_fd(), name)
-        .context("roll back: rename source back")?;
-    fs.fsync(source.dir.as_fd())
-        .context("fsync source directory")?;
-    fs.fsync(retired_parent.as_fd())
-        .context("fsync staging directory on the cache branch")?;
-    published.remove(fs).context("roll back")?;
-    Ok(())
+    /// Undoes the move: renames the source back and removes the published
+    /// copy. The source's lease is still held, so whoever broke it opens the
+    /// source only once it is back.
+    fn roll_back(self, fs: &dyn FsOps) -> Result<(), Abort> {
+        let name = split(self.source.rel).1;
+        let rolled_back = fs
+            .rename_noreplace(
+                self.retired_parent.as_fd(),
+                name,
+                self.source.dir.as_fd(),
+                name,
+            )
+            .context("roll back: rename source back")
+            .and_then(|()| {
+                fs.fsync(self.source.dir.as_fd())
+                    .context("fsync source directory")
+            })
+            .and_then(|()| {
+                fs.fsync(self.retired_parent.as_fd())
+                    .context("fsync staging directory on the cache branch")
+            })
+            .and_then(|()| self.published.remove(fs).context("roll back"));
+        self.remove_empty_staging_dirs(fs);
+        Ok(rolled_back?)
+    }
+
+    fn remove_empty_staging_dirs(&self, fs: &dyn FsOps) {
+        let staging = fs.open_dir(self.source.cache_branch.fd.as_fd(), Path::new(STAGING));
+        if let Ok(staging) = staging {
+            remove_empty_dirs(fs, &staging, split(self.source.rel).0);
+        }
+    }
 }
 
 /// Opens `branch`'s staging directory and, below it, the mirror of `parent`,
@@ -283,15 +424,15 @@ fn staging_dirs(fs: &dyn FsOps, branch: &Branch, parent: &Path) -> io::Result<(O
 struct Source<'a> {
     fs: &'a dyn FsOps,
     cache_branch: &'a Branch,
-    /// The source's relpath, split into its parent directory and name.
-    parent: &'a Path,
-    name: &'a Path,
+    rel: &'a Path,
     /// The parent directory, as opened when the move started.
     dir: OwnedFd,
     file: OwnedFd,
     lease: Lease,
     /// The source as it was when the lease was taken.
     identity: Identity,
+    /// Space the source takes up on the cache branch.
+    allocated: u64,
 }
 
 /// What must stay the same about a source for its copy to be current.
@@ -332,16 +473,16 @@ impl Identity {
 }
 
 impl<'a> Source<'a> {
-    /// Opens `parent/name` on the cache branch and takes a lease on it. Skips
-    /// it if another open conflicts with the lease, or if it is younger than
-    /// the minimum age.
+    /// Opens `rel` on the cache branch and takes a lease on it. Skips it if
+    /// another open conflicts with the lease, or if it is younger than the
+    /// minimum age.
     fn open(
         fs: &'a dyn FsOps,
         cache_branch: &'a Branch,
-        parent: &'a Path,
-        name: &'a Path,
+        rel: &'a Path,
         guard: &Guard,
     ) -> Result<Source<'a>, Abort> {
+        let (parent, name) = split(rel);
         let dir = open_dirs(fs, &cache_branch.fd, parent).context("open source directory")?;
         let file = fs.open_read(dir.as_fd(), name).context("open source")?;
         let lease = guard.lease;
@@ -352,19 +493,20 @@ impl<'a> Source<'a> {
             }
             Err(e) => return Err(anyhow::Error::from(e).context("take lease").into()),
         }
-        let identity = Identity::of(&fs.fstat(file.as_fd()).context("fstat source")?);
+        let stat = fs.fstat(file.as_fd()).context("fstat source")?;
+        let identity = Identity::of(&stat);
         if identity.is_younger_than(guard.minimum_age) {
             return Err(Abort::Skip(Skip::TooYoung));
         }
         Ok(Source {
             fs,
             cache_branch,
-            parent,
-            name,
+            rel,
             dir,
             file,
             lease,
             identity,
+            allocated: stat.st_blocks.max(0) as u64 * 512,
         })
     }
 
@@ -378,8 +520,9 @@ impl<'a> Source<'a> {
         if Identity::of(&now) != self.identity {
             return Err(Abort::Skip(Skip::Changed));
         }
-        let at_path = open_dirs(self.fs, &self.cache_branch.fd, self.parent)
-            .and_then(|dir| self.fs.stat_at(dir.as_fd(), self.name));
+        let (parent, name) = split(self.rel);
+        let at_path = open_dirs(self.fs, &self.cache_branch.fd, parent)
+            .and_then(|dir| self.fs.stat_at(dir.as_fd(), name));
         match at_path {
             Ok(stat) if Identity::of(&stat) == self.identity => Ok(()),
             Ok(_) => Err(Abort::Skip(Skip::Changed)),
@@ -403,28 +546,6 @@ impl<'a> Source<'a> {
             return Err(Abort::Skip(Skip::InUse));
         }
         Ok(())
-    }
-}
-
-/// Copies the source into `dst`, aborting as soon as the source's lease
-/// breaks.
-fn copy(fs: &dyn FsOps, src: &Source, dst: &OwnedFd) -> Result<(), Abort> {
-    let mut buf = vec![0; COPY_BUF];
-    loop {
-        src.check_lease()?;
-        let n = fs
-            .read(src.file.as_fd(), &mut buf)
-            .context("copy: read source")?;
-        if n == 0 {
-            return Ok(());
-        }
-        let mut chunk = &buf[..n];
-        while !chunk.is_empty() {
-            let written = fs
-                .write(dst.as_fd(), chunk)
-                .context("copy: write temp file")?;
-            chunk = &chunk[written..];
-        }
     }
 }
 

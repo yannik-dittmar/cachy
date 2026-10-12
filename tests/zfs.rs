@@ -3,7 +3,7 @@ mod common;
 use std::path::Path;
 use std::process::Command;
 
-use common::{Fixture, FsKind, skip, zfs_dataset};
+use common::{Fixture, FsKind, output, skip, zfs_dataset};
 
 #[test]
 fn zfs_branches_resolve_to_their_dataset() {
@@ -19,9 +19,7 @@ fn zfs_branches_resolve_to_their_dataset() {
 
     for (branch, _) in branches.iter().filter(|(_, fs)| *fs == FsKind::Zfs) {
         let dataset = zfs_dataset(branch);
-        let out = Command::new("zfs")
-            .args(["list", "-H", "-o", "mountpoint", &dataset])
-            .output()
+        let out = output(Command::new("zfs").args(["list", "-H", "-o", "mountpoint", &dataset]))
             .expect("spawn zfs");
         assert!(out.status.success(), "zfs list {dataset}");
         let mountpoint = String::from_utf8(out.stdout).unwrap();

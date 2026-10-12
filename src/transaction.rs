@@ -1,13 +1,16 @@
-//! The move transaction: relocates one regular file from the cache branch to a
-//! backing branch, so that afterwards it exists on exactly one of them.
+//! The move transaction: relocates one regular file or symlink from the cache
+//! branch to a backing branch, so that afterwards it exists on exactly one of
+//! them.
 //!
-//! The source is held under a lease for the whole move, so a move unit that is
-//! in use is never moved.
+//! A regular file is held under a lease for the whole move, so a move unit
+//! that is in use is never moved. A symlink cannot be opened, so it is never
+//! in use; it is recreated with its link text verbatim.
 //!
 //! Each staging directory mirrors relpaths (`<root>/.cachy-staging/<relpath>`),
 //! so anything left in it after a crash names the move it belongs to.
 
 use std::collections::VecDeque;
+use std::ffi::OsString;
 use std::fmt;
 use std::io;
 use std::os::fd::{AsFd, OwnedFd};
@@ -16,11 +19,12 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
-use xxhash_rust::xxh3::Xxh3;
+use xxhash_rust::xxh3::{Xxh3, xxh3_128};
 
 use crate::config::Verify;
 use crate::fsops::{FsOps, Lease, Stat};
 use crate::metadata::{self, AllowedLosses};
+use crate::scan::Kind;
 
 /// Name of the staging directory at the root of each filesystem cachy writes to.
 pub const STAGING: &str = ".cachy-staging";
@@ -74,7 +78,8 @@ pub enum MoveOutcome {
     Skipped(Skip),
 }
 
-/// The XXH3-128 hash of a file's content, computed while copying it.
+/// The XXH3-128 hash of a file's content, computed while copying it, or of
+/// a symlink's link text.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Hash(u128);
 
@@ -180,24 +185,31 @@ impl<'a> Mover<'a> {
         }
     }
 
-    /// Moves the regular file `rel` from the cache branch to the backing
-    /// branch, unless the guard finds it in use. The outcome is reported by
-    /// [`Mover::finished`], possibly only after later moves have started.
+    /// Moves `rel`, a file of the given kind, from the cache branch to the
+    /// backing branch, unless the guard finds it in use. A special file is
+    /// skipped. The outcome is reported by [`Mover::finished`], possibly only
+    /// after later moves have started.
     ///
     /// A skipped move, or one that fails before publish, leaves the source
     /// where it was and no copy behind. A stale copy at `rel` on the backing
     /// branch is not replaced yet: the publish fails and the move with it.
-    pub fn start(&mut self, rel: &'a Path) {
+    pub fn start(&mut self, rel: &'a Path, kind: Kind) {
         self.service();
-        while self.retiring.len() >= MAX_RETIRING {
-            thread::sleep(RETIRING_POLL);
-            self.service();
-        }
-        match self.transact(rel) {
-            Ok(()) => {}
-            Err(Abort::Skip(skip)) => self.finished.push((rel, Ok(MoveOutcome::Skipped(skip)))),
-            Err(Abort::Fail(e)) => self.finished.push((rel, Err(e))),
-        }
+        let result = match kind {
+            Kind::Regular => {
+                while self.retiring.len() >= MAX_RETIRING {
+                    thread::sleep(RETIRING_POLL);
+                    self.service();
+                }
+                match self.transact(rel) {
+                    Ok(()) => return,
+                    Err(abort) => Err(abort),
+                }
+            }
+            Kind::Symlink => self.transact_symlink(rel),
+            Kind::Special => Err(Abort::Skip(Skip::SpecialFile)),
+        };
+        self.finished.push((rel, outcome(result)));
     }
 
     /// Space on the cache branch that retiring moves free once their sources
@@ -301,6 +313,47 @@ impl<'a> Mover<'a> {
         let retiring = retire(fs, source, published, hash)?;
         self.retiring.push_back(retiring);
         Ok(())
+    }
+
+    /// Moves the symlink `rel`: recreates it with the same link text in the
+    /// staging directory, gives it the source's owner and timestamps,
+    /// publishes it and retires the source. Nothing can have a symlink open,
+    /// so the move needs no lease and no retire wait.
+    fn transact_symlink(&mut self, rel: &'a Path) -> Result<Hash, Abort> {
+        let fs = self.fs;
+        let (parent, name) = split(rel);
+
+        let source = Link::open(fs, self.cache_branch, rel, self.guard)?;
+        let (backing_staging, staged_parent) = staging_dirs(fs, self.backing_branch, parent)
+            .context("create staging directory on the backing branch")?;
+
+        fs.symlink(&source.target, staged_parent.as_fd(), name)
+            .context("create temp symlink")?;
+        let published = metadata::copy_symlink(fs, &source.stat, &staged_parent, name)
+            .context("metadata")
+            .map_err(Abort::from)
+            .and_then(|()| source.revalidate())
+            .and_then(|()| {
+                let dest_parent = make_dirs_like(
+                    fs,
+                    self.backing_branch,
+                    parent,
+                    &self.cache_branch.fd,
+                    self.allowed_losses,
+                    &mut self.created_dirs,
+                )
+                .context("create destination directory")?;
+                Ok(publish_symlink(fs, dest_parent, name, &staged_parent)?)
+            });
+        if published.is_err() {
+            let _ = fs.unlink(staged_parent.as_fd(), name);
+        }
+        remove_empty_dirs(fs, &backing_staging, parent);
+
+        let published = published?;
+        let hash = Hash(xxh3_128(source.target.as_encoded_bytes()));
+        source.retire(published)?;
+        Ok(hash)
     }
 
     /// Writes the staged copy of `source` into the temp file `temp`, makes it
@@ -512,16 +565,86 @@ fn publish<'a>(
 /// that name still refers to it. If it cannot, the copy stays as a stale copy,
 /// identical to the source.
 fn unpublish(fs: &dyn FsOps, dest_parent: &OwnedFd, name: &Path, copy: &OwnedFd) {
-    let inode = |stat: Stat| (stat.st_dev, stat.st_ino);
-    let ours = match (
-        fs.fstat(copy.as_fd()),
-        fs.stat_at(dest_parent.as_fd(), name),
-    ) {
-        (Ok(copy), Ok(at_name)) => inode(copy) == inode(at_name),
-        _ => false,
-    };
+    if let Ok(copy) = fs.fstat(copy.as_fd()) {
+        unpublish_inode(fs, dest_parent, name, &copy);
+    }
+}
+
+/// Removes `<dest_parent>/<name>` if it is still the inode of `copy`.
+fn unpublish_inode(fs: &dyn FsOps, dest_parent: &OwnedFd, name: &Path, copy: &Stat) {
+    let inode = |stat: &Stat| (stat.st_dev, stat.st_ino);
+    let ours = fs
+        .stat_at(dest_parent.as_fd(), name)
+        .is_ok_and(|at_name| inode(&at_name) == inode(copy));
     if ours && fs.unlink(dest_parent.as_fd(), name).is_ok() {
         let _ = fs.fsync(dest_parent.as_fd());
+    }
+}
+
+/// Makes the staged symlink `<staged_parent>/<name>` visible as
+/// `<dest_parent>/<name>`, never replacing an existing file. An existing
+/// identical symlink is adopted as the published copy instead.
+fn publish_symlink<'a>(
+    fs: &dyn FsOps,
+    dest_parent: OwnedFd,
+    name: &'a Path,
+    staged_parent: &OwnedFd,
+) -> Result<Published<'a>> {
+    let staged = fs
+        .stat_at(staged_parent.as_fd(), name)
+        .context("stat temp symlink")?;
+    match fs.rename_noreplace(staged_parent.as_fd(), name, dest_parent.as_fd(), name) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            let identical = identical_symlinks(fs, staged_parent, name, &dest_parent, name);
+            if !identical.unwrap_or(false) {
+                return Err(e).context("publish");
+            }
+            let identity = Identity::of(
+                &fs.stat_at(dest_parent.as_fd(), name)
+                    .context("stat existing symlink")?,
+            );
+            fs.unlink(staged_parent.as_fd(), name)
+                .context("delete temp symlink")?;
+            fs.fsync(staged_parent.as_fd())
+                .context("fsync staging directory on the backing branch")?;
+            return Ok(Published {
+                dir: dest_parent,
+                name,
+                identity,
+                adopted: true,
+            });
+        }
+        Err(e) => return Err(e).context("publish"),
+    }
+    // A symlink cannot be fsynced; fsyncing its directory makes it durable.
+    let identity = fs
+        .fsync(dest_parent.as_fd())
+        .context("fsync destination directory")
+        .and_then(|()| {
+            fs.fsync(staged_parent.as_fd())
+                .context("fsync staging directory on the backing branch")
+        })
+        .and_then(|()| {
+            Ok(Identity::of(
+                &fs.stat_at(dest_parent.as_fd(), name)
+                    .context("stat published copy")?,
+            ))
+        });
+    match identity {
+        Ok(identity) if (identity.dev, identity.ino) == (staged.st_dev, staged.st_ino) => {
+            Ok(Published {
+                dir: dest_parent,
+                name,
+                identity,
+                adopted: false,
+            })
+        }
+        Ok(_) => Err(anyhow!("publish: the published copy was replaced")),
+        Err(e) => {
+            unpublish_inode(fs, &dest_parent, name, &staged);
+            Err(e)
+        }
     }
 }
 
@@ -789,6 +912,157 @@ impl<'a> Source<'a> {
         }
         Ok(())
     }
+}
+
+/// The source of a symlink's move.
+struct Link<'a> {
+    fs: &'a dyn FsOps,
+    cache_branch: &'a Branch,
+    rel: &'a Path,
+    /// The parent directory, as opened when the move started.
+    dir: OwnedFd,
+    target: OsString,
+    /// The symlink as it was when the move started.
+    identity: Identity,
+    stat: Stat,
+}
+
+impl<'a> Link<'a> {
+    /// Reads the symlink `rel` on the cache branch. Skips it if it is younger
+    /// than the minimum age.
+    fn open(
+        fs: &'a dyn FsOps,
+        cache_branch: &'a Branch,
+        rel: &'a Path,
+        guard: &Guard,
+    ) -> Result<Link<'a>, Abort> {
+        let (parent, name) = split(rel);
+        let dir = open_dirs(fs, &cache_branch.fd, parent).context("open source directory")?;
+        let stat = fs.stat_at(dir.as_fd(), name).context("stat source")?;
+        if stat.st_mode & libc::S_IFMT != libc::S_IFLNK {
+            // Replaced since the scan.
+            return Err(Abort::Skip(Skip::Changed));
+        }
+        let identity = Identity::of(&stat);
+        if identity.is_younger_than(guard.minimum_age) {
+            return Err(Abort::Skip(Skip::TooYoung));
+        }
+        let target = fs.read_link(dir.as_fd(), name).context("read source")?;
+        // A symlink's link text never changes, but it may have been replaced.
+        if Identity::of(&fs.stat_at(dir.as_fd(), name).context("stat source")?) != identity {
+            return Err(Abort::Skip(Skip::Changed));
+        }
+        Ok(Link {
+            fs,
+            cache_branch,
+            rel,
+            dir,
+            target,
+            identity,
+            stat,
+        })
+    }
+
+    /// Checks, right before publishing, that the copy is still current: the
+    /// relpath, looked up afresh from the cache branch root, still names the
+    /// symlink, unchanged.
+    fn revalidate(&self) -> Result<(), Abort> {
+        let (parent, name) = split(self.rel);
+        let at_path = open_dirs(self.fs, &self.cache_branch.fd, parent)
+            .and_then(|dir| self.fs.stat_at(dir.as_fd(), name));
+        match at_path {
+            Ok(stat) if Identity::of(&stat) == self.identity => Ok(()),
+            Ok(_) => Err(Abort::Skip(Skip::Changed)),
+            Err(e)
+                if matches!(
+                    e.raw_os_error(),
+                    Some(libc::ENOENT | libc::ENOTDIR | libc::ELOOP)
+                ) =>
+            {
+                Err(Abort::Skip(Skip::Changed))
+            }
+            Err(e) => Err(anyhow::Error::from(e).context("look up source path").into()),
+        }
+    }
+
+    /// Removes the symlink from the cache branch once `published` is: renames
+    /// it into the cache branch's staging directory and unlinks it there if
+    /// it is still the source. Otherwise, or if the rename fails, the move is
+    /// undone and the symlink stays where it was.
+    fn retire(self, published: Published) -> Result<(), Abort> {
+        let fs = self.fs;
+        let (parent, name) = split(self.rel);
+        let renamed = staging_dirs(fs, self.cache_branch, parent)
+            .context("create staging directory on the cache branch")
+            .and_then(|(_, retired_parent)| {
+                fs.rename_noreplace(self.dir.as_fd(), name, retired_parent.as_fd(), name)
+                    .context("retire: rename source into staging directory")?;
+                Ok(retired_parent)
+            });
+        let retired_parent = match renamed {
+            Ok(retired_parent) => retired_parent,
+            Err(e) => {
+                let _ = published.remove(fs);
+                self.remove_empty_staging_dirs();
+                return Err(Abort::Fail(e));
+            }
+        };
+        let retired = fs
+            .stat_at(retired_parent.as_fd(), name)
+            .context("retire: stat retired source");
+        // The rename changed its ctime; its link text cannot change in place.
+        let unlinked = match retired {
+            Ok(stat) if (stat.st_dev, stat.st_ino) == (self.identity.dev, self.identity.ino) => fs
+                .unlink(retired_parent.as_fd(), name)
+                .context("retire: unlink source")
+                .map_err(Abort::from),
+            // Replaced between the revalidation and the rename.
+            Ok(_) => Err(Abort::Skip(Skip::Changed)),
+            Err(e) => Err(Abort::Fail(e)),
+        };
+        if let Err(abort) = unlinked {
+            let rolled_back = fs
+                .rename_noreplace(retired_parent.as_fd(), name, self.dir.as_fd(), name)
+                .context("roll back: rename source back")
+                .and_then(|()| fs.fsync(self.dir.as_fd()).context("fsync source directory"))
+                .and_then(|()| published.remove(fs).context("roll back"));
+            self.remove_empty_staging_dirs();
+            rolled_back?;
+            return Err(abort);
+        }
+        let synced = fs
+            .fsync(retired_parent.as_fd())
+            .context("fsync staging directory on the cache branch")
+            .and_then(|()| fs.fsync(self.dir.as_fd()).context("fsync source directory"));
+        self.remove_empty_staging_dirs();
+        Ok(synced?)
+    }
+
+    fn remove_empty_staging_dirs(&self) {
+        let staging = self
+            .fs
+            .open_dir(self.cache_branch.fd.as_fd(), Path::new(STAGING));
+        if let Ok(staging) = staging {
+            remove_empty_dirs(self.fs, &staging, split(self.rel).0);
+        }
+    }
+}
+
+/// Whether `<a_dir>/<a>` and `<b_dir>/<b>` are symlinks with the same link
+/// text, owner, group and mtime: either can stand in for the other.
+pub fn identical_symlinks(
+    fs: &dyn FsOps,
+    a_dir: &OwnedFd,
+    a: &Path,
+    b_dir: &OwnedFd,
+    b: &Path,
+) -> io::Result<bool> {
+    let (a_stat, b_stat) = (fs.stat_at(a_dir.as_fd(), a)?, fs.stat_at(b_dir.as_fd(), b)?);
+    let symlink = |stat: &Stat| stat.st_mode & libc::S_IFMT == libc::S_IFLNK;
+    if !symlink(&a_stat) || !symlink(&b_stat) || !metadata::same(&a_stat, &b_stat) {
+        return Ok(false);
+    }
+    Ok(fs.read_link(a_dir.as_fd(), a)? == fs.read_link(b_dir.as_fd(), b)?)
 }
 
 /// Whether the open files `a` and `b`, read from their start, are regular

@@ -1,5 +1,7 @@
 //! Metadata copying: owner, group, mode, xattrs, ACLs and timestamps, from a
-//! file or directory on one branch to its copy on another.
+//! file or directory on one branch to its copy on another. A symlink's copy
+//! gets only its owner, group and timestamps: Linux gives every symlink mode
+//! 777.
 //!
 //! The steps run in an order where none undoes an earlier one: a chown clears
 //! setuid, setgid and file capabilities, so the mode and the xattrs follow it;
@@ -8,7 +10,7 @@
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::io;
-use std::os::fd::BorrowedFd;
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
@@ -108,16 +110,32 @@ pub fn copy_attributes(
 
 /// Copies the atime and mtime of `stat` to `dst`.
 pub fn copy_times(fs: &dyn FsOps, stat: &Stat, dst: BorrowedFd) -> Result<()> {
+    let (atime, mtime) = times(stat);
+    fs.set_times(dst, atime, mtime).context("set timestamps")
+}
+
+fn times(stat: &Stat) -> (Timespec, Timespec) {
     let time = |sec, nsec| Timespec {
         tv_sec: sec,
         tv_nsec: nsec as _,
     };
-    fs.set_times(
-        dst,
+    (
         time(stat.st_atime, stat.st_atime_nsec),
         time(stat.st_mtime, stat.st_mtime_nsec),
     )
-    .context("set timestamps")
+}
+
+/// Copies the owner, group and timestamps of a symlink, whose metadata is
+/// `stat`, to the symlink `<dir>/<name>`, and checks that they arrived
+/// unchanged.
+pub fn copy_symlink(fs: &dyn FsOps, stat: &Stat, dir: &OwnedFd, name: &Path) -> Result<()> {
+    fs.set_owner_at(dir.as_fd(), name, stat.st_uid, stat.st_gid)
+        .context("chown")?;
+    let (atime, mtime) = times(stat);
+    fs.set_times_at(dir.as_fd(), name, atime, mtime)
+        .context("set timestamps")?;
+    let copied = fs.stat_at(dir.as_fd(), name).context("stat the copy")?;
+    check_preserved(stat, &copied)
 }
 
 /// Copies all metadata of the file `src`, whose metadata is `stat`, to `dst`
@@ -133,7 +151,12 @@ pub fn copy_file(
     copy_attributes(fs, stat, src, dst, allowed, what)?;
     copy_times(fs, stat, dst)?;
     let copied = fs.fstat(dst).context("fstat the copy")?;
-    if !same(stat, &copied) {
+    check_preserved(stat, &copied)
+}
+
+/// Fails unless `copied` has the owner, group, mode and mtime of `stat`.
+fn check_preserved(stat: &Stat, copied: &Stat) -> Result<()> {
+    if !same(stat, copied) {
         bail!(
             "not preserved: owner {}:{}, mode {:o}, mtime {}.{:09} became {}:{}, {:o}, {}.{:09}",
             stat.st_uid,

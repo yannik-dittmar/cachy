@@ -160,6 +160,16 @@ impl FsOps for FaultyFs {
         RealFs.mkdir(dir, path, mode)
     }
 
+    fn symlink(&self, target: &OsStr, dir: BorrowedFd, path: &Path) -> io::Result<()> {
+        self.count_op("symlink")?;
+        RealFs.symlink(target, dir, path)
+    }
+
+    fn read_link(&self, dir: BorrowedFd, path: &Path) -> io::Result<OsString> {
+        self.count_op("read_link")?;
+        RealFs.read_link(dir, path)
+    }
+
     fn fstat(&self, fd: BorrowedFd) -> io::Result<Stat> {
         self.count_op("fstat")?;
         RealFs.fstat(fd)
@@ -269,6 +279,22 @@ impl FsOps for FaultyFs {
     fn set_times(&self, fd: BorrowedFd, atime: Timespec, mtime: Timespec) -> io::Result<()> {
         self.count_op("set_times")?;
         RealFs.set_times(fd, atime, mtime)
+    }
+
+    fn set_owner_at(&self, dir: BorrowedFd, path: &Path, uid: u32, gid: u32) -> io::Result<()> {
+        self.count_op("set_owner_at")?;
+        RealFs.set_owner_at(dir, path, uid, gid)
+    }
+
+    fn set_times_at(
+        &self,
+        dir: BorrowedFd,
+        path: &Path,
+        atime: Timespec,
+        mtime: Timespec,
+    ) -> io::Result<()> {
+        self.count_op("set_times_at")?;
+        RealFs.set_times_at(dir, path, atime, mtime)
     }
 
     fn list_xattrs(&self, fd: BorrowedFd) -> io::Result<Vec<OsString>> {

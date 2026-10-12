@@ -1,5 +1,6 @@
 //! The scanner: walks the cache branch on one filesystem and lists its regular
-//! files and special files, oldest mtime first.
+//! files, symlinks and special files, oldest mtime first. Symlinks are never
+//! followed.
 
 use std::fs;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
@@ -21,11 +22,13 @@ pub struct Entry {
 pub enum Kind {
     /// A regular file of any size, which is a move unit.
     Regular,
+    /// A symlink, which is a move unit whatever it points at.
+    Symlink,
     /// A FIFO, socket or device node, which is never moved.
     Special,
 }
 
-/// Regular and special files under `root` that `exclusions` leave, ordered by
+/// Regular files, symlinks and special files under `root` that `exclusions` leave, ordered by
 /// mtime, then relpath. The walk prunes excluded directories, the staging
 /// directory and directories on other filesystems. Directories that cannot be
 /// read are skipped with a warning.
@@ -105,6 +108,8 @@ impl Walk<'_> {
 fn kind(file_type: fs::FileType) -> Option<Kind> {
     if file_type.is_file() {
         Some(Kind::Regular)
+    } else if file_type.is_symlink() {
+        Some(Kind::Symlink)
     } else if file_type.is_fifo()
         || file_type.is_socket()
         || file_type.is_block_device()

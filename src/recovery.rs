@@ -10,9 +10,12 @@
 //!   it is renamed back to its relpath on the cache branch, which never
 //!   replaces a file. A crash releases the lease that kept openers away from
 //!   it, so recovery takes a lease of its own before deciding.
-//! - A temp file (in a backing branch's staging directory) is deleted. A move
-//!   retires its source only once the copy is published, so a temp file is
-//!   never the only copy of anything.
+//! - A retired symlink is deleted if its published counterpart is an
+//!   identical symlink, and renamed back otherwise. Nothing can have a
+//!   symlink open, so it takes no lease.
+//! - A temp file or temp symlink (in a backing branch's staging directory) is
+//!   deleted. A move retires its source only once the copy is published, so a
+//!   temp file is never the only copy of anything.
 
 use std::io;
 use std::os::fd::{AsFd, OwnedFd};
@@ -22,7 +25,9 @@ use anyhow::{Context, Result};
 
 use crate::fsops::{FsOps, Lease};
 use crate::metadata::AllowedLosses;
-use crate::transaction::{Branch, STAGING, identical, make_dirs_like, open_dirs, split};
+use crate::transaction::{
+    Branch, STAGING, identical, identical_symlinks, make_dirs_like, open_dirs, split,
+};
 
 /// Resolves the leftovers in the staging directories of the cache branch and
 /// the backing branch, then removes the staging directories once empty.
@@ -48,7 +53,7 @@ pub fn recover(
     recovery.unresolved
 }
 
-/// What a regular file in a staging directory is left over from.
+/// What a regular file or symlink in a staging directory is left over from.
 #[derive(Clone, Copy)]
 enum Leftover {
     /// A source that was renamed into the cache branch's staging directory to
@@ -122,8 +127,11 @@ impl Recovery<'_> {
                     // Fails harmlessly if a leftover could not be resolved.
                     let _ = self.fs.rmdir(dir.as_fd(), name);
                 }
-                libc::S_IFREG => {
+                file_type @ (libc::S_IFREG | libc::S_IFLNK) => {
                     let resolved = match kind {
+                        Leftover::RetiredSource if file_type == libc::S_IFLNK => {
+                            self.resolve_retired_symlink(dir, &rel)
+                        }
                         Leftover::RetiredSource => self.resolve_retired_source(dir, &rel),
                         Leftover::TempFile => self.resolve_temp_file(dir, &rel),
                     };
@@ -134,7 +142,7 @@ impl Recovery<'_> {
                 }
                 _ => self.unresolved(
                     &staged(&rel),
-                    anyhow::anyhow!("not a regular file or directory"),
+                    anyhow::anyhow!("not a regular file, symlink or directory"),
                 ),
             }
         }
@@ -159,6 +167,30 @@ impl Recovery<'_> {
                 // A conflicting open since the lease was taken.
                 && fs.lease(retired.as_fd()).is_ok_and(|lease| lease == self.lease)
         });
+        self.delete_or_rename_back(staged_dir, rel, redundant)
+    }
+
+    /// Deletes the retired symlink `rel` (in `staged_dir`) if its published
+    /// counterpart is an identical symlink, and renames it back to the cache
+    /// branch otherwise.
+    fn resolve_retired_symlink(&self, staged_dir: &OwnedFd, rel: &Path) -> Result<&'static str> {
+        let (parent, name) = split(rel);
+        let redundant = open_dirs(self.fs, &self.backing_branch.fd, parent)
+            .and_then(|dir| identical_symlinks(self.fs, staged_dir, name, &dir, name))
+            .unwrap_or(false);
+        self.delete_or_rename_back(staged_dir, rel, redundant)
+    }
+
+    /// Deletes the retired source `rel` (in `staged_dir`) if it is
+    /// `redundant`, and renames it back to the cache branch otherwise.
+    fn delete_or_rename_back(
+        &self,
+        staged_dir: &OwnedFd,
+        rel: &Path,
+        redundant: bool,
+    ) -> Result<&'static str> {
+        let fs = self.fs;
+        let (parent, name) = split(rel);
         if redundant {
             fs.unlink(staged_dir.as_fd(), name)
                 .context("delete retired source")?;

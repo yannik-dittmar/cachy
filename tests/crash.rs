@@ -377,6 +377,118 @@ mod fault_injection {
         assert!(retired, "no crash left the source retired");
     }
 
+    /// Symlinks of a representative run, oldest first: with their link text.
+    const SYMLINKS: [(&str, &str); 2] = [
+        ("links/relative", "../media/file.txt"),
+        ("links/deep/dangling", "/nowhere"),
+    ];
+
+    fn create_symlinks(fx: &Fixture) {
+        fx.cache_branch_file("media/file.txt", b"content", 500);
+        for (i, (rel, target)) in SYMLINKS.into_iter().enumerate() {
+            let path = fx.on_cache_branch(rel);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(target, &path).unwrap();
+            common::set_times(&path, 1_000, 1_000 + i as i64);
+        }
+    }
+
+    /// Each symlink exists exactly once, on the cache branch or the backing
+    /// branch, with its link text and mtime.
+    fn assert_each_symlink_exactly_once(fx: &Fixture, context: &str) {
+        for (i, (rel, target)) in SYMLINKS.into_iter().enumerate() {
+            let copies: Vec<_> = [fx.on_cache_branch(rel), fx.on_backing_branch(rel)]
+                .into_iter()
+                .filter(|p| fs::symlink_metadata(p).is_ok())
+                .collect();
+            assert!(
+                copies.len() == 1,
+                "{context}: {rel} exists {} times",
+                copies.len()
+            );
+            assert_eq!(
+                fs::read_link(&copies[0]).unwrap().to_str(),
+                Some(target),
+                "{context}: {} has other link text",
+                copies[0].display()
+            );
+            let meta = fs::symlink_metadata(&copies[0]).unwrap();
+            assert_eq!(
+                meta.mtime(),
+                1_000 + i as i64,
+                "{context}: {} has another mtime",
+                copies[0].display()
+            );
+        }
+    }
+
+    #[test]
+    fn crash_at_every_operation_of_symlink_moves_is_recovered_by_the_next_run() {
+        for_every_operation(|n| {
+            let fx = Fixture::new();
+            create_symlinks(&fx);
+            let config = fx.move_everything_config();
+
+            let (out, reached) =
+                run_with_faults(with_short_retire_wait(&fx, &config), &format!("kill@{n}"));
+            if !reached {
+                assert_exit(&out, 0);
+                return false;
+            }
+            let out = common::output(&mut with_short_retire_wait(&fx, &config)).unwrap();
+
+            let context = format!(
+                "killed at operation {n}, then ran again; stderr:\n{}",
+                common::stderr(&out)
+            );
+            assert_eq!(out.status.code(), Some(0), "{context}");
+            assert_each_symlink_exactly_once(&fx, &context);
+            for (rel, _) in SYMLINKS {
+                assert!(
+                    fs::symlink_metadata(fx.on_backing_branch(rel)).is_ok(),
+                    "{context}: {rel} was not moved"
+                );
+            }
+            assert_no_staging_directories(&fx, &context);
+            true
+        });
+    }
+
+    #[test]
+    fn error_at_every_operation_of_symlink_moves_loses_nothing() {
+        for errno in ["eio", "enospc"] {
+            for_every_operation(|n| {
+                let fx = Fixture::new();
+                create_symlinks(&fx);
+
+                let fault = format!("{errno}@{n}");
+                let (out, reached) = run_with_faults(
+                    with_short_retire_wait(&fx, &fx.move_everything_config()),
+                    &fault,
+                );
+                if !reached {
+                    assert_exit(&out, 0);
+                    return false;
+                }
+                let context = format!("{fault}; stderr:\n{}", common::stderr(&out));
+                assert!(
+                    matches!(out.status.code(), Some(0 | 2)),
+                    "{context}\nexit: {:?}",
+                    out.status
+                );
+                assert_each_symlink_exactly_once(&fx, &context);
+
+                let out =
+                    common::output(&mut with_short_retire_wait(&fx, &fx.no_work_config())).unwrap();
+                let context = format!("{fault}, then recovered; stderr:\n{}", common::stderr(&out));
+                assert_eq!(out.status.code(), Some(0), "{context}");
+                assert_each_symlink_exactly_once(&fx, &context);
+                assert_no_staging_directories(&fx, &context);
+                true
+            });
+        }
+    }
+
     /// Recovery itself can crash at any step; the run after that finishes it.
     #[test]
     fn crash_at_every_operation_of_recovery_is_recovered_by_the_next_run() {

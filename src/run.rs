@@ -11,7 +11,7 @@ use crate::fsops::{FsOps, Lease};
 use crate::metadata::AllowedLosses;
 use crate::recovery::recover;
 use crate::scan::{Kind, scan};
-use crate::transaction::{Branch, Guard, MoveOutcome, Mover, STAGING, Skip};
+use crate::transaction::{Branch, Guard, MoveOutcome, Mover, STAGING};
 
 pub struct Outcome {
     /// Number of moves that were attempted and failed.
@@ -105,14 +105,10 @@ pub fn run(fs: &dyn FsOps, config: &Config) -> Result<Outcome> {
         if free + mover.retiring_bytes() >= config.target {
             break;
         }
+        mover.start(&entry.rel, entry.kind);
         if entry.kind == Kind::Special {
-            tally.record(vec![(
-                &entry.rel,
-                Ok(MoveOutcome::Skipped(Skip::SpecialFile)),
-            )]);
             continue;
         }
-        mover.start(&entry.rel);
         match free_space(fs, &cache_branch) {
             Ok(now) => free = now,
             Err(e) => {

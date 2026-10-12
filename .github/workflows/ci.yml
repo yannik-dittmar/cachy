@@ -1,7 +1,10 @@
 name: CI
 
 on:
+  # Branches other than main are tested through their pull request, not
+  # once more for each push.
   push:
+    branches: [main]
   pull_request:
 
 env:

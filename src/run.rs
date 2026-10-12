@@ -10,8 +10,8 @@ use crate::config::{Config, LeaseType};
 use crate::fsops::{FsOps, Lease};
 use crate::metadata::AllowedLosses;
 use crate::recovery::recover;
-use crate::scan::scan;
-use crate::transaction::{Branch, Guard, MoveOutcome, Mover, STAGING};
+use crate::scan::{Kind, scan};
+use crate::transaction::{Branch, Guard, MoveOutcome, Mover, STAGING, Skip};
 
 pub struct Outcome {
     /// Number of moves that were attempted and failed.
@@ -87,7 +87,7 @@ pub fn run(fs: &dyn FsOps, config: &Config) -> Result<Outcome> {
         config.threshold, config.target
     );
 
-    let units = scan(&cache_branch.path)
+    let units = scan(&cache_branch.path, &config.exclude)
         .with_context(|| format!("cannot scan cache branch {}", cache_branch.path.display()))?;
     let mut tally = Tally::default();
     let mut stopped = false;
@@ -104,6 +104,13 @@ pub fn run(fs: &dyn FsOps, config: &Config) -> Result<Outcome> {
         // Retiring moves free their space once their sources are unlinked.
         if free + mover.retiring_bytes() >= config.target {
             break;
+        }
+        if unit.kind == Kind::Special {
+            tally.record(vec![(
+                &unit.rel,
+                Ok(MoveOutcome::Skipped(Skip::SpecialFile)),
+            )]);
+            continue;
         }
         mover.start(&unit.rel);
         match free_space(fs, &cache_branch) {

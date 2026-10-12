@@ -94,6 +94,8 @@ pub enum Skip {
     Changed,
     /// It changed more recently than the minimum age.
     TooYoung,
+    /// It is a FIFO, socket or device node, which cachy never moves.
+    SpecialFile,
 }
 
 impl fmt::Display for Skip {
@@ -102,6 +104,7 @@ impl fmt::Display for Skip {
             Skip::InUse => "in use",
             Skip::Changed => "changed",
             Skip::TooYoung => "too young",
+            Skip::SpecialFile => "special file",
         })
     }
 }

@@ -18,11 +18,11 @@ fn fault_injection_is_unavailable_in_normal_builds() {
     let fx = Fixture::new();
     fx.cache_branch_file("file.bin", b"content", 1_000);
 
-    let out = fx
-        .command(&fx.move_everything_config())
-        .env("CACHY_FAULT", "kill@1")
-        .output()
-        .unwrap();
+    let out = common::output(
+        fx.command(&fx.move_everything_config())
+            .env("CACHY_FAULT", "kill@1"),
+    )
+    .unwrap();
 
     assert_exit(&out, 0);
     assert_eq!(
@@ -83,12 +83,19 @@ mod fault_injection {
 
     /// Runs `command` with `faults` (`<fault>@<n>[,…]`) injected. Returns
     /// the output and whether the run reached every faulty operation.
+    ///
+    /// Fails if a run that did not reach them skipped a move unit: it ended
+    /// early, not for lack of operations, and [`for_every_operation`] would
+    /// stop short of the operations after it.
     fn run_with_faults(mut command: Command, faults: &str) -> (Output, bool) {
-        let out = command.env("CACHY_FAULT", faults).output().unwrap();
-        let injected = common::stderr(&out)
-            .matches("cachy: fault injection:")
-            .count();
+        let out = common::output(command.env("CACHY_FAULT", faults)).unwrap();
+        let err = common::stderr(&out);
+        let injected = err.matches("cachy: fault injection:").count();
         let reached = injected == faults.split(',').count();
+        assert!(
+            reached || !err.contains("cachy: skipped"),
+            "{faults}: the run skipped a move unit; stderr:\n{err}"
+        );
         (out, reached)
     }
 
@@ -212,7 +219,7 @@ mod fault_injection {
                 assert_exit(&out, 0);
                 return false;
             }
-            let out = with_short_retire_wait(&fx, &config).output().unwrap();
+            let out = common::output(&mut with_short_retire_wait(&fx, &config)).unwrap();
 
             let context = format!(
                 "killed at operation {n}, then ran again; stderr:\n{}",
@@ -255,9 +262,8 @@ mod fault_injection {
             );
             assert_each_exactly_once(&fx, &context);
 
-            let out = with_short_retire_wait(&fx, &fx.no_work_config())
-                .output()
-                .unwrap();
+            let out =
+                common::output(&mut with_short_retire_wait(&fx, &fx.no_work_config())).unwrap();
             let context = format!("{fault}, then recovered; stderr:\n{}", common::stderr(&out));
             assert_eq!(out.status.code(), Some(0), "{context}");
             assert_each_exactly_once(&fx, &context);
@@ -317,7 +323,7 @@ mod fault_injection {
             found.1 |= retired;
             drop(found);
 
-            let out = with_short_retire_wait(&fx, &config).output().unwrap();
+            let out = common::output(&mut with_short_retire_wait(&fx, &config)).unwrap();
 
             let context = format!(
                 "killed at operation {n}, then ran again; stderr:\n{}",
@@ -361,7 +367,7 @@ mod fault_injection {
                 assert_exit(&out, 0);
                 return false;
             }
-            let out = with_short_retire_wait(&fx, &config).output().unwrap();
+            let out = common::output(&mut with_short_retire_wait(&fx, &config)).unwrap();
 
             let context = format!(
                 "killed at operation {n}, then ran again; stderr:\n{}",
@@ -463,7 +469,7 @@ mod fault_injection {
                     assert_exit(&out, 2);
                     return false;
                 }
-                let out = with_short_retire_wait(&fx, &config).output().unwrap();
+                let out = common::output(&mut with_short_retire_wait(&fx, &config)).unwrap();
 
                 let context = format!(
                     "{faults}, then ran again; stderr:\n{}",

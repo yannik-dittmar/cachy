@@ -22,7 +22,7 @@ use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Mutex, MutexGuard, RwLock};
 use std::time::{Duration, Instant};
 
 use rustix::fs::{StatVfs, Timestamps, statvfs};
@@ -106,6 +106,30 @@ fn privileged() -> bool {
 /// then returns early. CI shows the note (`--show-output`).
 pub fn skip(reason: &str) {
     eprintln!("skipped: {reason}");
+}
+
+/// A child process starts with a copy of its parent's descriptors and keeps
+/// it until it execs. A file that one test thread has open for writing can
+/// thus stay open in a child that another thread spawned meanwhile, and make
+/// cachy's lease on it fail as if the file were in use. Test files are written
+/// holding this lock exclusively, and children are spawned holding it shared:
+/// `Command::spawn` returns only once the child has exec'd, which closes the
+/// copies.
+static SPAWN: RwLock<()> = RwLock::new(());
+
+/// Spawns `command` so that it holds no test file open for writing.
+pub fn spawn(command: &mut Command) -> std::io::Result<Child> {
+    let _spawning = SPAWN.read().unwrap_or_else(|e| e.into_inner());
+    command.spawn()
+}
+
+/// Like [`Command::output`], but spawns `command` with [`spawn`].
+pub fn output(command: &mut Command) -> std::io::Result<Output> {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    spawn(command)?.wait_with_output()
 }
 
 /// Tests that set thresholds from measured free space share the cache
@@ -250,7 +274,7 @@ impl Fixture {
     /// Starts `cachy run --config <file>` without waiting for it, so a test
     /// can act on the branches while the run is in progress.
     pub fn spawn(&self, config: &str) -> Child {
-        self.command(config).spawn().expect("spawn cachy")
+        spawn(&mut self.command(config)).expect("spawn cachy")
     }
 
     /// `cachy run --config <file>` with the given config file content, for a
@@ -330,11 +354,8 @@ impl Drop for CachePool {
 /// Runs a command as root through passwordless sudo, which the privileged tier
 /// has.
 pub fn sudo(args: &[&OsStr]) -> Result<(), String> {
-    let out = Command::new("sudo")
-        .arg("-n")
-        .args(args)
-        .output()
-        .map_err(|e| format!("sudo: {e}"))?;
+    let out =
+        output(Command::new("sudo").arg("-n").args(args)).map_err(|e| format!("sudo: {e}"))?;
     if out.status.success() {
         Ok(())
     } else {
@@ -349,20 +370,18 @@ pub fn sudo(args: &[&OsStr]) -> Result<(), String> {
 /// The ZFS dataset that holds `path`, for commands such as
 /// `sudo zfs snapshot <dataset>@<name>`.
 pub fn zfs_dataset(path: &Path) -> String {
-    let out = Command::new("findmnt")
-        .args(["--noheadings", "--output", "SOURCE", "--target"])
-        .arg(path)
-        .output()
-        .expect("spawn findmnt");
+    let out = output(
+        Command::new("findmnt")
+            .args(["--noheadings", "--output", "SOURCE", "--target"])
+            .arg(path),
+    )
+    .expect("spawn findmnt");
     assert!(out.status.success(), "findmnt {}", path.display());
     String::from_utf8(out.stdout).unwrap().trim().to_owned()
 }
 
 pub fn cachy(args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_cachy"))
-        .args(args)
-        .output()
-        .expect("spawn cachy")
+    output(Command::new(env!("CARGO_BIN_EXE_cachy")).args(args)).expect("spawn cachy")
 }
 
 /// Waits until `path` exists, polling without sleeping so that a test can
@@ -400,6 +419,7 @@ pub fn assert_exit(out: &Output, code: i32) -> String {
 }
 
 fn write_file(path: &Path, content: &[u8], mtime: i64) {
+    let _writing = SPAWN.write().unwrap_or_else(|e| e.into_inner());
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(path, content).unwrap();
     let ts = rustix::fs::Timespec {

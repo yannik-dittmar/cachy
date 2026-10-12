@@ -169,6 +169,9 @@ impl Drop for Snapshot {
 /// must not wait for it.
 #[test]
 fn many_small_files_move_without_waiting_for_each_retire() {
+    // Writes on ZFS take up several times their size in free space until
+    // they sync, so no test in this file writes while another measures.
+    let _lock = free_space_lock();
     let fx = Fixture::new();
     for i in 0..20 {
         fx.cache_branch_file(&format!("small/{i}.txt"), b"tiny", 1_000 + i);
@@ -258,16 +261,19 @@ fn publish_never_replaces_an_existing_backing_file() {
 }
 
 /// `bytes` as a percentage of the cache branch's size, to 12 decimals,
-/// rounded down.
-fn percent_of_cache_branch(fx: &Fixture, bytes: u64) -> String {
+/// rounded down, or `None` if `bytes` exceed the size.
+fn percent_of_cache_branch(fx: &Fixture, bytes: u64) -> Option<String> {
     let s = rustix::fs::statvfs(fx.cache_branch.path()).unwrap();
     let size = s.f_blocks as u128 * s.f_frsize as u128;
+    if bytes as u128 > size {
+        return None;
+    }
     let scaled = bytes as u128 * 100 * 10u128.pow(12) / size;
-    format!(
+    Some(format!(
         "{}.{:012}%",
         scaled / 10u128.pow(12),
         scaled % 10u128.pow(12)
-    )
+    ))
 }
 
 #[test]
@@ -278,9 +284,14 @@ fn percentage_threshold_and_target_move_like_the_equivalent_byte_sizes() {
     let free = fx.cache_branch_free();
     let (threshold, target) = (free + MIB, free + 2 * MIB + MIB / 2);
     let in_bytes = fx.config(&threshold.to_string(), &target.to_string());
+    let Some(target_percent) = percent_of_cache_branch(&fx, target) else {
+        // A ZFS dataset's size is its own data plus its free space.
+        skip("the target exceeds the cache branch's size");
+        return;
+    };
     let in_percent = fx.config(
-        &percent_of_cache_branch(&fx, threshold),
-        &percent_of_cache_branch(&fx, target),
+        &percent_of_cache_branch(&fx, threshold).unwrap(),
+        &target_percent,
     );
     let planned = |config: &str| {
         let out = common::output(fx.command(config).arg("--dry-run")).unwrap();
@@ -302,4 +313,25 @@ fn percentage_threshold_and_target_move_like_the_equivalent_byte_sizes() {
     for i in 3..5 {
         assert_kept(&fx, i);
     }
+}
+
+/// A group of two names takes up its space once, so it consumes that much of
+/// the byte budget, not twice as much.
+#[test]
+fn group_consumes_the_byte_budget_once() {
+    let _lock = free_space_lock();
+    let fx = Fixture::new();
+    let content = content(0);
+    fx.cache_branch_hardlinks(&["one.bin", "two.bin"], &content, 1_000);
+    fx.cache_branch_file("next.bin", &content, 2_000);
+    fx.cache_branch_file("last.bin", &content, 3_000);
+    let free = fx.cache_branch_free();
+    let config = fx.config(&(free + 1).to_string(), &(free + MIB + MIB / 2).to_string());
+
+    let err = assert_exit(&fx.run(&config), 0);
+
+    assert!(err.contains("2 moved"), "stderr:\n{err}");
+    assert!(fx.on_backing_branch("one.bin").exists());
+    assert!(fx.on_backing_branch("next.bin").exists());
+    assert!(fx.on_cache_branch("last.bin").exists());
 }

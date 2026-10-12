@@ -1,6 +1,7 @@
 //! The YAML configuration: parsed and validated into a typed, immutable value.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
@@ -14,6 +15,12 @@ pub struct Config {
     pub threshold: u64,
     #[serde(deserialize_with = "byte_size")]
     pub target: u64,
+    #[serde(default = "default_minimum_age", deserialize_with = "duration")]
+    pub minimum_age: Duration,
+}
+
+fn default_minimum_age() -> Duration {
+    Duration::from_secs(15 * 60)
 }
 
 impl Config {
@@ -68,6 +75,44 @@ fn byte_size<'de, D: serde::Deserializer<'de>>(de: D) -> Result<u64, D::Error> {
     }
 
     de.deserialize_any(ByteSize)
+}
+
+/// A duration: an integer with an `s`, `m`, `h` or `d` suffix (`15m` is 900
+/// seconds).
+fn duration<'de, D: serde::Deserializer<'de>>(de: D) -> Result<Duration, D::Error> {
+    struct Dur;
+
+    impl serde::de::Visitor<'_> for Dur {
+        type Value = Duration;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a duration such as 15m")
+        }
+
+        fn visit_str<E: serde::de::Error>(self, s: &str) -> Result<Duration, E> {
+            parse_duration(s).ok_or_else(|| {
+                E::custom(format!(
+                    "invalid duration `{s}`: expected a whole number with an s, m, h or d suffix"
+                ))
+            })
+        }
+    }
+
+    de.deserialize_str(Dur)
+}
+
+fn parse_duration(s: &str) -> Option<Duration> {
+    let (digits, unit) = match s.as_bytes().last()? {
+        b's' => (&s[..s.len() - 1], 1),
+        b'm' => (&s[..s.len() - 1], 60),
+        b'h' => (&s[..s.len() - 1], 60 * 60),
+        b'd' => (&s[..s.len() - 1], 24 * 60 * 60),
+        _ => return None,
+    };
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some(Duration::from_secs(digits.parse::<u64>().ok()?.checked_mul(unit)?))
 }
 
 fn parse_byte_size(s: &str) -> Option<u64> {

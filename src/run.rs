@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use crate::config::Config;
 use crate::fsops::FsOps;
 use crate::scan::scan;
-use crate::transaction::{Branch, STAGING, move_file};
+use crate::transaction::{Branch, Guard, Outcome as MoveOutcome, STAGING, move_file};
 
 pub struct Outcome {
     /// Number of moves that were attempted and failed.
@@ -51,17 +51,26 @@ pub fn run(fs: &dyn FsOps, config: &Config) -> Result<Outcome> {
         config.threshold, config.target
     );
 
+    ignore_lease_break_signal();
+    let guard = Guard {
+        minimum_age: config.minimum_age,
+    };
     let units = scan(&cache_branch.path)
         .with_context(|| format!("cannot scan cache branch {}", cache_branch.path.display()))?;
     let mut moved = 0;
+    let mut skipped = 0;
     let mut failed = 0;
     let mut stopped = false;
     for unit in &units {
         if free >= config.target {
             break;
         }
-        match move_file(fs, &cache_branch, &backing_branch, &unit.rel) {
-            Ok(()) => moved += 1,
+        match move_file(fs, &cache_branch, &backing_branch, &unit.rel, &guard) {
+            Ok(MoveOutcome::Moved) => moved += 1,
+            Ok(MoveOutcome::Skipped(reason)) => {
+                skipped += 1;
+                eprintln!("cachy: skipped {}: {reason}", unit.rel.display());
+            }
             Err(e) => {
                 failed += 1;
                 eprintln!("cachy: error: move of {} failed: {e:#}", unit.rel.display());
@@ -87,8 +96,15 @@ pub fn run(fs: &dyn FsOps, config: &Config) -> Result<Outcome> {
             config.target
         );
     }
-    eprintln!("cachy: run finished: {moved} moved, {failed} failed");
+    eprintln!("cachy: run finished: {moved} moved, {skipped} skipped, {failed} failed");
     Ok(Outcome { failed, stopped })
+}
+
+/// A lease break signals its holder with `SIGIO`, which would terminate cachy.
+/// Moves notice a break by querying their lease instead.
+fn ignore_lease_break_signal() {
+    // SAFETY: setting a signal to SIG_IGN installs no handler code.
+    unsafe { libc::signal(libc::SIGIO, libc::SIG_IGN) };
 }
 
 fn free_space(fs: &dyn FsOps, cache_branch: &Branch) -> Result<u64> {

@@ -106,6 +106,21 @@ fn missing_backing_branch_is_refused() {
 }
 
 #[test]
+fn malformed_minimum_age_is_refused() {
+    for age in ["15", "15x", "1.5h", "m", "-5m"] {
+        let fx = Fixture::new();
+        let config = fx
+            .config("1G", "2G")
+            .replace("minimum_age: 0s", &format!("minimum_age: {age}"));
+
+        let err = assert_exit(&fx.run(&config), 1);
+
+        assert!(err.contains("minimum_age"), "stderr:\n{err}");
+        assert!(err.contains(&format!("`{age}`")), "stderr:\n{err}");
+    }
+}
+
+#[test]
 fn malformed_byte_size_is_refused() {
     let fx = Fixture::new();
     let config = fx.config("1.5G", "2G");

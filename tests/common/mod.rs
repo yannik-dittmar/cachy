@@ -21,10 +21,12 @@
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Child, Command, Output, Stdio};
 use std::sync::{Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use rustix::fs::{StatVfs, Timestamps, statvfs};
+use rustix::process::{Pid, Signal, kill_process};
 use tempfile::TempDir;
 
 const CACHE_BRANCH_FS: &str = "CACHY_TEST_CACHE_BRANCH_FS";
@@ -172,10 +174,11 @@ impl Fixture {
     }
 
     /// A valid config for this fixture's branches with the given threshold and
-    /// target, as YAML scalars.
+    /// target, as YAML scalars. Its minimum age is `0s`, because files that
+    /// tests create always have a fresh ctime.
     pub fn config(&self, threshold: &str, target: &str) -> String {
         format!(
-            "cache_branch: {}\nbacking_branches:\n  - {}\nthreshold: {threshold}\ntarget: {target}\n",
+            "cache_branch: {}\nbacking_branches:\n  - {}\nthreshold: {threshold}\ntarget: {target}\nminimum_age: 0s\n",
             self.cache_branch.path().display(),
             self.backing_branch.path().display(),
         )
@@ -197,9 +200,20 @@ impl Fixture {
 
     /// Runs `cachy run --config <file>` with the given config file content.
     pub fn run(&self, config: &str) -> Output {
+        self.spawn(config).wait_with_output().expect("wait for cachy")
+    }
+
+    /// Starts `cachy run --config <file>` without waiting for it, so a test
+    /// can act on the branches while the run is in progress.
+    pub fn spawn(&self, config: &str) -> Child {
         let path = self.scratch.path().join("cachy.yml");
         fs::write(&path, config).unwrap();
-        cachy(&["run", "--config", path.to_str().unwrap()])
+        Command::new(env!("CARGO_BIN_EXE_cachy"))
+            .args(["run", "--config", path.to_str().unwrap()])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn cachy")
     }
 
     /// Relative paths of all entries (files and directories) under a branch,
@@ -299,6 +313,29 @@ pub fn cachy(args: &[&str]) -> Output {
         .args(args)
         .output()
         .expect("spawn cachy")
+}
+
+/// Waits until `path` exists, polling without sleeping so that a test can
+/// catch a run at a step that lasts only milliseconds.
+pub fn wait_for(path: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !path.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "{} did not appear",
+            path.display()
+        );
+        std::hint::spin_loop();
+    }
+}
+
+/// Stops a running cachy (`SIGSTOP`) where it is; [`resume`] continues it.
+pub fn pause(child: &Child) {
+    kill_process(Pid::from_child(child), Signal::STOP).unwrap();
+}
+
+pub fn resume(child: &Child) {
+    kill_process(Pid::from_child(child), Signal::CONT).unwrap();
 }
 
 pub fn stderr(out: &Output) -> String {

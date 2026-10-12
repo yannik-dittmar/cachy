@@ -31,7 +31,6 @@ exclude:
   - snapraid.content
   - snapraid.parity
   - .snapraid/
-  - '**/.snapshots/'
 ```
 
 cachy moves regular files of any size, including empty ones, and never moves FIFOs, sockets or device nodes; it skips them as special files. It does not walk into other filesystems mounted inside the cache branch.

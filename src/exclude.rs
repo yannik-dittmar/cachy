@@ -13,15 +13,16 @@ use ignore::gitignore::{Gitignore, GitignoreBuilder};
 pub struct Exclusions(Gitignore);
 
 impl Exclusions {
+    /// Compiles `patterns`, or says why one of them is invalid.
     pub fn new(patterns: &[String]) -> Result<Exclusions, String> {
         let mut builder = GitignoreBuilder::new("");
         for pattern in patterns {
             if pattern.trim().is_empty() {
-                return Err("exclude: a pattern is empty".to_owned());
+                return Err("a pattern is empty".to_owned());
             }
             builder
                 .add_line(None, &anchored(pattern))
-                .map_err(|e| format!("exclude: invalid pattern `{pattern}`: {e}"))?;
+                .map_err(|e| format!("invalid pattern `{pattern}`: {e}"))?;
         }
         let gitignore = builder.build().map_err(|e| e.to_string())?;
         Ok(Exclusions(gitignore))
@@ -32,6 +33,13 @@ impl Exclusions {
     /// contents are never matched.
     pub fn excludes(&self, rel: &Path, is_dir: bool) -> bool {
         self.0.matched(rel, is_dir).is_ignore()
+    }
+}
+
+impl Default for Exclusions {
+    /// No patterns: nothing is excluded.
+    fn default() -> Exclusions {
+        Exclusions(Gitignore::empty())
     }
 }
 

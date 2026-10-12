@@ -6,7 +6,7 @@ mod common;
 use std::fs;
 use std::os::unix::fs::FileTypeExt;
 
-use common::{Fixture, assert_exit, root_available};
+use common::{Fixture, assert_exit, root_available, skip, sudo};
 use rustix::fs::{FileType, Mode, mknodat};
 
 #[test]
@@ -72,7 +72,7 @@ fn device_nodes_stay_in_place_and_are_skipped_as_special_files() {
         )
         .map_err(|e| e.to_string())
     } else {
-        common::sudo(&[
+        sudo(&[
             "mknod".as_ref(),
             fx.on_cache_branch("null").as_os_str(),
             "c".as_ref(),
@@ -82,7 +82,7 @@ fn device_nodes_stay_in_place_and_are_skipped_as_special_files() {
     };
     if let Err(e) = created {
         // Some filesystems (or their mount options) refuse device nodes.
-        common::skip(&format!("cannot create a device node: {e}"));
+        skip(&format!("cannot create a device node: {e}"));
         return;
     }
 

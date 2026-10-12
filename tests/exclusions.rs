@@ -139,6 +139,7 @@ fn excluded_directories_are_not_traversed() {
     populate(&control);
     let err = assert_exit(&control.run(&control.move_everything_config()), 0);
     assert!(err.contains("warning: skipping"), "stderr:\n{err}");
+
     let fx = Fixture::new();
     populate(&fx);
 

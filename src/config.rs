@@ -29,7 +29,7 @@ pub struct Config {
     pub verify: Verify,
     /// Gitignore patterns, anchored at the cache branch root, for files and
     /// directories that stay on the cache branch.
-    #[serde(default = "no_exclusions", deserialize_with = "exclusions")]
+    #[serde(default, deserialize_with = "exclusions")]
     pub exclude: Exclusions,
 }
 
@@ -70,13 +70,9 @@ pub enum LeaseType {
     Write,
 }
 
-fn no_exclusions() -> Exclusions {
-    Exclusions::new(&[]).expect("no patterns are valid")
-}
-
 fn exclusions<'de, D: serde::Deserializer<'de>>(de: D) -> Result<Exclusions, D::Error> {
     let patterns = Vec::<String>::deserialize(de)?;
-    Exclusions::new(&patterns).map_err(serde::de::Error::custom)
+    Exclusions::new(&patterns).map_err(|e| serde::de::Error::custom(format!("exclude: {e}")))
 }
 
 fn default_minimum_age() -> Duration {

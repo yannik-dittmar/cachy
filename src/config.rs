@@ -21,14 +21,17 @@ pub struct Config {
     pub lease_type: LeaseType,
 }
 
-/// Which opens by other processes keep a move unit from being moved.
+/// The kernel lease cachy holds on a move unit while moving it, which decides
+/// what makes the move unit in use.
 #[derive(Clone, Copy, Debug, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LeaseType {
-    /// Opens for writing (`F_RDLCK`).
+    /// A read lease (`F_RDLCK`): only opens for writing make a move unit in
+    /// use, so files that are only being read still move.
     #[default]
     Read,
-    /// Any open, even for reading only (`F_WRLCK`).
+    /// A write lease (`F_WRLCK`): any open, even for reading only, makes a
+    /// move unit in use.
     Write,
 }
 
@@ -93,9 +96,9 @@ fn byte_size<'de, D: serde::Deserializer<'de>>(de: D) -> Result<u64, D::Error> {
 /// A duration: an integer with an `s`, `m`, `h` or `d` suffix (`15m` is 900
 /// seconds).
 fn duration<'de, D: serde::Deserializer<'de>>(de: D) -> Result<Duration, D::Error> {
-    struct Dur;
+    struct DurationVisitor;
 
-    impl serde::de::Visitor<'_> for Dur {
+    impl serde::de::Visitor<'_> for DurationVisitor {
         type Value = Duration;
 
         fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
@@ -111,35 +114,36 @@ fn duration<'de, D: serde::Deserializer<'de>>(de: D) -> Result<Duration, D::Erro
         }
     }
 
-    de.deserialize_str(Dur)
+    de.deserialize_str(DurationVisitor)
 }
 
 fn parse_duration(s: &str) -> Option<Duration> {
-    let (digits, unit) = match s.as_bytes().last()? {
-        b's' => (&s[..s.len() - 1], 1),
-        b'm' => (&s[..s.len() - 1], 60),
-        b'h' => (&s[..s.len() - 1], 60 * 60),
-        b'd' => (&s[..s.len() - 1], 24 * 60 * 60),
-        _ => return None,
-    };
-    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    Some(Duration::from_secs(
-        digits.parse::<u64>().ok()?.checked_mul(unit)?,
-    ))
+    const UNITS: &[(u8, u64)] = &[(b's', 1), (b'm', 60), (b'h', 60 * 60), (b'd', 24 * 60 * 60)];
+    parse_with_unit(s, UNITS, None).map(Duration::from_secs)
 }
 
 fn parse_byte_size(s: &str) -> Option<u64> {
-    let (digits, shift) = match s.as_bytes().last()? {
-        b'K' => (&s[..s.len() - 1], 10),
-        b'M' => (&s[..s.len() - 1], 20),
-        b'G' => (&s[..s.len() - 1], 30),
-        b'T' => (&s[..s.len() - 1], 40),
-        _ => (s, 0),
+    const UNITS: &[(u8, u64)] = &[
+        (b'K', 1 << 10),
+        (b'M', 1 << 20),
+        (b'G', 1 << 30),
+        (b'T', 1 << 40),
+    ];
+    parse_with_unit(s, UNITS, Some(1))
+}
+
+/// Parses a whole number followed by one of the unit suffixes in `units`, or
+/// by no suffix if `bare` gives the unit for that case.
+fn parse_with_unit(s: &str, units: &[(u8, u64)], bare: Option<u64>) -> Option<u64> {
+    let suffixed = units
+        .iter()
+        .find(|(suffix, _)| s.as_bytes().last() == Some(suffix));
+    let (digits, unit) = match suffixed {
+        Some((_, unit)) => (&s[..s.len() - 1], *unit),
+        None => (s, bare?),
     };
     if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
-    digits.parse::<u64>().ok()?.checked_mul(1 << shift)
+    digits.parse::<u64>().ok()?.checked_mul(unit)
 }

@@ -33,6 +33,9 @@ const CACHE_BRANCH_FS: &str = "CACHY_TEST_CACHE_BRANCH_FS";
 const BACKING_BRANCH_FS: &str = "CACHY_TEST_BACKING_BRANCH_FS";
 const PRIVILEGED: &str = "CACHY_TEST_PRIVILEGED";
 
+/// The staging directory at the root of each branch.
+const STAGING: &str = ".cachy-staging";
+
 /// A filesystem kind, recognised by its `statfs` magic number.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FsKind {
@@ -151,6 +154,22 @@ impl Fixture {
 
     pub fn on_backing_branch(&self, rel: &str) -> PathBuf {
         self.backing_branch.path().join(rel)
+    }
+
+    /// Where a move of `rel` keeps the retired source on the cache branch.
+    pub fn staged_on_cache_branch(&self, rel: &str) -> PathBuf {
+        self.on_cache_branch(STAGING).join(rel)
+    }
+
+    /// Where a move of `rel` writes its copy on the backing branch before
+    /// publishing it.
+    pub fn staged_on_backing_branch(&self, rel: &str) -> PathBuf {
+        self.on_backing_branch(STAGING).join(rel)
+    }
+
+    pub fn assert_no_staging_directories(&self) {
+        assert!(!self.on_cache_branch(STAGING).exists());
+        assert!(!self.on_backing_branch(STAGING).exists());
     }
 
     /// Creates a file on the cache branch with the given content and mtime

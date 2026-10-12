@@ -7,7 +7,6 @@ use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
-use std::path::PathBuf;
 use std::process::Output;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -93,7 +92,7 @@ fn run_interrupted_mid_copy(
     during_copy: impl FnOnce(),
 ) -> (Output, Instant) {
     let child = fx.spawn(&move_everything(fx));
-    wait_for(&temp_file(fx, rel));
+    wait_for(&fx.staged_on_backing_branch(rel));
     pause(&child);
     assert!(
         !fx.on_backing_branch(rel).exists(),
@@ -103,16 +102,6 @@ fn run_interrupted_mid_copy(
     resume(&child);
     let resumed = Instant::now();
     (child.wait_with_output().unwrap(), resumed)
-}
-
-/// Where a move of `rel` writes its copy on the backing branch.
-fn temp_file(fx: &Fixture, rel: &str) -> PathBuf {
-    fx.on_backing_branch(".cachy-staging").join(rel)
-}
-
-fn assert_no_staging_directories(fx: &Fixture) {
-    assert!(!fx.on_cache_branch(".cachy-staging").exists());
-    assert!(!fx.on_backing_branch(".cachy-staging").exists());
 }
 
 #[test]
@@ -147,7 +136,7 @@ fn writer_opening_mid_copy_aborts_the_move() {
     expected[..3].copy_from_slice(b"new");
     assert!(fs::read(&source).unwrap() == expected, "the source changed");
     assert!(!fx.on_backing_branch("media/clip.bin").exists());
-    assert_no_staging_directories(&fx);
+    fx.assert_no_staging_directories();
 }
 
 /// Regression: upstream published the old content and deleted the new one.
@@ -169,13 +158,32 @@ fn atomic_save_during_copy_aborts_the_move() {
     assert!(err.contains("docs/report.odt: changed"), "stderr:\n{err}");
     assert_eq!(fs::read(&source).unwrap(), b"the new version");
     assert!(!fx.on_backing_branch("docs/report.odt").exists());
-    assert_no_staging_directories(&fx);
+    fx.assert_no_staging_directories();
+}
+
+#[test]
+fn renaming_the_parent_directory_during_copy_aborts_the_move() {
+    let fx = Fixture::new();
+    fx.cache_branch_file("show/episode.mkv", &content(LARGE, 10), 1_000);
+
+    let (out, _) = run_interrupted_mid_copy(&fx, "show/episode.mkv", || {
+        fs::rename(fx.on_cache_branch("show"), fx.on_cache_branch("show-s01")).unwrap();
+    });
+
+    let err = assert_exit(&out, 0);
+    assert!(err.contains("show/episode.mkv: changed"), "stderr:\n{err}");
+    assert!(
+        fs::read(fx.on_cache_branch("show-s01/episode.mkv")).unwrap() == content(LARGE, 10),
+        "the source changed"
+    );
+    assert!(!fx.on_backing_branch("show/episode.mkv").exists());
+    assert!(!fx.on_backing_branch("show-s01/episode.mkv").exists());
 }
 
 /// Regression: a writer that resolved the path before the source was retired
 /// must not write into an unlinked inode.
 #[test]
-fn write_during_retire_grace_period_rolls_the_move_back() {
+fn write_while_the_retired_source_waits_rolls_the_move_back() {
     let fx = Fixture::new();
     fx.cache_branch_file("db/journal.log", &content(MIB, 6), 1_000);
     // An O_PATH descriptor names the inode without opening it, like a path
@@ -188,7 +196,7 @@ fn write_during_retire_grace_period_rolls_the_move_back() {
     .unwrap();
     let child = fx.spawn(&move_everything(&fx));
 
-    wait_for(&fx.on_cache_branch(".cachy-staging/db/journal.log"));
+    wait_for(&fx.staged_on_cache_branch("db/journal.log"));
     let mut writer = OpenOptions::new()
         .append(true)
         .open(format!("/proc/self/fd/{}", looked_up.as_raw_fd()))
@@ -205,7 +213,7 @@ fn write_during_retire_grace_period_rolls_the_move_back() {
         "the write was lost"
     );
     assert!(!fx.on_backing_branch("db/journal.log").exists());
-    assert_no_staging_directories(&fx);
+    fx.assert_no_staging_directories();
 }
 
 #[test]

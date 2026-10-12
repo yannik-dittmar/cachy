@@ -148,6 +148,5 @@ fn publish_never_replaces_an_existing_backing_file() {
     for i in [0, 2, 3, 4] {
         assert_moved(&fx, i);
     }
-    assert!(!fx.on_backing_branch(".cachy-staging").exists());
-    assert!(!fx.on_cache_branch(".cachy-staging").exists());
+    fx.assert_no_staging_directories();
 }

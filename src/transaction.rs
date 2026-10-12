@@ -24,7 +24,7 @@ pub const STAGING: &str = ".cachy-staging";
 /// How long a retired source stays in the staging directory before it is
 /// unlinked. An open that looked up the source before it was retired, but
 /// reaches the lease check only after this, is not caught.
-const RETIRE_GRACE: Duration = Duration::from_secs(1);
+const RETIRE_WAIT: Duration = Duration::from_secs(1);
 const COPY_BUF: usize = 1 << 20;
 const DIR_MODE: u32 = 0o755;
 const STAGING_MODE: u32 = 0o700;
@@ -49,7 +49,7 @@ impl Branch {
     }
 }
 
-pub enum Outcome {
+pub enum MoveOutcome {
     Moved,
     /// The move unit was left where it is, untouched.
     Skipped(Skip),
@@ -58,7 +58,8 @@ pub enum Outcome {
 /// Why a move unit was skipped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Skip {
-    /// Another process has it open for writing, or opened it during the move.
+    /// Another process had it open in a way that conflicts with the lease, or
+    /// opened it so during the move.
     InUse,
     /// It was changed, replaced or renamed during the move.
     Changed,
@@ -109,10 +110,10 @@ pub fn move_file(
     backing_branch: &Branch,
     rel: &Path,
     guard: &Guard,
-) -> Result<Outcome> {
+) -> Result<MoveOutcome> {
     match transact(fs, cache_branch, backing_branch, rel, guard) {
-        Ok(()) => Ok(Outcome::Moved),
-        Err(Abort::Skip(skip)) => Ok(Outcome::Skipped(skip)),
+        Ok(()) => Ok(MoveOutcome::Moved),
+        Err(Abort::Skip(skip)) => Ok(MoveOutcome::Skipped(skip)),
         Err(Abort::Fail(e)) => Err(e),
     }
 }
@@ -160,15 +161,15 @@ fn transact(
 struct Published<'a> {
     dir: OwnedFd,
     name: &'a Path,
-    dev: u64,
-    ino: u64,
+    /// The copy as it was right after publishing.
+    identity: Identity,
 }
 
 impl Published<'_> {
     fn remove(&self, fs: &dyn FsOps) -> Result<()> {
         match fs.stat_at(self.dir.as_fd(), self.name) {
-            Ok(stat) if (stat.st_dev, stat.st_ino) == (self.dev, self.ino) => {}
-            // Replaced or removed since: no longer cachy's to remove.
+            Ok(stat) if Identity::of(&stat) == self.identity => {}
+            // Replaced, changed or removed since: no longer cachy's own.
             Ok(_) => return Ok(()),
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
             Err(e) => return Err(e).context("stat published copy"),
@@ -190,7 +191,6 @@ fn publish<'a>(
     staged_parent: &OwnedFd,
     copy: &OwnedFd,
 ) -> Result<Published<'a>> {
-    let stat = fs.fstat(copy.as_fd()).context("fstat temp file")?;
     let dest_parent = make_dirs(fs, &backing_branch.fd, parent, DIR_MODE)
         .context("create destination directory")?;
     fs.rename_noreplace(staged_parent.as_fd(), name, dest_parent.as_fd(), name)
@@ -199,16 +199,17 @@ fn publish<'a>(
         .context("fsync destination directory")?;
     fs.fsync(staged_parent.as_fd())
         .context("fsync staging directory on the backing branch")?;
+    // After the rename, which may have changed the copy's ctime.
+    let identity = Identity::of(&fs.fstat(copy.as_fd()).context("fstat published copy")?);
     Ok(Published {
         dir: dest_parent,
         name,
-        dev: stat.st_dev,
-        ino: stat.st_ino,
+        identity,
     })
 }
 
 /// Removes the source from the cache branch. It is first renamed into the
-/// cache branch's staging directory and kept there for a grace period, so an
+/// cache branch's staging directory and kept there for [`RETIRE_WAIT`], so an
 /// open that looked up the source before the rename reaches the lease check
 /// in time to roll the move back.
 fn retire(
@@ -224,10 +225,17 @@ fn retire(
 
     fs.rename_noreplace(source.dir.as_fd(), name, retired_parent.as_fd(), name)
         .context("retire: rename source into staging directory")?;
-    fs.fsync(source.dir.as_fd())
-        .context("fsync source directory")?;
-    thread::sleep(RETIRE_GRACE);
-    let retired = match source.check_lease() {
+    // From here on, every way out either unlinks the retired source or puts
+    // it back, so no opener blocked on the lease is left with a hidden file.
+    let unused = fs
+        .fsync(source.dir.as_fd())
+        .context("fsync source directory")
+        .map_err(Abort::from)
+        .and_then(|()| {
+            thread::sleep(RETIRE_WAIT);
+            source.check_lease()
+        });
+    let retired = match unused {
         Ok(()) => unlink_retired(fs, &retired_parent, name),
         Err(abort) => roll_back(fs, source, &retired_parent, published).and(Err(abort)),
     };
@@ -274,9 +282,12 @@ fn staging_dirs(fs: &dyn FsOps, branch: &Branch, parent: &Path) -> io::Result<(O
 /// The source of a move, held open under a lease for the whole move.
 struct Source<'a> {
     fs: &'a dyn FsOps,
-    /// The source's directory on the cache branch.
-    dir: OwnedFd,
+    cache_branch: &'a Branch,
+    /// The source's relpath, split into its parent directory and name.
+    parent: &'a Path,
     name: &'a Path,
+    /// The parent directory, as opened when the move started.
+    dir: OwnedFd,
     file: OwnedFd,
     lease: Lease,
     /// The source as it was when the lease was taken.
@@ -326,8 +337,8 @@ impl<'a> Source<'a> {
     /// the minimum age.
     fn open(
         fs: &'a dyn FsOps,
-        cache_branch: &Branch,
-        parent: &Path,
+        cache_branch: &'a Branch,
+        parent: &'a Path,
         name: &'a Path,
         guard: &Guard,
     ) -> Result<Source<'a>, Abort> {
@@ -347,8 +358,10 @@ impl<'a> Source<'a> {
         }
         Ok(Source {
             fs,
-            dir,
+            cache_branch,
+            parent,
             name,
+            dir,
             file,
             lease,
             identity,
@@ -356,19 +369,29 @@ impl<'a> Source<'a> {
     }
 
     /// Checks, right before publishing, that the copy is still current: the
-    /// lease is held, the source is unchanged, and its path still names it.
-    /// An atomic save during the copy fails the last check.
+    /// lease is held, the source is unchanged, and its relpath, looked up
+    /// afresh from the cache branch root, still names it. An atomic save or a
+    /// renamed directory during the copy fails the last check.
     fn revalidate(&self) -> Result<(), Abort> {
         self.check_lease()?;
         let now = self.fs.fstat(self.file.as_fd()).context("fstat source")?;
         if Identity::of(&now) != self.identity {
             return Err(Abort::Skip(Skip::Changed));
         }
-        match self.fs.stat_at(self.dir.as_fd(), self.name) {
-            Ok(at_path) if (at_path.st_dev, at_path.st_ino) == (now.st_dev, now.st_ino) => Ok(()),
+        let at_path = open_dirs(self.fs, &self.cache_branch.fd, self.parent)
+            .and_then(|dir| self.fs.stat_at(dir.as_fd(), self.name));
+        match at_path {
+            Ok(stat) if Identity::of(&stat) == self.identity => Ok(()),
             Ok(_) => Err(Abort::Skip(Skip::Changed)),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Err(Abort::Skip(Skip::Changed)),
-            Err(e) => Err(anyhow::Error::from(e).context("stat source path").into()),
+            Err(e)
+                if matches!(
+                    e.raw_os_error(),
+                    Some(libc::ENOENT | libc::ENOTDIR | libc::ELOOP)
+                ) =>
+            {
+                Err(Abort::Skip(Skip::Changed))
+            }
+            Err(e) => Err(anyhow::Error::from(e).context("look up source path").into()),
         }
     }
 

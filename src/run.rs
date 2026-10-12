@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use crate::config::{Config, LeaseType};
 use crate::fsops::{FsOps, Lease};
 use crate::scan::scan;
-use crate::transaction::{Branch, Guard, Outcome as MoveOutcome, STAGING, move_file};
+use crate::transaction::{Branch, Guard, MoveOutcome, STAGING, move_file};
 
 pub struct Outcome {
     /// Number of moves that were attempted and failed.

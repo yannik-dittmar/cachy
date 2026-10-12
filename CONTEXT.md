@@ -60,11 +60,11 @@ The step of a move, after publishing, that removes the move unit from the cache 
 _Avoid_: delete, clean up
 
 **Staging directory**:
-cachy's own directory at the root of each filesystem it writes to, holding the temp files and retired sources of unfinished moves; anything left in it after a crash belongs to an unfinished move and nothing else.
+cachy's own directory at the root of each filesystem it writes to, holding the temp files and retired sources of unfinished moves, and the directories that cachy is creating; anything left in it after a crash belongs to an unfinished move or directory creation and nothing else.
 _Avoid_: temp dir, journal
 
 **Leftover**:
-A temp file or retired source that an unfinished move left in a staging directory.
+A temp file or retired source that an unfinished move left in a staging directory, or an empty directory that an unfinished directory creation left there.
 _Avoid_: orphan
 
 **Recovery**:

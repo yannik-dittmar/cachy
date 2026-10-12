@@ -18,6 +18,9 @@ pub struct Outcome {
     pub failed: usize,
     /// Number of staging-directory leftovers that recovery could not resolve.
     pub unresolved: usize,
+    /// Number of directories created on the backing branch whose times could
+    /// not be set.
+    pub undated_dirs: usize,
     /// The run stopped early on an error outside any move.
     pub stopped: bool,
 }
@@ -25,7 +28,7 @@ pub struct Outcome {
 impl Outcome {
     /// Every attempted move succeeded and the run was not cut short.
     pub fn succeeded(&self) -> bool {
-        self.failed == 0 && self.unresolved == 0 && !self.stopped
+        self.failed == 0 && self.unresolved == 0 && self.undated_dirs == 0 && !self.stopped
     }
 }
 
@@ -62,6 +65,7 @@ pub fn run(fs: &dyn FsOps, config: &Config) -> Result<Outcome> {
             return Ok(Outcome {
                 failed: 0,
                 unresolved,
+                undated_dirs: 0,
                 stopped: true,
             });
         }
@@ -74,6 +78,7 @@ pub fn run(fs: &dyn FsOps, config: &Config) -> Result<Outcome> {
         return Ok(Outcome {
             failed: 0,
             unresolved,
+            undated_dirs: 0,
             stopped: false,
         });
     }
@@ -105,8 +110,8 @@ pub fn run(fs: &dyn FsOps, config: &Config) -> Result<Outcome> {
     }
     mover.finish();
     tally.record(mover.finished());
-    for (rel, e) in mover.date_created_dirs() {
-        tally.failed += 1;
+    let undated = mover.date_created_dirs();
+    for (rel, e) in &undated {
         eprintln!(
             "cachy: error: cannot set the times of created directory {}: {e:#}",
             rel.display()
@@ -135,6 +140,7 @@ pub fn run(fs: &dyn FsOps, config: &Config) -> Result<Outcome> {
     Ok(Outcome {
         failed,
         unresolved,
+        undated_dirs: undated.len(),
         stopped,
     })
 }

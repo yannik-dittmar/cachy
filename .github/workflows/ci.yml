@@ -1,0 +1,22 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup update stable && rustup default stable
+      - run: rustup component add rustfmt clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      # Integration tests put the cache branch on /dev/shm (tmpfs) and the
+      # backing branch on the runner's temp directory.
+      - run: cargo test --locked

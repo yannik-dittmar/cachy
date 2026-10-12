@@ -6,7 +6,7 @@ cachy is heavily inspired by [mergerfs-cache-mover](https://github.com/monstermu
 
 ## Status
 
-Early development. Nothing works yet.
+Early development. Do not use it on real data yet: `cachy run` can already move files, but it has no in-use guard, so it can move a file that an application is still writing.
 
 ## Licence
 

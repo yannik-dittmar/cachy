@@ -8,3 +8,12 @@ repository = "https://github.com/yannik-dittmar/cachy"
 publish = false
 
 [dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+rustix = { version = "1", features = ["fs"] }
+serde = { version = "1", features = ["derive"] }
+serde_yaml_ng = "0.10"
+
+[dev-dependencies]
+rustix = { version = "1", features = ["fs"] }
+tempfile = "3"

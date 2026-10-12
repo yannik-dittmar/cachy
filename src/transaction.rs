@@ -622,6 +622,8 @@ fn publish_symlink<'a>(
         Err(e) => return Err(e).context("publish"),
     }
     // A symlink cannot be fsynced; fsyncing its directory makes it durable.
+    // Its owner and timestamps may not be: on ZFS, the directory's fsync
+    // need not commit the symlink's own changes (see ADR 0002).
     let identity = fs
         .fsync(dest_parent.as_fd())
         .context("fsync destination directory")

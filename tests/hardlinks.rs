@@ -198,3 +198,48 @@ fn link_added_while_the_group_waits_in_its_retire_rolls_the_move_back() {
     }
     fx.assert_no_staging_directories();
 }
+
+#[test]
+fn dry_run_lists_a_group_once_and_a_partly_excluded_group_as_a_skip() {
+    let fx = Fixture::new();
+    fx.cache_branch_hardlinks(&["media/b.mkv", "media/a.mkv"], b"episode", 1_000);
+    fx.cache_branch_hardlinks(&["appdata/seed.mkv", "seeding/x.mkv"], b"seed", 2_000);
+    let config = fx.move_everything_config() + "exclude:\n  - /appdata/\n";
+
+    let out = common::output(fx.command(&config).arg("--dry-run")).unwrap();
+
+    assert_exit(&out, 0);
+    let planned = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(
+        planned.lines().skip(1).collect::<Vec<_>>(),
+        [
+            "would move media/a.mkv, media/b.mkv",
+            "would skip seeding/x.mkv: hardlink group partly excluded",
+        ],
+        "stdout:\n{planned}"
+    );
+    assert!(fx.on_cache_branch("media/a.mkv").exists());
+    fx.assert_no_staging_directories();
+}
+
+/// A group of two names takes up its space once, so it consumes that much of
+/// the byte budget, not twice as much.
+#[test]
+fn group_consumes_the_byte_budget_once() {
+    let _lock = common::free_space_lock();
+    let fx = Fixture::new();
+    let content: Vec<u8> = (0..MIB).map(|b| (b * 7 % 251) as u8).collect();
+    fx.cache_branch_hardlinks(&["one.bin", "two.bin"], &content, 1_000);
+    fx.cache_branch_file("next.bin", &content, 2_000);
+    fx.cache_branch_file("last.bin", &content, 3_000);
+    let free = fx.cache_branch_free();
+    let mib = MIB as u64;
+    let config = fx.config(&(free + 1).to_string(), &(free + mib + mib / 2).to_string());
+
+    let err = assert_exit(&fx.run(&config), 0);
+
+    assert!(err.contains("2 moved"), "stderr:\n{err}");
+    assert!(fx.on_backing_branch("one.bin").exists());
+    assert!(fx.on_backing_branch("next.bin").exists());
+    assert!(fx.on_cache_branch("last.bin").exists());
+}

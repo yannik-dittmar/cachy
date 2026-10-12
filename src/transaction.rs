@@ -598,3 +598,115 @@ fn split(rel: &Path) -> (&Path, &Path) {
     let name = Path::new(rel.file_name().expect("a move unit's relpath names a file"));
     (parent, name)
 }
+
+#[cfg(test)]
+mod tests {
+    use std::os::fd::BorrowedFd;
+    use std::os::unix::fs::MetadataExt;
+
+    use super::*;
+    use crate::fsops::RealFs;
+
+    /// The real filesystem operations, except that every fsync of one
+    /// directory fails with EIO.
+    struct FailingDirFsync {
+        dir: (u64, u64),
+    }
+
+    impl FsOps for FailingDirFsync {
+        fn open_dir(&self, dir: BorrowedFd, path: &Path) -> io::Result<OwnedFd> {
+            RealFs.open_dir(dir, path)
+        }
+        fn open_read(&self, dir: BorrowedFd, path: &Path) -> io::Result<OwnedFd> {
+            RealFs.open_read(dir, path)
+        }
+        fn create_new(&self, dir: BorrowedFd, path: &Path, mode: u32) -> io::Result<OwnedFd> {
+            RealFs.create_new(dir, path, mode)
+        }
+        fn mkdir(&self, dir: BorrowedFd, path: &Path, mode: u32) -> io::Result<()> {
+            RealFs.mkdir(dir, path, mode)
+        }
+        fn fstat(&self, fd: BorrowedFd) -> io::Result<Stat> {
+            RealFs.fstat(fd)
+        }
+        fn stat_at(&self, dir: BorrowedFd, path: &Path) -> io::Result<Stat> {
+            RealFs.stat_at(dir, path)
+        }
+        fn read(&self, fd: BorrowedFd, buf: &mut [u8]) -> io::Result<usize> {
+            RealFs.read(fd, buf)
+        }
+        fn write(&self, fd: BorrowedFd, buf: &[u8]) -> io::Result<usize> {
+            RealFs.write(fd, buf)
+        }
+        fn fsync(&self, fd: BorrowedFd) -> io::Result<()> {
+            let stat = RealFs.fstat(fd)?;
+            if (stat.st_dev, stat.st_ino) == self.dir {
+                return Err(io::Error::from_raw_os_error(libc::EIO));
+            }
+            RealFs.fsync(fd)
+        }
+        fn rename_noreplace(
+            &self,
+            from_dir: BorrowedFd,
+            from: &Path,
+            to_dir: BorrowedFd,
+            to: &Path,
+        ) -> io::Result<()> {
+            RealFs.rename_noreplace(from_dir, from, to_dir, to)
+        }
+        fn unlink(&self, dir: BorrowedFd, path: &Path) -> io::Result<()> {
+            RealFs.unlink(dir, path)
+        }
+        fn rmdir(&self, dir: BorrowedFd, path: &Path) -> io::Result<()> {
+            RealFs.rmdir(dir, path)
+        }
+        fn free_space(&self, fd: BorrowedFd) -> io::Result<u64> {
+            RealFs.free_space(fd)
+        }
+        fn set_lease(&self, fd: BorrowedFd, lease: Lease) -> io::Result<()> {
+            RealFs.set_lease(fd, lease)
+        }
+        fn lease(&self, fd: BorrowedFd) -> io::Result<Lease> {
+            RealFs.lease(fd)
+        }
+    }
+
+    /// If the source's directory cannot be fsynced once the source is
+    /// retired, the move fails with the source back in place, not left in the
+    /// staging directory where a blocked opener would write into it unseen.
+    #[test]
+    fn failed_fsync_after_retiring_the_source_puts_it_back() {
+        let cache = tempfile::tempdir_in("/dev/shm").unwrap();
+        let backing = tempfile::tempdir().unwrap();
+        std::fs::create_dir(cache.path().join("dir")).unwrap();
+        std::fs::write(cache.path().join("dir/file.bin"), b"content").unwrap();
+        let meta = std::fs::metadata(cache.path().join("dir")).unwrap();
+        let fs = FailingDirFsync {
+            dir: (meta.dev(), meta.ino()),
+        };
+        let cache_branch = Branch::open(cache.path()).unwrap();
+        let backing_branch = Branch::open(backing.path()).unwrap();
+        let guard = Guard {
+            lease: Lease::Read,
+            minimum_age: Duration::ZERO,
+        };
+        let rel = Path::new("dir/file.bin");
+
+        let mut mover = Mover::new(&fs, &cache_branch, &backing_branch, &guard);
+        mover.start(rel);
+        mover.finish();
+        let finished = mover.finished();
+
+        assert_eq!(finished.len(), 1);
+        let err = finished[0].1.as_ref().err().expect("the move failed");
+        assert!(
+            format!("{err:#}").contains("fsync source directory"),
+            "{err:#}"
+        );
+        assert_eq!(
+            std::fs::read(cache.path().join("dir/file.bin")).unwrap(),
+            b"content"
+        );
+        assert!(!cache.path().join(STAGING).join(rel).exists());
+    }
+}

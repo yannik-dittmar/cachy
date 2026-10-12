@@ -409,6 +409,22 @@ pub fn chown(path: &Path, uid: u32, gid: u32) {
     }
 }
 
+/// Sets the mode of `path`, through sudo unless the tests run as root, for a
+/// file that [`chown`] gave away. Check [`root_available`] first.
+pub fn chmod_as_root(path: &Path, mode: u32) {
+    if rustix::process::geteuid().is_root() {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+    } else {
+        sudo(&[
+            OsStr::new("chmod"),
+            OsStr::new(&format!("{mode:o}")),
+            path.as_os_str(),
+        ])
+        .unwrap();
+    }
+}
+
 /// The ZFS dataset that holds `path`, for commands such as
 /// `sudo zfs snapshot <dataset>@<name>`.
 pub fn zfs_dataset(path: &Path) -> String {

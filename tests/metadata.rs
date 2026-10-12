@@ -9,8 +9,8 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
 
 use common::{
-    ACCESS_ACL, DEFAULT_ACL, Fixture, acl_granting, assert_exit, chown, root_available, set_times,
-    set_xattr, skip, xattrs,
+    ACCESS_ACL, DEFAULT_ACL, Fixture, acl_granting, assert_exit, chmod_as_root, chown,
+    root_available, set_times, set_xattr, skip, xattrs,
 };
 
 fn mode(path: &Path) -> u32 {
@@ -59,7 +59,7 @@ fn moved_file_keeps_its_owner_and_group() {
     let source = fx.on_cache_branch("dir/file.bin");
     chown(&source, 1234, 5678);
     // A chown clears setuid; it must survive the move all the same.
-    set_mode(&source, 0o4644);
+    chmod_as_root(&source, 0o4644);
 
     assert_exit(&fx.run_as_root(&fx.move_everything_config()), 0);
 
@@ -218,7 +218,7 @@ fn created_directories_take_the_cache_directory_metadata() {
     fx.cache_branch_file("a/other.bin", b"other", 1_000);
     let (a, b) = (fx.on_cache_branch("a"), fx.on_cache_branch("a/b"));
     set_xattr(&a, "user.dir", b"a").unwrap();
-    if supports_acls(fx.cache_branch.path()) {
+    if supports_acls(fx.cache_branch.path()) && supports_acls(fx.backing_branch.path()) {
         set_xattr(&a, DEFAULT_ACL, &acl_granting(4321)).unwrap();
     }
     set_mode(&a, 0o750);
@@ -242,17 +242,7 @@ fn created_directories_take_the_cache_directory_metadata() {
             (before.mtime(), before.mtime_nsec()),
             "{rel}"
         );
-        let expected = xattrs(&cache_dir);
-        let backing_supports_acls = supports_acls(fx.backing_branch.path());
-        let expected: Vec<_> = expected
-            .into_iter()
-            .filter(|(name, _)| backing_supports_acls || !name.starts_with("system.posix_acl"))
-            .collect();
-        assert_eq!(
-            xattrs(&created).into_iter().collect::<Vec<_>>(),
-            expected,
-            "{rel}"
-        );
+        assert_eq!(xattrs(&created), xattrs(&cache_dir), "{rel}");
     }
     assert_eq!(mode(&fx.on_backing_branch("a")), 0o040_750);
 }

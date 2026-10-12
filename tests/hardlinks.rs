@@ -8,7 +8,7 @@ const MIB: usize = 1 << 20;
 use std::fs::{self, OpenOptions};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
-use common::{Fixture, assert_exit, set_times, set_xattr, wait_for, xattrs};
+use common::{Fixture, FsKind, assert_exit, set_times, set_xattr, wait_for, xattrs};
 
 #[test]
 fn group_moves_as_one_inode_with_all_its_links() {
@@ -19,7 +19,7 @@ fn group_moves_as_one_inode_with_all_its_links() {
         "media/show/episode.mkv",
         "media/copy.mkv",
     ];
-    let content = vec![7; MIB];
+    let content: Vec<u8> = (0..MIB).map(|b| (b * 7 % 251) as u8).collect();
     fx.cache_branch_hardlinks(&names, &content, 1_000);
     let free_before = fx.cache_branch_free();
 
@@ -29,10 +29,13 @@ fn group_moves_as_one_inode_with_all_its_links() {
         err.contains("1 moved, 0 skipped, 0 failed"),
         "stderr:\n{err}"
     );
-    assert!(
-        fx.cache_branch_free() >= free_before + MIB as u64,
-        "the group's space on the cache branch was not freed"
-    );
+    // ZFS shows freed space only once its transaction group syncs (#13).
+    if fx.cache_branch_fs != FsKind::Zfs {
+        assert!(
+            fx.cache_branch_free() >= free_before + MIB as u64,
+            "the group's space on the cache branch was not freed"
+        );
+    }
     let first = fs::metadata(fx.on_backing_branch(names[0])).unwrap();
     assert_eq!(first.nlink(), 3);
     for name in names {

@@ -6,7 +6,7 @@ mod common;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, OwnedFd};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
 use std::process::Output;
 use std::thread;
@@ -25,12 +25,6 @@ fn content(len: usize, seed: u8) -> Vec<u8> {
     (0..len).map(|b| (b * 7) as u8 ^ seed).collect()
 }
 
-/// A config whose threshold and target lie far above any test filesystem's
-/// free space, so a run moves every eligible move unit.
-fn move_everything(fx: &Fixture) -> String {
-    fx.config("1T", "2T")
-}
-
 #[test]
 fn file_open_for_writing_is_skipped_as_in_use() {
     let fx = Fixture::new();
@@ -41,7 +35,7 @@ fn file_open_for_writing_is_skipped_as_in_use() {
         .open(fx.on_cache_branch("busy.bin"))
         .unwrap();
 
-    let err = assert_exit(&fx.run(&move_everything(&fx)), 0);
+    let err = assert_exit(&fx.run(&fx.move_everything_config()), 0);
 
     assert!(err.contains("busy.bin: in use"), "stderr:\n{err}");
     assert_eq!(
@@ -62,7 +56,7 @@ fn file_open_only_for_reading_is_moved() {
     fx.cache_branch_file("stream.bin", &content(MIB, 7), 1_000);
     let _reader = fs::File::open(fx.on_cache_branch("stream.bin")).unwrap();
 
-    assert_exit(&fx.run(&move_everything(&fx)), 0);
+    assert_exit(&fx.run(&fx.move_everything_config()), 0);
 
     assert!(!fx.on_cache_branch("stream.bin").exists());
     assert!(fs::read(fx.on_backing_branch("stream.bin")).unwrap() == content(MIB, 7));
@@ -74,7 +68,7 @@ fn write_lease_skips_files_open_only_for_reading() {
     fx.cache_branch_file("stream.bin", &content(MIB, 8), 1_000);
     fx.cache_branch_file("idle.bin", &content(MIB, 9), 2_000);
     let _reader = fs::File::open(fx.on_cache_branch("stream.bin")).unwrap();
-    let config = move_everything(&fx) + "lease_type: write\n";
+    let config = fx.move_everything_config() + "lease_type: write\n";
 
     let err = assert_exit(&fx.run(&config), 0);
 
@@ -92,7 +86,7 @@ fn run_interrupted_mid_copy(
     rel: &str,
     during_copy: impl FnOnce(),
 ) -> (Output, Instant) {
-    let child = fx.spawn(&move_everything(fx));
+    let child = fx.spawn(&fx.move_everything_config());
     wait_for(&fx.staged_on_backing_branch(rel));
     pause(&child);
     assert!(
@@ -188,7 +182,7 @@ fn write_while_the_retired_source_waits_rolls_the_move_back() {
     let fx = Fixture::new();
     fx.cache_branch_file("db/journal.log", &content(MIB, 6), 1_000);
     let looked_up = look_up(&fx.on_cache_branch("db/journal.log"));
-    let child = fx.spawn(&move_everything(&fx));
+    let child = fx.spawn(&fx.move_everything_config());
 
     wait_for(&fx.staged_on_cache_branch("db/journal.log"));
     reopen_for_append(&looked_up)
@@ -212,7 +206,7 @@ fn rollback_keeps_a_published_copy_that_changed_meanwhile() {
     let fx = Fixture::new();
     fx.cache_branch_file("db/journal.log", &content(MIB, 11), 1_000);
     let looked_up = look_up(&fx.on_cache_branch("db/journal.log"));
-    let child = fx.spawn(&move_everything(&fx));
+    let child = fx.spawn(&fx.move_everything_config());
 
     wait_for(&fx.staged_on_cache_branch("db/journal.log"));
     // The cache pool already shows the published copy, and someone edits it.
@@ -263,7 +257,7 @@ fn write_to_a_retired_source_during_a_later_move_rolls_back_only_its_move() {
     fx.cache_branch_file("a/first.log", &content(MIB, 13), 1_000);
     fx.cache_branch_file("b/second.bin", &content(LARGE, 14), 2_000);
     let looked_up = look_up(&fx.on_cache_branch("a/first.log"));
-    let child = fx.spawn(&move_everything(&fx));
+    let child = fx.spawn(&fx.move_everything_config());
 
     wait_for(&fx.staged_on_backing_branch("b/second.bin"));
     pause(&child);
@@ -332,4 +326,35 @@ fn reader_opening_mid_move_does_not_block_it() {
     let mut read = Vec::new();
     reader.unwrap().read_to_end(&mut read).unwrap();
     assert!(read == content(LARGE, 4), "the reader read different data");
+}
+
+/// A move adopts an identical file already on the backing branch instead of
+/// publishing its own copy. Rolling the move back keeps that file: cachy did
+/// not write it.
+#[test]
+fn rollback_keeps_an_adopted_backing_file() {
+    let fx = Fixture::new();
+    fx.cache_branch_file("db/journal.log", &content(MIB, 15), 1_000);
+    fx.backing_branch_file("db/journal.log", &content(MIB, 15), 1_000);
+    let backing_inode = fs::metadata(fx.on_backing_branch("db/journal.log"))
+        .unwrap()
+        .ino();
+    let looked_up = look_up(&fx.on_cache_branch("db/journal.log"));
+    let child = fx.spawn(&fx.move_everything_config());
+
+    wait_for(&fx.staged_on_cache_branch("db/journal.log"));
+    reopen_for_append(&looked_up)
+        .write_all(b"appended")
+        .unwrap();
+
+    let err = assert_exit(&child.wait_with_output().unwrap(), 0);
+    assert!(err.contains("db/journal.log: in use"), "stderr:\n{err}");
+    let mut source = content(MIB, 15);
+    source.extend_from_slice(b"appended");
+    assert!(fs::read(fx.on_cache_branch("db/journal.log")).unwrap() == source);
+    let backing = fs::metadata(fx.on_backing_branch("db/journal.log"))
+        .expect("the adopted backing file was removed");
+    assert_eq!(backing.ino(), backing_inode);
+    assert!(fs::read(fx.on_backing_branch("db/journal.log")).unwrap() == content(MIB, 15));
+    fx.assert_no_staging_directories();
 }

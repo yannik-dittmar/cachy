@@ -34,7 +34,7 @@ const BACKING_BRANCH_FS: &str = "CACHY_TEST_BACKING_BRANCH_FS";
 const PRIVILEGED: &str = "CACHY_TEST_PRIVILEGED";
 
 /// The staging directory at the root of each branch.
-const STAGING: &str = ".cachy-staging";
+pub const STAGING: &str = ".cachy-staging";
 
 /// A filesystem kind, recognised by its `statfs` magic number.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -213,6 +213,17 @@ impl Fixture {
             self.cache_branch.path().display(),
             self.backing_branch.path().display(),
         )
+    }
+
+    /// A config whose threshold and target lie far above any test
+    /// filesystem's free space, so a run moves every eligible move unit.
+    pub fn move_everything_config(&self) -> String {
+        self.config("1T", "2T")
+    }
+
+    /// A config under which the check finds no work, so cachy only recovers.
+    pub fn no_work_config(&self) -> String {
+        self.config("0", "1")
     }
 
     /// A cache pool over this fixture's branches, or `None` (with a note on

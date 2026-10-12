@@ -38,7 +38,15 @@ pub fn run(fs: &dyn FsOps, config: &Config) -> Result<Outcome> {
     let backing_branch = Branch::open(backing_root)
         .with_context(|| format!("cannot open backing branch {}", backing_root.display()))?;
 
-    let unresolved = recover(fs, &cache_branch, &backing_branch);
+    ignore_lease_break_signal();
+    let guard = Guard {
+        lease: match config.lease_type {
+            LeaseType::Read => Lease::Read,
+            LeaseType::Write => Lease::Write,
+        },
+        minimum_age: config.minimum_age,
+    };
+    let unresolved = recover(fs, &cache_branch, &backing_branch, guard.lease);
     let mut free = match free_space(fs, &cache_branch) {
         Ok(free) => free,
         Err(e) => {
@@ -66,14 +74,6 @@ pub fn run(fs: &dyn FsOps, config: &Config) -> Result<Outcome> {
         config.threshold, config.target
     );
 
-    ignore_lease_break_signal();
-    let guard = Guard {
-        lease: match config.lease_type {
-            LeaseType::Read => Lease::Read,
-            LeaseType::Write => Lease::Write,
-        },
-        minimum_age: config.minimum_age,
-    };
     let units = scan(&cache_branch.path)
         .with_context(|| format!("cannot scan cache branch {}", cache_branch.path.display()))?;
     let mut tally = Tally::default();

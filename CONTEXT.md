@@ -68,7 +68,7 @@ A temp file or retired source that an unfinished move left in a staging director
 _Avoid_: orphan
 
 **Recovery**:
-The first step of every run, which resolves each leftover against its published counterpart (deleting it if it is redundant, renaming a retired source back otherwise) and then removes empty staging directories.
+The first step of every invocation of cachy, before the check, which resolves each leftover against its published counterpart (deleting it if it is redundant, renaming a retired source back otherwise) and then removes empty staging directories.
 _Avoid_: cleanup, orphan cleaning
 
 ### Checks and runs

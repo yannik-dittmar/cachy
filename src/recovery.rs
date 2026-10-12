@@ -6,8 +6,10 @@
 //! published counterpart, the file at the same relpath on the backing branch:
 //!
 //! - A retired source (in the cache branch's staging directory) is deleted if
-//!   it is identical to its published counterpart. Otherwise it is renamed
-//!   back to its relpath on the cache branch, which never replaces a file.
+//!   it is identical to its published counterpart and not in use. Otherwise
+//!   it is renamed back to its relpath on the cache branch, which never
+//!   replaces a file. A crash releases the lease that kept openers away from
+//!   it, so recovery takes a lease of its own before deciding.
 //! - A temp file (in a backing branch's staging directory) is deleted. A move
 //!   retires its source only once the copy is published, so a temp file is
 //!   never the only copy of anything.
@@ -18,21 +20,28 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
-use crate::fsops::FsOps;
+use crate::fsops::{FsOps, Lease};
 use crate::transaction::{Branch, DIR_MODE, STAGING, make_dirs, open_dirs, same_content, split};
 
 /// Resolves the leftovers in the staging directories of the cache branch and
 /// the backing branch, then removes the staging directories once empty.
+/// A retired source counts as in use if another open conflicts with `lease`.
 /// Returns how many leftovers could not be resolved; they stay where they are.
-pub fn recover(fs: &dyn FsOps, cache_branch: &Branch, backing_branch: &Branch) -> usize {
+pub fn recover(
+    fs: &dyn FsOps,
+    cache_branch: &Branch,
+    backing_branch: &Branch,
+    lease: Lease,
+) -> usize {
     let mut recovery = Recovery {
         fs,
         cache_branch,
         backing_branch,
+        lease,
         unresolved: 0,
     };
-    recovery.staging_directory(cache_branch, Leftover::RetiredSource);
-    recovery.staging_directory(backing_branch, Leftover::TempFile);
+    recovery.resolve_staging_directory(cache_branch, Leftover::RetiredSource);
+    recovery.resolve_staging_directory(backing_branch, Leftover::TempFile);
     recovery.unresolved
 }
 
@@ -50,11 +59,12 @@ struct Recovery<'a> {
     fs: &'a dyn FsOps,
     cache_branch: &'a Branch,
     backing_branch: &'a Branch,
+    lease: Lease,
     unresolved: usize,
 }
 
 impl Recovery<'_> {
-    fn staging_directory(&mut self, branch: &Branch, kind: Leftover) {
+    fn resolve_staging_directory(&mut self, branch: &Branch, kind: Leftover) {
         let staging = match self.fs.open_dir(branch.fd.as_fd(), Path::new(STAGING)) {
             Ok(staging) => staging,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return,
@@ -63,7 +73,7 @@ impl Recovery<'_> {
                 return;
             }
         };
-        self.directory(branch, &staging, Path::new(""), kind);
+        self.resolve_directory(branch, &staging, Path::new(""), kind);
         // Fails harmlessly if a leftover could not be resolved.
         let _ = self.fs.rmdir(branch.fd.as_fd(), Path::new(STAGING));
     }
@@ -71,7 +81,13 @@ impl Recovery<'_> {
     /// Resolves the leftovers below `rel_dir`, the directory `dir` in
     /// `branch`'s staging directory, and removes the directories they leave
     /// empty.
-    fn directory(&mut self, branch: &Branch, dir: &OwnedFd, rel_dir: &Path, kind: Leftover) {
+    fn resolve_directory(
+        &mut self,
+        branch: &Branch,
+        dir: &OwnedFd,
+        rel_dir: &Path,
+        kind: Leftover,
+    ) {
         let staged = |rel: &Path| branch.path.join(STAGING).join(rel);
         let names = match self.fs.list_dir(dir.as_fd()) {
             Ok(names) => names,
@@ -93,7 +109,7 @@ impl Recovery<'_> {
             match stat.st_mode & libc::S_IFMT {
                 libc::S_IFDIR => {
                     match self.fs.open_dir(dir.as_fd(), name) {
-                        Ok(child) => self.directory(branch, &child, &rel, kind),
+                        Ok(child) => self.resolve_directory(branch, &child, &rel, kind),
                         Err(e) => {
                             self.unresolved(&staged(&rel), anyhow::Error::from(e).context("open"));
                             continue;
@@ -104,8 +120,8 @@ impl Recovery<'_> {
                 }
                 libc::S_IFREG => {
                     let resolved = match kind {
-                        Leftover::RetiredSource => self.retired_source(dir, &rel),
-                        Leftover::TempFile => self.temp_file(dir, &rel),
+                        Leftover::RetiredSource => self.resolve_retired_source(dir, &rel),
+                        Leftover::TempFile => self.resolve_temp_file(dir, &rel),
                     };
                     match resolved {
                         Ok(how) => eprintln!("cachy: recovery: {}: {how}", staged(&rel).display()),
@@ -121,17 +137,25 @@ impl Recovery<'_> {
     }
 
     /// Deletes the retired source `rel` (in `staged_dir`) if its published
-    /// counterpart is identical, and renames it back to the cache branch
-    /// otherwise.
-    fn retired_source(&self, staged_dir: &OwnedFd, rel: &Path) -> Result<&'static str> {
+    /// counterpart is identical and it is not in use, and renames it back to
+    /// the cache branch otherwise.
+    fn resolve_retired_source(&self, staged_dir: &OwnedFd, rel: &Path) -> Result<&'static str> {
         let fs = self.fs;
         let (parent, name) = split(rel);
-        // Anything short of proof that the published counterpart is identical
-        // keeps the retired source, which renaming it back always does.
-        let identical = open_dirs(fs, &self.backing_branch.fd, parent)
-            .and_then(|dir| same_content(fs, staged_dir, name, &dir, name))
-            .unwrap_or(false);
-        if identical {
+        // Anything short of proof that the retired source is redundant keeps
+        // it, which renaming it back always does. The lease is held until the
+        // retired source is deleted or back in place.
+        let retired = fs.open_read(staged_dir.as_fd(), name);
+        let redundant = retired.as_ref().is_ok_and(|retired| {
+            fs.set_lease(retired.as_fd(), self.lease).is_ok()
+                && open_dirs(fs, &self.backing_branch.fd, parent)
+                    .and_then(|dir| fs.open_read(dir.as_fd(), name))
+                    .and_then(|published| same_content(fs, retired, &published))
+                    .unwrap_or(false)
+                // A conflicting open since the lease was taken.
+                && fs.lease(retired.as_fd()).is_ok_and(|lease| lease == self.lease)
+        });
+        if redundant {
             fs.unlink(staged_dir.as_fd(), name)
                 .context("delete retired source")?;
             fs.fsync(staged_dir.as_fd())
@@ -149,15 +173,15 @@ impl Recovery<'_> {
         Ok("renamed back to the cache branch")
     }
 
-    fn temp_file(&self, staged_dir: &OwnedFd, rel: &Path) -> Result<&'static str> {
+    fn resolve_temp_file(&self, staged_dir: &OwnedFd, rel: &Path) -> Result<&'static str> {
         let name = split(rel).1;
         self.fs
             .unlink(staged_dir.as_fd(), name)
-            .context("delete unfinished copy")?;
+            .context("delete temp file")?;
         self.fs
             .fsync(staged_dir.as_fd())
             .context("fsync staging directory")?;
-        Ok("deleted unfinished copy")
+        Ok("deleted temp file")
     }
 
     fn unresolved(&mut self, path: &Path, e: anyhow::Error) {

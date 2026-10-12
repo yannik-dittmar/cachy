@@ -5,17 +5,12 @@
 //! These tests drive a `cachy` built with the test-only `fault-injection`
 //! feature (`cargo test --features fault-injection`). `CACHY_FAULT=<fault>@<n>`
 //! makes its `n`th filesystem operation kill the process (`kill`) or fail with
-//! an errno (`eio`, `enospc`, `exdev`, `eintr`).
+//! an errno (`eio`, `enospc`, `exdev`, `eintr`); a comma-separated list
+//! injects several faults.
 
 mod common;
 
 use common::{Fixture, assert_exit};
-
-/// A config whose threshold and target lie far above any test filesystem's
-/// free space, so a run moves every eligible move unit.
-fn move_everything(fx: &Fixture) -> String {
-    fx.config("1T", "2T")
-}
 
 #[cfg(not(feature = "fault-injection"))]
 #[test]
@@ -24,7 +19,7 @@ fn fault_injection_is_unavailable_in_normal_builds() {
     fx.cache_branch_file("file.bin", b"content", 1_000);
 
     let out = fx
-        .command(&move_everything(&fx))
+        .command(&fx.move_everything_config())
         .env("CACHY_FAULT", "kill@1")
         .output()
         .unwrap();
@@ -40,7 +35,6 @@ fn fault_injection_is_unavailable_in_normal_builds() {
 #[cfg(feature = "fault-injection")]
 mod fault_injection {
     use std::fs;
-    use std::os::unix::process::ExitStatusExt;
     use std::panic::{self, AssertUnwindSafe};
     use std::process::{Command, Output};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -78,7 +72,7 @@ mod fault_injection {
         &CONTENTS[i]
     }
 
-    fn representative(fx: &Fixture) {
+    fn create_representative_tree(fx: &Fixture) {
         for (i, (rel, _, mtime)) in FILES.into_iter().enumerate() {
             fx.cache_branch_file(rel, content(i), mtime);
         }
@@ -87,23 +81,20 @@ mod fault_injection {
         }
     }
 
-    /// A config under which the check finds no work, so a run only recovers.
-    fn recover_only(fx: &Fixture) -> String {
-        fx.config("0", "1")
-    }
-
-    /// Runs `command` with `fault` (`<fault>@<n>`) injected. Returns the
-    /// output and whether the run reached the `n`th operation.
-    fn run_with_fault(mut command: Command, fault: &str) -> (Output, bool) {
-        let out = command.env("CACHY_FAULT", fault).output().unwrap();
-        let reached = out.status.signal().is_some()
-            || common::stderr(&out).contains("cachy: fault injection:");
+    /// Runs `command` with `faults` (`<fault>@<n>[,…]`) injected. Returns
+    /// the output and whether the run reached every faulty operation.
+    fn run_with_faults(mut command: Command, faults: &str) -> (Output, bool) {
+        let out = command.env("CACHY_FAULT", faults).output().unwrap();
+        let injected = common::stderr(&out)
+            .matches("cachy: fault injection:")
+            .count();
+        let reached = injected == faults.split(',').count();
         (out, reached)
     }
 
     /// `cachy run` with a retire wait short enough that hundreds of runs do
     /// not add up to minutes.
-    fn quick(fx: &Fixture, config: &str) -> Command {
+    fn with_short_retire_wait(fx: &Fixture, config: &str) -> Command {
         let mut command = fx.command(config);
         command.env("CACHY_RETIRE_WAIT_MS", "0");
         command
@@ -211,17 +202,17 @@ mod fault_injection {
     fn crash_at_every_operation_is_recovered_by_the_next_run() {
         for_every_operation(|n| {
             let fx = Fixture::new();
-            representative(&fx);
-            let config = move_everything(&fx);
+            create_representative_tree(&fx);
+            let config = fx.move_everything_config();
 
             // With the real retire wait, so that several retired sources wait
             // in the staging directory at once.
-            let (out, reached) = run_with_fault(fx.command(&config), &format!("kill@{n}"));
+            let (out, reached) = run_with_faults(fx.command(&config), &format!("kill@{n}"));
             if !reached {
                 assert_exit(&out, 0);
                 return false;
             }
-            let out = quick(&fx, &config).output().unwrap();
+            let out = with_short_retire_wait(&fx, &config).output().unwrap();
 
             let context = format!(
                 "killed at operation {n}, then ran again; stderr:\n{}",
@@ -245,10 +236,13 @@ mod fault_injection {
     fn error_at_every_operation(errno: &str) {
         for_every_operation(|n| {
             let fx = Fixture::new();
-            representative(&fx);
+            create_representative_tree(&fx);
 
             let fault = format!("{errno}@{n}");
-            let (out, reached) = run_with_fault(quick(&fx, &move_everything(&fx)), &fault);
+            let (out, reached) = run_with_faults(
+                with_short_retire_wait(&fx, &fx.move_everything_config()),
+                &fault,
+            );
             if !reached {
                 assert_exit(&out, 0);
                 return false;
@@ -261,7 +255,9 @@ mod fault_injection {
             );
             assert_each_exactly_once(&fx, &context);
 
-            let out = quick(&fx, &recover_only(&fx)).output().unwrap();
+            let out = with_short_retire_wait(&fx, &fx.no_work_config())
+                .output()
+                .unwrap();
             let context = format!("{fault}, then recovered; stderr:\n{}", common::stderr(&out));
             assert_eq!(out.status.code(), Some(0), "{context}");
             assert_each_exactly_once(&fx, &context);
@@ -300,9 +296,10 @@ mod fault_injection {
         for_every_operation(|n| {
             let fx = Fixture::new();
             fx.cache_branch_file(rel, b"content", 1_000);
-            let config = move_everything(&fx);
+            let config = fx.move_everything_config();
 
-            let (out, reached) = run_with_fault(quick(&fx, &config), &format!("kill@{n}"));
+            let (out, reached) =
+                run_with_faults(with_short_retire_wait(&fx, &config), &format!("kill@{n}"));
             if !reached {
                 assert_exit(&out, 0);
                 return false;
@@ -320,7 +317,7 @@ mod fault_injection {
             found.1 |= retired;
             drop(found);
 
-            let out = quick(&fx, &config).output().unwrap();
+            let out = with_short_retire_wait(&fx, &config).output().unwrap();
 
             let context = format!(
                 "killed at operation {n}, then ran again; stderr:\n{}",
@@ -347,8 +344,8 @@ mod fault_injection {
         for_every_operation(|n| {
             let fx = Fixture::new();
             // One leftover of each kind: retired sources to delete and to
-            // rename back (one into a directory that no longer exists), and an
-            // unfinished copy.
+            // rename back (one into a directory that no longer exists), and a
+            // temp file.
             fx.staged_cache_branch_file("same.bin", b"published", 1_000);
             fx.backing_branch_file("same.bin", b"published", 1_000);
             fx.staged_cache_branch_file("dir/changed.bin", b"written while retiring", 1_000);
@@ -356,14 +353,15 @@ mod fault_injection {
             fx.staged_cache_branch_file("gone/unpublished.bin", b"retired", 1_000);
             fx.cache_branch_file("dir/copying.bin", b"source", 1_000);
             fx.staged_backing_branch_file("dir/copying.bin", b"sou", 1_000);
-            let config = recover_only(&fx);
+            let config = fx.no_work_config();
 
-            let (out, reached) = run_with_fault(quick(&fx, &config), &format!("kill@{n}"));
+            let (out, reached) =
+                run_with_faults(with_short_retire_wait(&fx, &config), &format!("kill@{n}"));
             if !reached {
                 assert_exit(&out, 0);
                 return false;
             }
-            let out = quick(&fx, &config).output().unwrap();
+            let out = with_short_retire_wait(&fx, &config).output().unwrap();
 
             let context = format!(
                 "killed at operation {n}, then ran again; stderr:\n{}",
@@ -406,8 +404,10 @@ mod fault_injection {
             let fx = Fixture::new();
             fx.cache_branch_file(rel, b"content", 1_000);
 
-            let (out, reached) =
-                run_with_fault(quick(&fx, &move_everything(&fx)), &format!("eio@{n}"));
+            let (out, reached) = run_with_faults(
+                with_short_retire_wait(&fx, &fx.move_everything_config()),
+                &format!("eio@{n}"),
+            );
             let err = common::stderr(&out);
             if !err.contains("failed: fsync source directory") {
                 return reached;
@@ -424,5 +424,61 @@ mod fault_injection {
             found.into_inner().unwrap(),
             "no fsync of the source directory failed"
         );
+    }
+
+    /// A move rolls back when its source's directory cannot be fsynced after
+    /// the source is retired. A crash or another error at any step of that
+    /// rollback loses nothing, and the next run finishes the move.
+    #[test]
+    fn fault_at_every_operation_of_a_rollback_loses_nothing() {
+        let rel = "dir/file.bin";
+        let setup = || {
+            let fx = Fixture::new();
+            fx.cache_branch_file(rel, b"content", 1_000);
+            fx
+        };
+        let rollback_start = Mutex::new(None);
+        for_every_operation(|n| {
+            let fx = setup();
+            let command = with_short_retire_wait(&fx, &fx.move_everything_config());
+            let (out, reached) = run_with_faults(command, &format!("eio@{n}"));
+            if common::stderr(&out).contains("failed: fsync source directory") {
+                *rollback_start.lock().unwrap() = Some(n);
+            }
+            reached
+        });
+        let first = rollback_start
+            .into_inner()
+            .unwrap()
+            .expect("no fsync of the source directory failed");
+
+        for fault in ["kill", "eio"] {
+            for_every_operation(|n| {
+                let fx = setup();
+                let config = fx.move_everything_config();
+                let faults = format!("eio@{first},{fault}@{}", first + n);
+
+                let (out, reached) = run_with_faults(with_short_retire_wait(&fx, &config), &faults);
+                if !reached {
+                    assert_exit(&out, 2);
+                    return false;
+                }
+                let out = with_short_retire_wait(&fx, &config).output().unwrap();
+
+                let context = format!(
+                    "{faults}, then ran again; stderr:\n{}",
+                    common::stderr(&out)
+                );
+                assert_eq!(out.status.code(), Some(0), "{context}");
+                assert!(!fx.on_cache_branch(rel).exists(), "{context}");
+                assert_eq!(
+                    fs::read(fx.on_backing_branch(rel)).unwrap(),
+                    b"content",
+                    "{context}"
+                );
+                assert_no_staging_directories(&fx, &context);
+                true
+            });
+        }
     }
 }

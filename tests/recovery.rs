@@ -1,18 +1,14 @@
-//! Recovery: every run starts by resolving what unfinished moves left in the
-//! staging directories.
+//! Recovery: cachy starts every invocation by resolving the leftovers of
+//! unfinished moves in the staging directories.
 
 mod common;
 
 use std::fs;
+use std::io::Write;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
 use common::{Fixture, assert_exit, skip};
-
-/// A config under which the check finds no work, so a run only recovers.
-fn recover_only(fx: &Fixture) -> String {
-    fx.config("0", "1")
-}
 
 #[test]
 fn retired_source_identical_to_its_published_copy_is_deleted() {
@@ -20,7 +16,7 @@ fn retired_source_identical_to_its_published_copy_is_deleted() {
     fx.staged_cache_branch_file("dir/file.bin", b"content", 1_000);
     fx.backing_branch_file("dir/file.bin", b"content", 1_000);
 
-    assert_exit(&fx.run(&recover_only(&fx)), 0);
+    assert_exit(&fx.run(&fx.no_work_config()), 0);
 
     assert_eq!(
         fs::read(fx.on_backing_branch("dir/file.bin")).unwrap(),
@@ -36,7 +32,7 @@ fn retired_source_differing_from_its_published_copy_is_renamed_back() {
     fx.staged_cache_branch_file("dir/file.bin", b"written while retiring", 1_000);
     fx.backing_branch_file("dir/file.bin", b"content", 1_000);
 
-    assert_exit(&fx.run(&recover_only(&fx)), 0);
+    assert_exit(&fx.run(&fx.no_work_config()), 0);
 
     assert_eq!(
         fs::read(fx.on_cache_branch("dir/file.bin")).unwrap(),
@@ -55,7 +51,7 @@ fn retired_source_without_a_published_copy_is_renamed_back() {
     let fx = Fixture::new();
     fx.staged_cache_branch_file("gone/deeper/file.bin", b"content", 1_000);
 
-    assert_exit(&fx.run(&recover_only(&fx)), 0);
+    assert_exit(&fx.run(&fx.no_work_config()), 0);
 
     assert_eq!(
         fs::read(fx.on_cache_branch("gone/deeper/file.bin")).unwrap(),
@@ -66,12 +62,12 @@ fn retired_source_without_a_published_copy_is_renamed_back() {
 }
 
 #[test]
-fn unfinished_copy_is_deleted() {
+fn temp_file_is_deleted() {
     let fx = Fixture::new();
     fx.cache_branch_file("dir/file.bin", b"content", 1_000);
     fx.staged_backing_branch_file("dir/file.bin", b"cont", 1_000);
 
-    assert_exit(&fx.run(&recover_only(&fx)), 0);
+    assert_exit(&fx.run(&fx.no_work_config()), 0);
 
     assert_eq!(
         fs::read(fx.on_cache_branch("dir/file.bin")).unwrap(),
@@ -89,7 +85,7 @@ fn retired_source_that_cannot_be_renamed_back_is_kept() {
     fx.staged_cache_branch_file("dir/file.bin", b"retired", 1_000);
     fx.cache_branch_file("dir/file.bin", b"created since", 1_000);
 
-    let err = assert_exit(&fx.run(&recover_only(&fx)), 2);
+    let err = assert_exit(&fx.run(&fx.no_work_config()), 2);
 
     assert!(
         err.contains("cannot resolve staging leftover") && err.contains("dir/file.bin"),
@@ -120,11 +116,11 @@ fn recovery_touches_nothing_outside_the_staging_directories() {
     let cache_before = Fixture::tree(fx.cache_branch.path());
     let backing_before = Fixture::tree(fx.backing_branch.path());
 
-    assert_exit(&fx.run(&recover_only(&fx)), 0);
+    assert_exit(&fx.run(&fx.no_work_config()), 0);
 
     let without_staging = |tree: Vec<String>| -> Vec<String> {
         tree.into_iter()
-            .filter(|p| !p.starts_with(".cachy-staging"))
+            .filter(|p| !p.starts_with(common::STAGING))
             .collect()
     };
     assert_eq!(
@@ -181,7 +177,7 @@ fn recovery_never_lists_backing_branch_directories_outside_staging() {
         return;
     }
 
-    assert_exit(&fx.run(&recover_only(&fx)), 0);
+    assert_exit(&fx.run(&fx.no_work_config()), 0);
 
     for dir in &dirs {
         assert_eq!(atime(dir), OLD_ATIME, "{} was listed", dir.display());
@@ -213,4 +209,32 @@ fn set_old_atime(path: &Path) {
 
 fn atime(path: &Path) -> i64 {
     fs::metadata(path).unwrap().atime()
+}
+
+/// A crash releases the lease that kept openers away from a retired source,
+/// so one may be writing to it by the time recovery runs. Deleting it would
+/// lose those writes, even if its content still matches the published copy.
+#[test]
+fn retired_source_open_for_writing_is_renamed_back_not_deleted() {
+    let fx = Fixture::new();
+    fx.staged_cache_branch_file("dir/file.bin", b"content", 1_000);
+    fx.backing_branch_file("dir/file.bin", b"content", 1_000);
+    let mut writer = fs::OpenOptions::new()
+        .append(true)
+        .open(fx.staged_on_cache_branch("dir/file.bin"))
+        .unwrap();
+
+    assert_exit(&fx.run(&fx.no_work_config()), 0);
+    writer.write_all(b" appended").unwrap();
+    drop(writer);
+
+    assert_eq!(
+        fs::read(fx.on_cache_branch("dir/file.bin")).unwrap(),
+        b"content appended"
+    );
+    assert_eq!(
+        fs::read(fx.on_backing_branch("dir/file.bin")).unwrap(),
+        b"content"
+    );
+    fx.assert_no_staging_directories();
 }

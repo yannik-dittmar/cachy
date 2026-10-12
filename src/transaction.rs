@@ -295,10 +295,16 @@ struct Published<'a> {
     name: &'a Path,
     /// The copy as it was right after publishing.
     identity: Identity,
+    /// The copy was already on the backing branch, not written by this move.
+    adopted: bool,
 }
 
 impl Published<'_> {
+    /// Removes the copy, unless it was adopted or is no longer cachy's own.
     fn remove(&self, fs: &dyn FsOps) -> Result<()> {
+        if self.adopted {
+            return Ok(());
+        }
         match fs.stat_at(self.dir.as_fd(), self.name) {
             Ok(stat) if Identity::of(&stat) == self.identity => {}
             // Replaced, changed or removed since: no longer cachy's own.
@@ -355,6 +361,7 @@ fn publish<'a>(
             dir: dest_parent,
             name,
             identity,
+            adopted: false,
         }),
         Err(e) => {
             unpublish(fs, &dest_parent, name, copy);
@@ -384,8 +391,8 @@ fn unpublish(fs: &dyn FsOps, dest_parent: &OwnedFd, name: &Path, copy: &OwnedFd)
 /// it is identical to the staged copy, which is then deleted. A run that was
 /// interrupted between publish and retire leaves such a file behind.
 ///
-/// A rollback removes an adopted copy like one cachy published, which loses
-/// nothing: it is identical to the source that the rollback puts back.
+/// A rollback keeps an adopted copy, as a stale copy identical to the source
+/// it puts back: cachy did not write it.
 fn adopt_identical<'a>(
     fs: &dyn FsOps,
     dest_parent: OwnedFd,
@@ -393,7 +400,9 @@ fn adopt_identical<'a>(
     staged_parent: &OwnedFd,
 ) -> io::Result<Option<Published<'a>>> {
     let before = Identity::of(&fs.stat_at(dest_parent.as_fd(), name)?);
-    if !same_content(fs, staged_parent, name, &dest_parent, name)? {
+    let staged = fs.open_read(staged_parent.as_fd(), name)?;
+    let existing = fs.open_read(dest_parent.as_fd(), name)?;
+    if !same_content(fs, &staged, &existing)? {
         return Ok(None);
     }
     let identity = Identity::of(&fs.stat_at(dest_parent.as_fd(), name)?);
@@ -406,6 +415,7 @@ fn adopt_identical<'a>(
         dir: dest_parent,
         name,
         identity,
+        adopted: true,
     }))
 }
 
@@ -638,17 +648,9 @@ impl<'a> Source<'a> {
     }
 }
 
-/// Whether `a_name` in `a_dir` and `b_name` in `b_dir` are regular files with
-/// the same content.
-pub fn same_content(
-    fs: &dyn FsOps,
-    a_dir: &OwnedFd,
-    a_name: &Path,
-    b_dir: &OwnedFd,
-    b_name: &Path,
-) -> io::Result<bool> {
-    let a = fs.open_read(a_dir.as_fd(), a_name)?;
-    let b = fs.open_read(b_dir.as_fd(), b_name)?;
+/// Whether the open files `a` and `b`, read from their start, are regular
+/// files with the same content.
+pub fn same_content(fs: &dyn FsOps, a: &OwnedFd, b: &OwnedFd) -> io::Result<bool> {
     let (a_stat, b_stat) = (fs.fstat(a.as_fd())?, fs.fstat(b.as_fd())?);
     let regular = |stat: &Stat| stat.st_mode & libc::S_IFMT == libc::S_IFREG;
     if !regular(&a_stat) || !regular(&b_stat) || a_stat.st_size != b_stat.st_size {
@@ -656,8 +658,8 @@ pub fn same_content(
     }
     let (mut a_buf, mut b_buf) = (vec![0; COPY_BUF], vec![0; COPY_BUF]);
     loop {
-        let n = read_full(fs, &a, &mut a_buf)?;
-        if n != read_full(fs, &b, &mut b_buf)? || a_buf[..n] != b_buf[..n] {
+        let n = read_full(fs, a, &mut a_buf)?;
+        if n != read_full(fs, b, &mut b_buf)? || a_buf[..n] != b_buf[..n] {
             return Ok(false);
         }
         if n == 0 {
@@ -707,7 +709,7 @@ pub fn open_dirs(fs: &dyn FsOps, root: &OwnedFd, path: &Path) -> io::Result<Owne
 
 /// Removes `path` below `root` and its ancestors (but not `root`) while they
 /// are empty.
-pub fn remove_empty_dirs(fs: &dyn FsOps, root: &OwnedFd, path: &Path) {
+fn remove_empty_dirs(fs: &dyn FsOps, root: &OwnedFd, path: &Path) {
     for dir in path.ancestors().filter(|p| !p.as_os_str().is_empty()) {
         if fs.rmdir(root.as_fd(), dir).is_err() {
             return;

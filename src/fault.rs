@@ -1,15 +1,21 @@
 //! Test-only fault injection, built only with the `fault-injection` feature.
 //!
 //! [`FaultyFs`] performs every filesystem operation through [`RealFs`], except
-//! that the one named by `CACHY_FAULT=<fault>@<n>` (the `n`th operation of
-//! the process, counting from 1) does not happen. Instead, a `kill` fault
-//! kills the process with `SIGKILL`, and `eio`, `enospc`, `exdev` or `eintr`
-//! fails the operation with that errno. Either way cachy first notes the
-//! fault on stderr. A comma-separated list injects several faults, such as
-//! one that starts a rollback and one during it: `eio@20,kill@23`.
+//! the one named by `CACHY_FAULT=<fault>@<n>` (the `n`th operation of the
+//! process, counting from 1). A `kill` fault kills the process with `SIGKILL`
+//! instead, and `eio`, `enospc`, `exdev` or `eintr` fails the operation with
+//! that errno. A `corrupt` fault lets a write succeed with the first byte of
+//! its data flipped, as faulty storage would; on any other operation it does
+//! nothing. Either way cachy first notes the fault on stderr. A
+//! comma-separated list injects several faults, such as one that starts a
+//! rollback and one during it: `eio@20,kill@23`.
 //!
 //! Lease queries are not counted, nor can they fail: how often a run polls its
 //! leases depends on timing, and the operation numbers must not.
+//!
+//! `CACHY_FAULT_TRACE=1` notes every counted operation on stderr, as
+//! `cachy: trace: operation <n> (<name>)`, so that a test can find the
+//! number of the operation it wants to inject a fault at.
 //!
 //! `CACHY_RETIRE_WAIT_MS=<ms>` shortens the retire wait, so that tests that
 //! run cachy hundreds of times do not wait a second each time.
@@ -29,6 +35,7 @@ use rustix::fs::Timespec;
 use crate::fsops::{FsOps, Lease, RealFs, Stat};
 
 const FAULT: &str = "CACHY_FAULT";
+const TRACE: &str = "CACHY_FAULT_TRACE";
 const RETIRE_WAIT: &str = "CACHY_RETIRE_WAIT_MS";
 
 /// The retire wait set by `CACHY_RETIRE_WAIT_MS`, if any.
@@ -47,6 +54,14 @@ pub fn retire_wait() -> Option<Duration> {
 enum Fault {
     Kill,
     Errno(i32),
+    Corrupt,
+}
+
+/// Whether the operation, if it is a write, is to corrupt its data.
+#[derive(PartialEq, Eq)]
+enum CorruptWrite {
+    Yes,
+    No,
 }
 
 pub struct FaultyFs {
@@ -54,6 +69,7 @@ pub struct FaultyFs {
     faults: Vec<(Fault, u64)>,
     /// Operations performed so far.
     count: Cell<u64>,
+    trace: bool,
 }
 
 impl FaultyFs {
@@ -70,14 +86,18 @@ impl FaultyFs {
         Ok(FaultyFs {
             faults,
             count: Cell::new(0),
+            trace: std::env::var_os(TRACE).is_some_and(|v| v == "1"),
         })
     }
 
     /// Counts the operation `name`, and injects the fault meant for it, if
-    /// any.
-    fn count_op(&self, name: &str) -> io::Result<()> {
+    /// any. A `corrupt` fault is left to the operation.
+    fn count_op(&self, name: &str) -> io::Result<CorruptWrite> {
         let n = self.count.get() + 1;
         self.count.set(n);
+        if self.trace {
+            eprintln!("cachy: trace: operation {n} ({name})");
+        }
         match self.faults.iter().find(|&&(_, at)| at == n) {
             Some((Fault::Kill, _)) => {
                 eprintln!("cachy: fault injection: kill at operation {n} ({name})");
@@ -90,7 +110,11 @@ impl FaultyFs {
                 eprintln!("cachy: fault injection: {e} at operation {n} ({name})");
                 Err(e)
             }
-            None => Ok(()),
+            Some((Fault::Corrupt, _)) => {
+                eprintln!("cachy: fault injection: corrupt at operation {n} ({name})");
+                Ok(CorruptWrite::Yes)
+            }
+            None => Ok(CorruptWrite::No),
         }
     }
 }
@@ -105,7 +129,8 @@ fn parse(spec: &str) -> Result<(Fault, u64)> {
         "enospc" => Fault::Errno(libc::ENOSPC),
         "exdev" => Fault::Errno(libc::EXDEV),
         "eintr" => Fault::Errno(libc::EINTR),
-        _ => bail!("unknown fault `{fault}`: expected kill, eio, enospc, exdev or eintr"),
+        "corrupt" => Fault::Corrupt,
+        _ => bail!("unknown fault `{fault}`: expected kill, eio, enospc, exdev, eintr or corrupt"),
     };
     let n = n.parse().context("invalid operation number")?;
     if n == 0 {
@@ -150,9 +175,40 @@ impl FsOps for FaultyFs {
         RealFs.read(fd, buf)
     }
 
-    fn write(&self, fd: BorrowedFd, buf: &[u8]) -> io::Result<usize> {
-        self.count_op("write")?;
-        RealFs.write(fd, buf)
+    fn read_at(&self, fd: BorrowedFd, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+        self.count_op("read_at")?;
+        RealFs.read_at(fd, buf, offset)
+    }
+
+    fn write_at(&self, fd: BorrowedFd, buf: &[u8], offset: u64) -> io::Result<usize> {
+        if self.count_op("write_at")? == CorruptWrite::Yes {
+            let mut corrupted = buf.to_vec();
+            if let Some(first) = corrupted.first_mut() {
+                *first ^= 0xff;
+            }
+            return RealFs.write_at(fd, &corrupted, offset);
+        }
+        RealFs.write_at(fd, buf, offset)
+    }
+
+    fn seek_data(&self, fd: BorrowedFd, offset: u64) -> io::Result<Option<u64>> {
+        self.count_op("seek_data")?;
+        RealFs.seek_data(fd, offset)
+    }
+
+    fn seek_hole(&self, fd: BorrowedFd, offset: u64) -> io::Result<u64> {
+        self.count_op("seek_hole")?;
+        RealFs.seek_hole(fd, offset)
+    }
+
+    fn set_len(&self, fd: BorrowedFd, len: u64) -> io::Result<()> {
+        self.count_op("set_len")?;
+        RealFs.set_len(fd, len)
+    }
+
+    fn drop_cache(&self, fd: BorrowedFd) -> io::Result<()> {
+        self.count_op("drop_cache")?;
+        RealFs.drop_cache(fd)
     }
 
     fn fsync(&self, fd: BorrowedFd) -> io::Result<()> {

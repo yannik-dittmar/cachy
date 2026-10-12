@@ -19,6 +19,7 @@ libc = "0.2"
 rustix = { version = "1", features = ["fs"] }
 serde = { version = "1", features = ["derive"] }
 serde_yaml_ng = "0.10"
+xxhash-rust = { version = "0.8.19", features = ["xxh3"] }
 
 [dev-dependencies]
 rustix = { version = "1", features = ["fs", "process"] }

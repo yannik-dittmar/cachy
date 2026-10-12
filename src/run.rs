@@ -91,7 +91,14 @@ pub fn run(fs: &dyn FsOps, config: &Config) -> Result<Outcome> {
         .with_context(|| format!("cannot scan cache branch {}", cache_branch.path.display()))?;
     let mut tally = Tally::default();
     let mut stopped = false;
-    let mut mover = Mover::new(fs, &cache_branch, &backing_branch, &guard, allowed_losses);
+    let mut mover = Mover::new(
+        fs,
+        &cache_branch,
+        &backing_branch,
+        &guard,
+        allowed_losses,
+        config.verify,
+    );
     for unit in &units {
         tally.record(mover.finished());
         // Retiring moves free their space once their sources are unlinked.
@@ -157,7 +164,10 @@ impl Tally {
     fn record(&mut self, finished: Vec<(&Path, Result<MoveOutcome>)>) {
         for (rel, outcome) in finished {
             match outcome {
-                Ok(MoveOutcome::Moved) => self.moved += 1,
+                Ok(MoveOutcome::Moved(hash)) => {
+                    self.moved += 1;
+                    eprintln!("cachy: moved {} (xxh3 {hash})", rel.display());
+                }
                 Ok(MoveOutcome::Skipped(reason)) => {
                     self.skipped += 1;
                     eprintln!("cachy: skipped {}: {reason}", rel.display());

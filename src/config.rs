@@ -23,6 +23,20 @@ pub struct Config {
     /// backing branch cannot store them. Any other loss fails the move.
     #[serde(default)]
     pub allow_metadata_loss: Vec<MetadataKind>,
+    #[serde(default)]
+    pub verify: Verify,
+}
+
+/// How a move checks its copy before publishing it.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Verify {
+    /// Only hash the source while copying it.
+    #[default]
+    Hash,
+    /// Also read the copy back from storage once it is fsynced, and fail the
+    /// move unless its hash matches the source's.
+    Readback,
 }
 
 /// Metadata that a move preserves only where the backing branch supports it,

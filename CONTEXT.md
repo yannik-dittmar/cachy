@@ -76,7 +76,11 @@ The free space below which a check finds work.
 The free space at which a run stops moving.
 
 **Max age**:
-An optional age past which a move unit counts as work for any check, regardless of the threshold.
+An optional time since a move unit last changed, past which it counts as work for any check, regardless of the threshold; always longer than the minimum age.
+
+**Minimum age**:
+The time since a move unit last changed below which it is never moved, guarding against writers that hold no open file between writes.
+_Avoid_: grace period, cooldown
 
 **Check**:
 The decision whether there is work: free space below the threshold, or (only when a max age is configured) move units past it.

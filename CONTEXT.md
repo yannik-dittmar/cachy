@@ -52,38 +52,57 @@ _Avoid_: busy, locked, open (a file open only for reading is not in use)
 A file on a backing branch at the same relative path as a file on the cache branch, hidden from applications by the cache branch's copy; a move replaces it.
 _Avoid_: conflict, duplicate, shadow
 
-### Runs
+**Publish**:
+The step of a move that makes the copy visible under its final name on the backing branch, never replacing anything except a stale copy.
 
-**Run**:
-One evaluation of the trigger followed by moves until the stop condition is reached.
-_Avoid_: job, pass, cycle
+**Retire**:
+The step of a move, after publishing, that removes the move unit from the cache branch.
+_Avoid_: delete, clean up
+
+**Staging directory**:
+cachy's own directory at the root of each filesystem it writes to, holding the temp files and retired sources of unfinished moves; anything left in it after a crash belongs to an unfinished move and nothing else.
+_Avoid_: temp dir, journal
+
+### Checks and runs
 
 **Free space**:
 The space on the cache branch that applications can still write into; the only measure of how full the cache is.
 _Avoid_: usage, Use%, used space (these drop on snapshot-holding filesystems even when no space is freed)
 
 **Threshold**:
-The free space below which a run starts moving.
+The free space below which a check finds work.
 
 **Target**:
 The free space at which a run stops moving.
 
+**Max age**:
+An optional age past which a move unit counts as work for any check, regardless of the threshold.
+
+**Check**:
+The decision whether there is work: free space below the threshold, or (only when a max age is configured) move units past it.
+_Avoid_: trigger, evaluation, poll
+
+**Run**:
+The moving that follows a check that found work, ending once the target is reached and no move unit is past the max age.
+_Avoid_: job, pass, cycle, trigger
+
 **Byte budget**:
 The amount a run must free to reach the target, fixed when the run starts and consumed by the allocated size of each completed move.
 
-**Max age**:
-An optional age past which a move unit is moved in any run, regardless of the threshold.
-
 **Drain**:
-A run that ignores the threshold and moves every eligible move unit.
+A run started without a check, which moves every eligible move unit.
 _Avoid_: empty-cache mode, flush
 
+**Schedule**:
+A user-configured recurring time at which cachy performs a check.
+_Avoid_: cron job, timer
+
 **Wake trigger**:
-A condition that starts a run because the backing disks have become awake.
+Repeated checks performed while the backing disks are awake.
 
 **Wake gate**:
-A condition that holds back an already-scheduled run until the backing disks are awake.
-_Avoid_: using "trigger" for something that only delays a run
+A hold on a scheduled check until the backing disks are awake, given up after a time limit.
+_Avoid_: using "trigger" for something that only delays a check
 
 **Run hook**:
 A user-configured command that cachy executes after each run, handing it the run summary.

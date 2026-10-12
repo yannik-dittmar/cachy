@@ -264,6 +264,22 @@ impl Fixture {
         }
     }
 
+    /// Runs `cachy run --config <file>` as root, through sudo unless the
+    /// tests run as root. Check [`root_available`] first.
+    pub fn run_as_root(&self, config: &str) -> Output {
+        let command = self.command(config);
+        let mut command = if rustix::process::geteuid().is_root() {
+            command
+        } else {
+            let mut sudo = Command::new("sudo");
+            sudo.arg("-n")
+                .arg(command.get_program())
+                .args(command.get_args());
+            sudo
+        };
+        output(&mut command).expect("spawn cachy")
+    }
+
     /// Runs `cachy run --config <file>` with the given config file content.
     pub fn run(&self, config: &str) -> Output {
         self.spawn(config)
@@ -367,6 +383,32 @@ pub fn sudo(args: &[&OsStr]) -> Result<(), String> {
     }
 }
 
+/// Whether the tests run as root or may use sudo (in the privileged tier).
+/// If not, notes on stderr that the calling test skips its checks.
+pub fn root_available() -> bool {
+    let available = rustix::process::geteuid().is_root() || privileged();
+    if !available {
+        skip("acting as root needs the privileged tier");
+    }
+    available
+}
+
+/// Gives `path` to `uid` and `gid`, through sudo unless the tests run as
+/// root. Check [`root_available`] first.
+pub fn chown(path: &Path, uid: u32, gid: u32) {
+    if rustix::process::geteuid().is_root() {
+        std::os::unix::fs::lchown(path, Some(uid), Some(gid)).unwrap();
+    } else {
+        sudo(&[
+            OsStr::new("chown"),
+            OsStr::new("-h"),
+            OsStr::new(&format!("{uid}:{gid}")),
+            path.as_os_str(),
+        ])
+        .unwrap();
+    }
+}
+
 /// The ZFS dataset that holds `path`, for commands such as
 /// `sudo zfs snapshot <dataset>@<name>`.
 pub fn zfs_dataset(path: &Path) -> String {
@@ -454,4 +496,76 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<String>) {
             walk(root, &path, out);
         }
     }
+}
+
+/// The extended attributes of `path` (not following a final symlink), by
+/// name, including ACLs (`system.posix_acl_*`).
+pub fn xattrs(path: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+    let mut names = vec![0; 64 * 1024];
+    let len = match rustix::fs::llistxattr(path, &mut names[..]) {
+        Ok(len) => len,
+        Err(rustix::io::Errno::OPNOTSUPP) => 0,
+        Err(e) => panic!("list xattrs of {}: {e}", path.display()),
+    };
+    names[..len]
+        .split(|&b| b == 0)
+        .filter(|name| !name.is_empty())
+        .map(|name| {
+            let name = String::from_utf8(name.to_vec()).unwrap();
+            let mut value = vec![0; 64 * 1024];
+            let len = rustix::fs::lgetxattr(path, name.as_str(), &mut value[..])
+                .unwrap_or_else(|e| panic!("get xattr {name} of {}: {e}", path.display()));
+            value.truncate(len);
+            (name, value)
+        })
+        .collect()
+}
+
+pub fn set_xattr(path: &Path, name: &str, value: &[u8]) -> rustix::io::Result<()> {
+    rustix::fs::lsetxattr(path, name, value, rustix::fs::XattrFlags::empty())
+}
+
+/// Name of the xattr that holds a file's access ACL.
+pub const ACCESS_ACL: &str = "system.posix_acl_access";
+/// Name of the xattr that holds a directory's default ACL.
+pub const DEFAULT_ACL: &str = "system.posix_acl_default";
+
+/// An ACL in the kernel's xattr format, granting `user` all permissions on
+/// top of the owner's `rwx`, the group's `r-x` and others' `---`. As a
+/// default ACL, it leaves the owner able to use new directories.
+pub fn acl_granting(user: u32) -> Vec<u8> {
+    const USER_OBJ: u16 = 0x01;
+    const USER: u16 = 0x02;
+    const GROUP_OBJ: u16 = 0x04;
+    const MASK: u16 = 0x10;
+    const OTHER: u16 = 0x20;
+    const UNDEFINED_ID: u32 = u32::MAX;
+    let mut acl = 2u32.to_le_bytes().to_vec();
+    for (tag, perm, id) in [
+        (USER_OBJ, 7u16, UNDEFINED_ID),
+        (USER, 7, user),
+        (GROUP_OBJ, 5, UNDEFINED_ID),
+        (MASK, 7, UNDEFINED_ID),
+        (OTHER, 0, UNDEFINED_ID),
+    ] {
+        acl.extend(tag.to_le_bytes());
+        acl.extend(perm.to_le_bytes());
+        acl.extend(id.to_le_bytes());
+    }
+    acl
+}
+
+/// Sets `path`'s atime and mtime (seconds since the epoch).
+pub fn set_times(path: &Path, atime: i64, mtime: i64) {
+    let ts = |tv_sec| rustix::fs::Timespec { tv_sec, tv_nsec: 0 };
+    rustix::fs::utimensat(
+        rustix::fs::CWD,
+        path,
+        &Timestamps {
+            last_access: ts(atime),
+            last_modification: ts(mtime),
+        },
+        rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+    )
+    .unwrap();
 }

@@ -19,6 +19,21 @@ pub struct Config {
     pub minimum_age: Duration,
     #[serde(default)]
     pub lease_type: LeaseType,
+    /// Kinds of metadata that a move may lose, with a warning, when the
+    /// backing branch cannot store them. Any other loss fails the move.
+    #[serde(default)]
+    pub allow_metadata_loss: Vec<MetadataKind>,
+}
+
+/// Metadata that a move preserves only where the backing branch supports it,
+/// if the configuration allows its loss.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum MetadataKind {
+    /// Extended attributes other than ACLs.
+    Xattrs,
+    /// POSIX ACLs (`system.posix_acl_access` and `system.posix_acl_default`).
+    Acls,
 }
 
 /// The kernel lease cachy holds on a move unit while moving it, which decides

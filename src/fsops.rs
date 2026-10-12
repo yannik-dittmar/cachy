@@ -4,14 +4,14 @@
 //!
 //! File descriptors are closed on drop, outside the port.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::io;
 use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::OsStringExt;
 use std::path::Path;
 
 pub use rustix::fs::Stat;
-use rustix::fs::{AtFlags, Mode, OFlags, RenameFlags};
+use rustix::fs::{AtFlags, Gid, Mode, OFlags, RenameFlags, Timespec, Timestamps, Uid, XattrFlags};
 
 /// A kernel file lease (`F_SETLEASE`) on an open file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -70,6 +70,16 @@ pub trait FsOps {
     /// The lease on `fd`'s file. While a conflicting open is breaking it, this
     /// is the lease it is being broken to.
     fn lease(&self, fd: BorrowedFd) -> io::Result<Lease>;
+    fn set_owner(&self, fd: BorrowedFd, uid: u32, gid: u32) -> io::Result<()>;
+    /// Sets the permission bits, including setuid, setgid and sticky.
+    fn set_mode(&self, fd: BorrowedFd, mode: u32) -> io::Result<()>;
+    fn set_times(&self, fd: BorrowedFd, atime: Timespec, mtime: Timespec) -> io::Result<()>;
+    /// The names of `fd`'s extended attributes, including ACLs.
+    fn list_xattrs(&self, fd: BorrowedFd) -> io::Result<Vec<OsString>>;
+    fn get_xattr(&self, fd: BorrowedFd, name: &OsStr) -> io::Result<Vec<u8>>;
+    /// Creates or replaces an extended attribute.
+    fn set_xattr(&self, fd: BorrowedFd, name: &OsStr, value: &[u8]) -> io::Result<()>;
+    fn remove_xattr(&self, fd: BorrowedFd, name: &OsStr) -> io::Result<()>;
 }
 
 pub struct RealFs;
@@ -176,6 +186,61 @@ impl FsOps for RealFs {
             libc::F_WRLCK => Ok(Lease::Write),
             libc::F_UNLCK => Ok(Lease::Unlocked),
             other => Err(io::Error::other(format!("unknown lease type {other}"))),
+        }
+    }
+
+    fn set_owner(&self, fd: BorrowedFd, uid: u32, gid: u32) -> io::Result<()> {
+        let (uid, gid) = (Uid::from_raw(uid), Gid::from_raw(gid));
+        Ok(rustix::fs::fchown(fd, Some(uid), Some(gid))?)
+    }
+
+    fn set_mode(&self, fd: BorrowedFd, mode: u32) -> io::Result<()> {
+        Ok(rustix::fs::fchmod(fd, Mode::from_raw_mode(mode))?)
+    }
+
+    fn set_times(&self, fd: BorrowedFd, atime: Timespec, mtime: Timespec) -> io::Result<()> {
+        let times = Timestamps {
+            last_access: atime,
+            last_modification: mtime,
+        };
+        Ok(rustix::fs::futimens(fd, &times)?)
+    }
+
+    fn list_xattrs(&self, fd: BorrowedFd) -> io::Result<Vec<OsString>> {
+        let names = read_sized(|buf| rustix::fs::flistxattr(fd, buf))?;
+        Ok(names
+            .split(|&b| b == 0)
+            .filter(|name| !name.is_empty())
+            .map(|name| OsString::from_vec(name.to_vec()))
+            .collect())
+    }
+
+    fn get_xattr(&self, fd: BorrowedFd, name: &OsStr) -> io::Result<Vec<u8>> {
+        read_sized(|buf| rustix::fs::fgetxattr(fd, name, buf))
+    }
+
+    fn set_xattr(&self, fd: BorrowedFd, name: &OsStr, value: &[u8]) -> io::Result<()> {
+        Ok(rustix::fs::fsetxattr(fd, name, value, XattrFlags::empty())?)
+    }
+
+    fn remove_xattr(&self, fd: BorrowedFd, name: &OsStr) -> io::Result<()> {
+        Ok(rustix::fs::fremovexattr(fd, name)?)
+    }
+}
+
+/// Reads a value of unknown size with `read`, which fills its buffer and
+/// returns the size, or with an empty buffer only returns the size.
+fn read_sized(read: impl Fn(&mut [u8]) -> rustix::io::Result<usize>) -> io::Result<Vec<u8>> {
+    loop {
+        let mut buf = vec![0; read(&mut [])?];
+        match read(&mut buf) {
+            Ok(len) => {
+                buf.truncate(len);
+                return Ok(buf);
+            }
+            // It grew between the two calls.
+            Err(rustix::io::Errno::RANGE) => continue,
+            Err(e) => return Err(e.into()),
         }
     }
 }

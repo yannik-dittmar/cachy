@@ -238,3 +238,59 @@ fn retired_source_open_for_writing_is_renamed_back_not_deleted() {
     );
     fx.assert_no_staging_directories();
 }
+
+/// Deleting a retired source whose metadata differs from its published copy
+/// would lose that metadata, even if the content is the same.
+#[test]
+fn retired_source_with_other_metadata_than_its_published_copy_is_renamed_back() {
+    let fx = Fixture::new();
+    fx.staged_cache_branch_file("dir/mtime.bin", b"content", 1_000);
+    fx.backing_branch_file("dir/mtime.bin", b"content", 2_000);
+    fx.staged_cache_branch_file("dir/mode.bin", b"content", 1_000);
+    fx.backing_branch_file("dir/mode.bin", b"content", 1_000);
+    fs::set_permissions(
+        fx.on_backing_branch("dir/mode.bin"),
+        std::os::unix::fs::PermissionsExt::from_mode(0o600),
+    )
+    .unwrap();
+
+    assert_exit(&fx.run(&fx.no_work_config()), 0);
+
+    for rel in ["dir/mtime.bin", "dir/mode.bin"] {
+        assert_eq!(fs::read(fx.on_cache_branch(rel)).unwrap(), b"content");
+        assert_eq!(fs::read(fx.on_backing_branch(rel)).unwrap(), b"content");
+    }
+    assert_eq!(
+        fs::metadata(fx.on_cache_branch("dir/mtime.bin"))
+            .unwrap()
+            .mtime(),
+        1_000
+    );
+    fx.assert_no_staging_directories();
+}
+
+/// A retired source whose directory is gone from the cache branch goes back
+/// into a recreated directory, which takes the metadata of its counterpart on
+/// the backing branch.
+#[test]
+fn recreated_cache_directory_takes_the_backing_directory_metadata() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fx = Fixture::new();
+    fx.staged_cache_branch_file("gone/file.bin", b"written while retiring", 1_000);
+    fx.backing_branch_file("gone/file.bin", b"published", 1_000);
+    let backing_dir = fx.on_backing_branch("gone");
+    common::set_xattr(&backing_dir, "user.dir", b"gone").unwrap();
+    fs::set_permissions(&backing_dir, fs::Permissions::from_mode(0o750)).unwrap();
+
+    assert_exit(&fx.run(&fx.no_work_config()), 0);
+
+    let recreated = fx.on_cache_branch("gone");
+    assert_eq!(
+        fs::read(recreated.join("file.bin")).unwrap(),
+        b"written while retiring"
+    );
+    assert_eq!(fs::metadata(&recreated).unwrap().mode(), 0o040_750);
+    assert_eq!(common::xattrs(&recreated), common::xattrs(&backing_dir));
+    fx.assert_no_staging_directories();
+}

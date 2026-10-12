@@ -8,6 +8,7 @@ use anyhow::{Context, Result};
 
 use crate::config::{Config, LeaseType};
 use crate::fsops::{FsOps, Lease};
+use crate::metadata::AllowedLosses;
 use crate::recovery::recover;
 use crate::scan::scan;
 use crate::transaction::{Branch, Guard, MoveOutcome, Mover, STAGING};
@@ -46,7 +47,14 @@ pub fn run(fs: &dyn FsOps, config: &Config) -> Result<Outcome> {
         },
         minimum_age: config.minimum_age,
     };
-    let unresolved = recover(fs, &cache_branch, &backing_branch, guard.lease);
+    let allowed_losses = AllowedLosses::of(&config.allow_metadata_loss);
+    let unresolved = recover(
+        fs,
+        &cache_branch,
+        &backing_branch,
+        guard.lease,
+        allowed_losses,
+    );
     let mut free = match free_space(fs, &cache_branch) {
         Ok(free) => free,
         Err(e) => {
@@ -78,7 +86,7 @@ pub fn run(fs: &dyn FsOps, config: &Config) -> Result<Outcome> {
         .with_context(|| format!("cannot scan cache branch {}", cache_branch.path.display()))?;
     let mut tally = Tally::default();
     let mut stopped = false;
-    let mut mover = Mover::new(fs, &cache_branch, &backing_branch, &guard);
+    let mut mover = Mover::new(fs, &cache_branch, &backing_branch, &guard, allowed_losses);
     for unit in &units {
         tally.record(mover.finished());
         // Retiring moves free their space once their sources are unlinked.
@@ -97,6 +105,13 @@ pub fn run(fs: &dyn FsOps, config: &Config) -> Result<Outcome> {
     }
     mover.finish();
     tally.record(mover.finished());
+    for (rel, e) in mover.date_created_dirs() {
+        tally.failed += 1;
+        eprintln!(
+            "cachy: error: cannot set the times of created directory {}: {e:#}",
+            rel.display()
+        );
+    }
     if let Ok(now) = free_space(fs, &cache_branch) {
         free = now;
     }

@@ -21,7 +21,8 @@ use std::path::Path;
 use anyhow::{Context, Result};
 
 use crate::fsops::{FsOps, Lease};
-use crate::transaction::{Branch, DIR_MODE, STAGING, make_dirs, open_dirs, same_content, split};
+use crate::metadata::AllowedLosses;
+use crate::transaction::{Branch, STAGING, identical, make_dirs_like, open_dirs, split};
 
 /// Resolves the leftovers in the staging directories of the cache branch and
 /// the backing branch, then removes the staging directories once empty.
@@ -32,12 +33,14 @@ pub fn recover(
     cache_branch: &Branch,
     backing_branch: &Branch,
     lease: Lease,
+    allowed_losses: AllowedLosses,
 ) -> usize {
     let mut recovery = Recovery {
         fs,
         cache_branch,
         backing_branch,
         lease,
+        allowed_losses,
         unresolved: 0,
     };
     recovery.resolve_staging_directory(cache_branch, Leftover::RetiredSource);
@@ -60,6 +63,7 @@ struct Recovery<'a> {
     cache_branch: &'a Branch,
     backing_branch: &'a Branch,
     lease: Lease,
+    allowed_losses: AllowedLosses,
     unresolved: usize,
 }
 
@@ -150,7 +154,7 @@ impl Recovery<'_> {
             fs.set_lease(retired.as_fd(), self.lease).is_ok()
                 && open_dirs(fs, &self.backing_branch.fd, parent)
                     .and_then(|dir| fs.open_read(dir.as_fd(), name))
-                    .and_then(|published| same_content(fs, retired, &published))
+                    .and_then(|published| identical(fs, retired, &published))
                     .unwrap_or(false)
                 // A conflicting open since the lease was taken.
                 && fs.lease(retired.as_fd()).is_ok_and(|lease| lease == self.lease)
@@ -162,8 +166,17 @@ impl Recovery<'_> {
                 .context("fsync staging directory")?;
             return Ok("deleted, identical to its published copy");
         }
-        let dest = make_dirs(fs, &self.cache_branch.fd, parent, DIR_MODE)
-            .context("create directory on the cache branch")?;
+        // A directory recreated on the cache branch takes the metadata of its
+        // counterpart on the backing branch, if there is one.
+        let dest = make_dirs_like(
+            fs,
+            self.cache_branch,
+            parent,
+            &self.backing_branch.fd,
+            self.allowed_losses,
+            &mut Vec::new(),
+        )
+        .context("create directory on the cache branch")?;
         fs.rename_noreplace(staged_dir.as_fd(), name, dest.as_fd(), name)
             .context("rename retired source back")?;
         fs.fsync(dest.as_fd())

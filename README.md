@@ -6,7 +6,15 @@ cachy is heavily inspired by [mergerfs-cache-mover](https://github.com/monstermu
 
 ## Status
 
-Early development. Do not use it on real data yet. `cachy run` moves files, skips files in use and recovers from a crash in the middle of a move, but it does not yet preserve metadata such as owner, mode and timestamps.
+Early development. Do not use it on real data yet. `cachy run` moves files, skips files in use, recovers from a crash in the middle of a move, and preserves owner, group, mode, xattrs, ACLs and timestamps.
+
+A move fails, keeping the source, if the backing branch cannot store the source's xattrs or ACLs. To accept losing them instead, with a warning, list the kinds in the configuration:
+
+```yaml
+allow_metadata_loss: [xattrs, acls]
+```
+
+Owner, group, mode and mtime are never optional. Directories that cachy creates on a backing branch take the owner, mode, xattrs and ACLs of the cache branch's directory, and its mtime at the end of the run; existing backing directories are left as they are.
 
 cachy detects files in use with kernel file leases. One race remains that leases cannot close: an application that looked up a file's path just before cachy retired it, but stalled for more than a second before opening it, opens the retired copy, and its writes are lost.
 

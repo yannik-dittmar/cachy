@@ -32,7 +32,7 @@ use anyhow::{Context, Result, bail};
 
 use rustix::fs::Timespec;
 
-use crate::fsops::{FsOps, Lease, RealFs, Stat};
+use crate::fsops::{FsOps, FsStat, Lease, RealFs, Stat};
 
 const FAULT: &str = "CACHY_FAULT";
 const TRACE: &str = "CACHY_FAULT_TRACE";
@@ -263,9 +263,14 @@ impl FsOps for FaultyFs {
         RealFs.list_dir(dir)
     }
 
-    fn free_space(&self, fd: BorrowedFd) -> io::Result<u64> {
-        self.count_op("free_space")?;
-        RealFs.free_space(fd)
+    fn stat_fs(&self, fd: BorrowedFd) -> io::Result<FsStat> {
+        self.count_op("stat_fs")?;
+        RealFs.stat_fs(fd)
+    }
+
+    fn sync_fs(&self, fd: BorrowedFd) -> io::Result<()> {
+        self.count_op("sync_fs")?;
+        RealFs.sync_fs(fd)
     }
 
     fn set_lease(&self, fd: BorrowedFd, lease: Lease) -> io::Result<()> {

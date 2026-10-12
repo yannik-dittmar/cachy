@@ -15,7 +15,7 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 
 use config::Config;
-use run::run;
+use run::{Options, run};
 
 /// Exit code when cachy refused to run.
 const EXIT_REFUSED: u8 = 1;
@@ -36,6 +36,13 @@ enum Command {
         /// Path to the YAML configuration file.
         #[arg(long)]
         config: PathBuf,
+        /// Write nothing; print the byte budget, the move units a run would
+        /// move, in order, and every skip with its reason.
+        #[arg(long)]
+        dry_run: bool,
+        /// Skip the check and move every eligible move unit.
+        #[arg(long)]
+        drain: bool,
     },
 }
 
@@ -66,13 +73,19 @@ fn main() -> ExitCode {
         }
     };
     match cli.command {
-        Command::Run { config } => match Config::load(&config).and_then(|c| run(&fs()?, &c)) {
-            Ok(outcome) if outcome.succeeded() => ExitCode::SUCCESS,
-            Ok(_) => ExitCode::from(EXIT_MOVE_FAILED),
-            Err(e) => {
-                eprintln!("cachy: error: {e:#}");
-                ExitCode::from(EXIT_REFUSED)
+        Command::Run {
+            config,
+            dry_run,
+            drain,
+        } => {
+            match Config::load(&config).and_then(|c| run(&fs()?, &c, Options { dry_run, drain })) {
+                Ok(outcome) if outcome.succeeded() => ExitCode::SUCCESS,
+                Ok(_) => ExitCode::from(EXIT_MOVE_FAILED),
+                Err(e) => {
+                    eprintln!("cachy: error: {e:#}");
+                    ExitCode::from(EXIT_REFUSED)
+                }
             }
-        },
+        }
     }
 }

@@ -16,6 +16,30 @@ use rustix::fs::{
     XattrFlags,
 };
 
+/// What `statvfs` reports about a filesystem.
+#[derive(Clone, Copy, Debug)]
+pub struct FsStat {
+    /// Bytes available to unprivileged writers.
+    pub free: u64,
+    /// The filesystem's size in bytes.
+    pub size: u64,
+    /// Mounted without access-time updates.
+    pub noatime: bool,
+}
+
+impl FsStat {
+    /// `fd`'s filesystem, measured outside the port, for checks that cachy
+    /// makes before it changes anything.
+    pub fn of(fd: BorrowedFd) -> io::Result<FsStat> {
+        let s = rustix::fs::fstatvfs(fd)?;
+        Ok(FsStat {
+            free: s.f_bavail * s.f_frsize,
+            size: s.f_blocks * s.f_frsize,
+            noatime: s.f_flag.contains(rustix::fs::StatVfsMountFlags::NOATIME),
+        })
+    }
+}
+
 /// A kernel file lease (`F_SETLEASE`) on an open file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Lease {
@@ -97,8 +121,11 @@ pub trait FsOps {
     fn rmdir(&self, dir: BorrowedFd, path: &Path) -> io::Result<()>;
     /// The names of the entries in the directory `dir`, without `.` and `..`.
     fn list_dir(&self, dir: BorrowedFd) -> io::Result<Vec<OsString>>;
-    /// Bytes available to unprivileged writers on `fd`'s filesystem.
-    fn free_space(&self, fd: BorrowedFd) -> io::Result<u64>;
+    /// The space and mount flags of `fd`'s filesystem.
+    fn stat_fs(&self, fd: BorrowedFd) -> io::Result<FsStat>;
+    /// Writes out everything that `fd`'s filesystem holds in memory, so that
+    /// frees show in its free space (ZFS reports them only once synced).
+    fn sync_fs(&self, fd: BorrowedFd) -> io::Result<()>;
     /// Takes, changes or releases the lease on `fd`'s file. Fails with
     /// [`io::ErrorKind::WouldBlock`] if another open conflicts with it.
     fn set_lease(&self, fd: BorrowedFd, lease: Lease) -> io::Result<()>;
@@ -260,9 +287,12 @@ impl FsOps for RealFs {
         Ok(names)
     }
 
-    fn free_space(&self, fd: BorrowedFd) -> io::Result<u64> {
-        let s = rustix::fs::fstatvfs(fd)?;
-        Ok(s.f_bavail * s.f_frsize)
+    fn stat_fs(&self, fd: BorrowedFd) -> io::Result<FsStat> {
+        FsStat::of(fd)
+    }
+
+    fn sync_fs(&self, fd: BorrowedFd) -> io::Result<()> {
+        Ok(rustix::fs::syncfs(fd)?)
     }
 
     fn set_lease(&self, fd: BorrowedFd, lease: Lease) -> io::Result<()> {

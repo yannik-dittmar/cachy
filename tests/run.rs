@@ -1,9 +1,12 @@
 mod common;
 
+use std::ffi::OsStr;
 use std::fs;
 use std::time::{Duration, Instant};
 
-use common::{Fixture, FsKind, assert_exit, free_space_lock, skip};
+use common::{
+    Fixture, FsKind, assert_exit, free_space_lock, root_available, skip, sudo, zfs_dataset,
+};
 
 const MIB: u64 = 1 << 20;
 
@@ -55,13 +58,6 @@ fn assert_kept(fx: &Fixture, i: usize) {
 fn run_moves_oldest_files_until_free_space_reaches_target() {
     let _lock = free_space_lock();
     let fx = Fixture::new();
-    if fx.cache_branch_fs == FsKind::Zfs {
-        // ZFS shows freed space only once its transaction group syncs, so a
-        // run that re-measures free space after each move overshoots the
-        // target. Runs will stop on a byte budget instead (#13).
-        skip("free space on ZFS lags behind moves");
-        return;
-    }
     populate(&fx);
     let free = fx.cache_branch_free();
     let config = fx.config(
@@ -69,13 +65,103 @@ fn run_moves_oldest_files_until_free_space_reaches_target() {
         &(free + 2 * MIB + MIB / 2).to_string(),
     );
 
-    assert_exit(&fx.run(&config), 0);
+    let err = assert_exit(&fx.run(&config), 0);
 
     for i in 0..3 {
         assert_moved(&fx, i);
     }
     for i in 3..5 {
         assert_kept(&fx, i);
+    }
+    assert!(!err.contains("warning"), "stderr:\n{err}");
+}
+
+/// A file that a reader holds open keeps its space after its move, so free
+/// space does not grow; the run still stops once the moves add up to its
+/// byte budget, and warns.
+#[test]
+fn run_stops_once_its_byte_budget_is_consumed_even_if_free_space_does_not_grow() {
+    let _lock = free_space_lock();
+    let fx = Fixture::new();
+    populate(&fx);
+    let _readers: Vec<fs::File> = FILES
+        .iter()
+        .map(|(rel, _)| fs::File::open(fx.on_cache_branch(rel)).unwrap())
+        .collect();
+    let free = fx.cache_branch_free();
+    let config = fx.config(
+        &(free + 1).to_string(),
+        &(free + 2 * MIB + MIB / 2).to_string(),
+    );
+
+    let err = assert_exit(&fx.run(&config), 0);
+
+    for i in 0..3 {
+        assert_moved(&fx, i);
+    }
+    for i in 3..5 {
+        assert_kept(&fx, i);
+    }
+    assert!(err.contains("3 moved"), "stderr:\n{err}");
+    assert!(
+        err.contains("snapshots of the cache branch may be holding the space"),
+        "stderr:\n{err}"
+    );
+}
+
+#[test]
+fn snapshot_holding_moved_files_ends_the_run_with_a_warning() {
+    let _lock = free_space_lock();
+    let fx = Fixture::new();
+    if fx.cache_branch_fs != FsKind::Zfs {
+        skip("the cache branch is not on ZFS");
+        return;
+    }
+    if !root_available() {
+        return;
+    }
+    populate(&fx);
+    let _snapshot = Snapshot::of(fx.cache_branch.path());
+    let free = fx.cache_branch_free();
+    let config = fx.config(
+        &(free + 1).to_string(),
+        &(free + 2 * MIB + MIB / 2).to_string(),
+    );
+
+    let err = assert_exit(&fx.run(&config), 0);
+
+    for i in 0..3 {
+        assert_moved(&fx, i);
+    }
+    for i in 3..5 {
+        assert_kept(&fx, i);
+    }
+    assert!(
+        err.contains("snapshots of the cache branch may be holding the space"),
+        "stderr:\n{err}"
+    );
+}
+
+/// A ZFS snapshot of the dataset that holds a path, destroyed on drop.
+struct Snapshot(String);
+
+impl Snapshot {
+    fn of(path: &std::path::Path) -> Snapshot {
+        let name = format!("{}@cachy-test-{}", zfs_dataset(path), std::process::id());
+        sudo(&[OsStr::new("zfs"), OsStr::new("snapshot"), OsStr::new(&name)]).unwrap();
+        Snapshot(name)
+    }
+}
+
+impl Drop for Snapshot {
+    fn drop(&mut self) {
+        if let Err(e) = sudo(&[
+            OsStr::new("zfs"),
+            OsStr::new("destroy"),
+            OsStr::new(&self.0),
+        ]) {
+            eprintln!("cannot destroy snapshot {}: {e}", self.0);
+        }
     }
 }
 
@@ -169,4 +255,51 @@ fn publish_never_replaces_an_existing_backing_file() {
         assert_moved(&fx, i);
     }
     fx.assert_no_staging_directories();
+}
+
+/// `bytes` as a percentage of the cache branch's size, to 12 decimals,
+/// rounded down.
+fn percent_of_cache_branch(fx: &Fixture, bytes: u64) -> String {
+    let s = rustix::fs::statvfs(fx.cache_branch.path()).unwrap();
+    let size = s.f_blocks as u128 * s.f_frsize as u128;
+    let scaled = bytes as u128 * 100 * 10u128.pow(12) / size;
+    format!(
+        "{}.{:012}%",
+        scaled / 10u128.pow(12),
+        scaled % 10u128.pow(12)
+    )
+}
+
+#[test]
+fn percentage_threshold_and_target_move_like_the_equivalent_byte_sizes() {
+    let _lock = free_space_lock();
+    let fx = Fixture::new();
+    populate(&fx);
+    let free = fx.cache_branch_free();
+    let (threshold, target) = (free + MIB, free + 2 * MIB + MIB / 2);
+    let in_bytes = fx.config(&threshold.to_string(), &target.to_string());
+    let in_percent = fx.config(
+        &percent_of_cache_branch(&fx, threshold),
+        &percent_of_cache_branch(&fx, target),
+    );
+    let planned = |config: &str| {
+        let out = common::output(fx.command(config).arg("--dry-run")).unwrap();
+        assert_exit(&out, 0);
+        String::from_utf8(out.stdout)
+            .unwrap()
+            .lines()
+            .filter(|line| line.starts_with("would "))
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+
+    assert_eq!(planned(&in_percent), planned(&in_bytes));
+    assert_exit(&fx.run(&in_percent), 0);
+
+    for i in 0..3 {
+        assert_moved(&fx, i);
+    }
+    for i in 3..5 {
+        assert_kept(&fx, i);
+    }
 }

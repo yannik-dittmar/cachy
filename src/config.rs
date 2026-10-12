@@ -13,10 +13,13 @@ use crate::exclude::Exclusions;
 pub struct Config {
     pub cache_branch: PathBuf,
     pub backing_branches: Vec<PathBuf>,
-    #[serde(deserialize_with = "byte_size")]
-    pub threshold: u64,
-    #[serde(deserialize_with = "byte_size")]
-    pub target: u64,
+    #[serde(deserialize_with = "free_space")]
+    pub threshold: FreeSpace,
+    #[serde(deserialize_with = "free_space")]
+    pub target: FreeSpace,
+    /// The timestamp that decides which move units a run moves first.
+    #[serde(default)]
+    pub order: Order,
     #[serde(default = "default_minimum_age", deserialize_with = "duration")]
     pub minimum_age: Duration,
     #[serde(default)]
@@ -31,6 +34,83 @@ pub struct Config {
     /// root, for files and directories that stay on the cache branch.
     #[serde(default, deserialize_with = "exclusions")]
     pub exclude: Exclusions,
+}
+
+/// An amount of free space on the cache branch: a byte size, or a percentage
+/// of the filesystem's size, resolved when a run starts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FreeSpace {
+    Bytes(u64),
+    /// `digits` × 10^-`decimals` percent, kept exact.
+    Percent {
+        digits: u64,
+        decimals: u32,
+    },
+}
+
+/// Most decimals a percentage may have; enough for a byte on a 100 TB
+/// filesystem.
+const MAX_PERCENT_DECIMALS: u32 = 12;
+
+impl FreeSpace {
+    /// The number of bytes this is on a filesystem of `size` bytes, rounded
+    /// down.
+    pub fn resolve(self, size: u64) -> u64 {
+        match self {
+            FreeSpace::Bytes(bytes) => bytes,
+            FreeSpace::Percent { digits, decimals } => {
+                let scale = 100 * 10u128.pow(decimals);
+                (size as u128 * digits as u128 / scale) as u64
+            }
+        }
+    }
+
+    /// Whether this is above `other` whatever the filesystem's size, or
+    /// `None` if that depends on the size.
+    fn above(self, other: FreeSpace) -> Option<bool> {
+        match (self, other) {
+            (FreeSpace::Bytes(a), FreeSpace::Bytes(b)) => Some(a > b),
+            (
+                FreeSpace::Percent {
+                    digits: a,
+                    decimals: ad,
+                },
+                FreeSpace::Percent {
+                    digits: b,
+                    decimals: bd,
+                },
+            ) => Some(a as u128 * 10u128.pow(bd) > b as u128 * 10u128.pow(ad)),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for FreeSpace {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match *self {
+            FreeSpace::Bytes(bytes) => write!(f, "{bytes} bytes"),
+            FreeSpace::Percent { digits, decimals } => {
+                let digits = format!("{digits:0>width$}", width = decimals as usize + 1);
+                let (whole, fraction) = digits.split_at(digits.len() - decimals as usize);
+                if fraction.is_empty() {
+                    write!(f, "{whole}%")
+                } else {
+                    write!(f, "{whole}.{fraction}%")
+                }
+            }
+        }
+    }
+}
+
+/// The timestamp by which a run orders move units, oldest first.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Order {
+    /// Last access: least recently used first.
+    #[default]
+    Atime,
+    /// Last modification: oldest content first.
+    Mtime,
 }
 
 /// How a move checks its copy before publishing it.
@@ -94,9 +174,9 @@ impl Config {
                 config.backing_branches.len()
             );
         }
-        if config.target <= config.threshold {
+        if config.target.above(config.threshold) == Some(false) {
             bail!(
-                "target ({} bytes) must be above the threshold ({} bytes)",
+                "target ({}) must be above the threshold ({})",
                 config.target,
                 config.threshold
             );
@@ -105,32 +185,61 @@ impl Config {
     }
 }
 
-/// A byte size: a plain integer, or an integer with a binary `K`, `M`, `G` or
-/// `T` suffix (`120G` is 120 × 1024³ bytes).
-fn byte_size<'de, D: serde::Deserializer<'de>>(de: D) -> Result<u64, D::Error> {
-    struct ByteSize;
+/// A threshold or target: a byte size, or a percentage such as `12.5%`.
+fn free_space<'de, D: serde::Deserializer<'de>>(de: D) -> Result<FreeSpace, D::Error> {
+    struct FreeSpaceVisitor;
 
-    impl serde::de::Visitor<'_> for ByteSize {
-        type Value = u64;
+    impl serde::de::Visitor<'_> for FreeSpaceVisitor {
+        type Value = FreeSpace;
 
         fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-            f.write_str("a byte size such as 120G")
+            f.write_str("a byte size such as 120G, or a percentage such as 10%")
         }
 
-        fn visit_u64<E: serde::de::Error>(self, n: u64) -> Result<u64, E> {
-            Ok(n)
+        fn visit_u64<E: serde::de::Error>(self, n: u64) -> Result<FreeSpace, E> {
+            Ok(FreeSpace::Bytes(n))
         }
 
-        fn visit_str<E: serde::de::Error>(self, s: &str) -> Result<u64, E> {
-            parse_byte_size(s).ok_or_else(|| {
+        fn visit_str<E: serde::de::Error>(self, s: &str) -> Result<FreeSpace, E> {
+            if let Some(percent) = s.strip_suffix('%') {
+                return parse_percent(percent).ok_or_else(|| {
+                    E::custom(format!(
+                        "invalid percentage `{s}`: expected a number from 0 to 100, with at most {MAX_PERCENT_DECIMALS} decimals"
+                    ))
+                });
+            }
+            parse_byte_size(s).map(FreeSpace::Bytes).ok_or_else(|| {
                 E::custom(format!(
-                    "invalid byte size `{s}`: expected a whole number with an optional K, M, G or T suffix"
+                    "invalid byte size `{s}`: expected a whole number with an optional K, M, G or T suffix, or a percentage"
                 ))
             })
         }
     }
 
-    de.deserialize_any(ByteSize)
+    de.deserialize_any(FreeSpaceVisitor)
+}
+
+/// Parses a percentage without its `%`, such as `12.5`, from 0 to 100.
+fn parse_percent(s: &str) -> Option<FreeSpace> {
+    let (whole, fraction) = s.split_once('.').unwrap_or((s, ""));
+    let all_digits = |part: &str| part.bytes().all(|b| b.is_ascii_digit());
+    if whole.is_empty() || !all_digits(whole) || !all_digits(fraction) {
+        return None;
+    }
+    if s.contains('.') && fraction.is_empty() {
+        return None;
+    }
+    let decimals = fraction.len() as u32;
+    if decimals > MAX_PERCENT_DECIMALS {
+        return None;
+    }
+    let digits: u64 = format!("{whole}{fraction}").parse().ok()?;
+    let percent = FreeSpace::Percent { digits, decimals };
+    let hundred = FreeSpace::Percent {
+        digits: 100,
+        decimals: 0,
+    };
+    (!percent.above(hundred)?).then_some(percent)
 }
 
 /// A duration: an integer with an `s`, `m`, `h` or `d` suffix (`15m` is 900

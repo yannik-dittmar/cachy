@@ -1,12 +1,13 @@
 //! The scanner: walks the cache branch on one filesystem and lists its regular
-//! files, hardlink groups, symlinks and special files, oldest mtime first.
-//! Symlinks are never followed.
+//! files, hardlink groups, symlinks and special files, in the configured
+//! order. Symlinks are never followed.
 
 use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 
+use crate::config::Order;
 use crate::exclude::Exclusions;
 use crate::transaction::STAGING;
 
@@ -17,6 +18,10 @@ pub struct Entry {
     /// a hardlink group that the walk found.
     pub rels: Vec<PathBuf>,
     pub kind: Kind,
+    /// Space it takes up on the cache branch (`st_blocks`), in bytes; a
+    /// hardlink group's once.
+    pub allocated: u64,
+    atime: (i64, i64),
     mtime: (i64, i64),
 }
 
@@ -36,10 +41,11 @@ pub enum Kind {
 }
 
 /// Regular files, hardlink groups, symlinks and special files under `root`
-/// that `exclusions` leave, ordered by mtime, then relpath. The walk prunes
-/// excluded directories, the staging directory and directories on other
-/// filesystems. Directories that cannot be read are skipped with a warning.
-pub fn scan(root: &Path, exclusions: &Exclusions) -> std::io::Result<Vec<Entry>> {
+/// that `exclusions` leave, oldest first by `order`, then by mtime, then by
+/// relpath. The walk prunes excluded directories, the staging directory and
+/// directories on other filesystems. Directories that cannot be read are
+/// skipped with a warning.
+pub fn scan(root: &Path, exclusions: &Exclusions, order: Order) -> std::io::Result<Vec<Entry>> {
     let dev = fs::metadata(root)?.dev();
     let mut found = Vec::new();
     let walk = Walk {
@@ -48,13 +54,15 @@ pub fn scan(root: &Path, exclusions: &Exclusions) -> std::io::Result<Vec<Entry>>
         exclusions,
     };
     walk.dir(Path::new(""), &mut found);
-    Ok(group(found))
+    Ok(group(found, order))
 }
 
 /// A file that the walk found.
 struct Found {
     rel: PathBuf,
     kind: Kind,
+    allocated: u64,
+    atime: (i64, i64),
     mtime: (i64, i64),
     /// `st_dev` and `st_ino`, which identify its inode.
     dev: u64,
@@ -63,11 +71,12 @@ struct Found {
     nlink: u64,
 }
 
-/// Turns what the walk found into entries, ordered by mtime, then relpath.
+/// Turns what the walk found into entries, oldest first by `order`, then by
+/// mtime, then by relpath.
 /// Regular files with more than one link that share `(st_dev, st_ino)` form
 /// one hardlink group; it is partly excluded if the walk found fewer names
 /// than its link count.
-fn group(found: Vec<Found>) -> Vec<Entry> {
+fn group(found: Vec<Found>, order: Order) -> Vec<Entry> {
     let mut entries = Vec::new();
     // Each group, with its link count, by `(st_dev, st_ino)`.
     let mut groups: BTreeMap<(u64, u64), (Entry, u64)> = BTreeMap::new();
@@ -79,6 +88,8 @@ fn group(found: Vec<Found>) -> Vec<Entry> {
                     Entry {
                         rels,
                         kind: Kind::Regular,
+                        allocated: f.allocated,
+                        atime: f.atime,
                         mtime: f.mtime,
                     },
                     f.nlink,
@@ -89,6 +100,8 @@ fn group(found: Vec<Found>) -> Vec<Entry> {
             entries.push(Entry {
                 rels: vec![f.rel],
                 kind: f.kind,
+                allocated: f.allocated,
+                atime: f.atime,
                 mtime: f.mtime,
             });
         }
@@ -100,7 +113,16 @@ fn group(found: Vec<Found>) -> Vec<Entry> {
         }
         entries.push(group);
     }
-    entries.sort_by(|a, b| a.mtime.cmp(&b.mtime).then_with(|| a.rels.cmp(&b.rels)));
+    let key = |e: &Entry| match order {
+        Order::Atime => e.atime,
+        Order::Mtime => e.mtime,
+    };
+    entries.sort_by(|a, b| {
+        key(a)
+            .cmp(&key(b))
+            .then_with(|| a.mtime.cmp(&b.mtime))
+            .then_with(|| a.rels.cmp(&b.rels))
+    });
     entries
 }
 
@@ -157,6 +179,8 @@ impl Walk<'_> {
                 found.push(Found {
                     rel,
                     kind,
+                    allocated: meta.blocks() * 512,
+                    atime: (meta.atime(), meta.atime_nsec()),
                     mtime: (meta.mtime(), meta.mtime_nsec()),
                     dev: meta.dev(),
                     ino: meta.ino(),
@@ -191,6 +215,8 @@ mod tests {
         Found {
             rel: PathBuf::from(rel),
             kind: Kind::Regular,
+            allocated: 0,
+            atime: (1_000, 0),
             mtime: (1_000, 0),
             dev,
             ino,
@@ -202,6 +228,8 @@ mod tests {
         Entry {
             rels: rels.iter().map(PathBuf::from).collect(),
             kind,
+            allocated: 0,
+            atime: (1_000, 0),
             mtime: (1_000, 0),
         }
     }
@@ -217,7 +245,7 @@ mod tests {
         ];
 
         assert_eq!(
-            group(found),
+            group(found, Order::Atime),
             [
                 entry(&["bind-mounted"], Kind::PartlyExcluded),
                 entry(&["cache"], Kind::PartlyExcluded),
@@ -234,7 +262,7 @@ mod tests {
         ];
 
         assert_eq!(
-            group(found),
+            group(found, Order::Atime),
             [
                 entry(&["a", "b"], Kind::Regular),
                 entry(&["single"], Kind::Regular),

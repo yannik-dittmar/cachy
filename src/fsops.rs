@@ -83,6 +83,16 @@ pub trait FsOps {
         to_dir: BorrowedFd,
         to: &Path,
     ) -> io::Result<()>;
+    /// Creates `to` relative to `to_dir` as a hard link to `from` relative
+    /// to `from_dir`, without following a final symlink; fails if `to`
+    /// exists.
+    fn link(
+        &self,
+        from_dir: BorrowedFd,
+        from: &Path,
+        to_dir: BorrowedFd,
+        to: &Path,
+    ) -> io::Result<()>;
     fn unlink(&self, dir: BorrowedFd, path: &Path) -> io::Result<()>;
     fn rmdir(&self, dir: BorrowedFd, path: &Path) -> io::Result<()>;
     /// The names of the entries in the directory `dir`, without `.` and `..`.
@@ -212,6 +222,22 @@ impl FsOps for RealFs {
             to_dir,
             to,
             RenameFlags::NOREPLACE,
+        )?)
+    }
+
+    fn link(
+        &self,
+        from_dir: BorrowedFd,
+        from: &Path,
+        to_dir: BorrowedFd,
+        to: &Path,
+    ) -> io::Result<()> {
+        Ok(rustix::fs::linkat(
+            from_dir,
+            from,
+            to_dir,
+            to,
+            AtFlags::empty(),
         )?)
     }
 

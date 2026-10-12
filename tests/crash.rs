@@ -489,6 +489,115 @@ mod fault_injection {
         }
     }
 
+    /// The names of a hardlink group, sorted, and its content and mtime.
+    const GROUP: [&str; 3] = ["a/file.bin", "a/link.bin", "b/deep/link.bin"];
+    const GROUP_MTIME: i64 = 1_000;
+
+    fn create_group(fx: &Fixture) {
+        fx.cache_branch_hardlinks(&GROUP, b"content", GROUP_MTIME);
+    }
+
+    /// Each name of the group exists exactly once, on the cache branch or
+    /// the backing branch, with its content and mtime, and the names on each
+    /// branch are links to one inode. With `moved`, all are on the backing
+    /// branch, as one inode with a link for each.
+    fn assert_group_exactly_once(fx: &Fixture, context: &str, moved: bool) {
+        let mut inodes = std::collections::BTreeMap::new();
+        for name in GROUP {
+            let copies: Vec<_> = [fx.on_cache_branch(name), fx.on_backing_branch(name)]
+                .into_iter()
+                .filter(|p| p.exists())
+                .collect();
+            assert!(
+                copies.len() == 1,
+                "{context}: {name} exists {} times",
+                copies.len()
+            );
+            assert_eq!(fs::read(&copies[0]).unwrap(), b"content", "{context}");
+            let meta = fs::metadata(&copies[0]).unwrap();
+            assert_eq!(meta.mtime(), GROUP_MTIME, "{context}: {name}");
+            let on_cache_branch = copies[0] == fx.on_cache_branch(name);
+            let inode = (meta.dev(), meta.ino(), meta.nlink());
+            assert_eq!(
+                *inodes.entry(on_cache_branch).or_insert(inode),
+                inode,
+                "{context}: {name} is not a link to the other names on its branch"
+            );
+        }
+        if moved {
+            let nlinks: Vec<_> = inodes
+                .into_iter()
+                .map(|(on_cache_branch, (_, _, nlink))| (on_cache_branch, nlink))
+                .collect();
+            assert_eq!(
+                nlinks,
+                [(false, GROUP.len() as u64)],
+                "{context}: the group was not moved whole"
+            );
+        }
+    }
+
+    #[test]
+    fn crash_at_every_operation_of_a_hardlink_group_move_is_recovered_by_the_next_run() {
+        for_every_operation(|n| {
+            let fx = Fixture::new();
+            create_group(&fx);
+            let config = fx.move_everything_config();
+
+            let (out, reached) =
+                run_with_faults(with_short_retire_wait(&fx, &config), &format!("kill@{n}"));
+            if !reached {
+                assert_exit(&out, 0);
+                return false;
+            }
+            let out = common::output(&mut with_short_retire_wait(&fx, &config)).unwrap();
+
+            let context = format!(
+                "killed at operation {n}, then ran again; stderr:\n{}",
+                common::stderr(&out)
+            );
+            assert_eq!(out.status.code(), Some(0), "{context}");
+            assert_group_exactly_once(&fx, &context, true);
+            assert_no_staging_directories(&fx, &context);
+            true
+        });
+    }
+
+    #[test]
+    fn error_at_every_operation_of_a_hardlink_group_move_loses_nothing() {
+        for errno in ["eio", "enospc"] {
+            for_every_operation(|n| {
+                let fx = Fixture::new();
+                create_group(&fx);
+
+                let fault = format!("{errno}@{n}");
+                let (out, reached) = run_with_faults(
+                    with_short_retire_wait(&fx, &fx.move_everything_config()),
+                    &fault,
+                );
+                if !reached {
+                    assert_exit(&out, 0);
+                    return false;
+                }
+                let context = format!("{fault}; stderr:\n{}", common::stderr(&out));
+                assert!(
+                    matches!(out.status.code(), Some(0 | 2)),
+                    "{context}\nexit: {:?}",
+                    out.status
+                );
+                assert_group_exactly_once(&fx, &context, false);
+
+                let config = fx.move_everything_config();
+                let out = common::output(&mut with_short_retire_wait(&fx, &config)).unwrap();
+                let context = format!("{fault}, then ran again; stderr:\n{}", common::stderr(&out));
+                assert_eq!(out.status.code(), Some(0), "{context}");
+                assert_group_exactly_once(&fx, &context, true);
+                assert_no_staging_directories(&fx, &context);
+                true
+            });
+        }
+    }
+
     /// Recovery itself can crash at any step; the run after that finishes it.
     #[test]
     fn crash_at_every_operation_of_recovery_is_recovered_by_the_next_run() {

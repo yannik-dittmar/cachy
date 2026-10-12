@@ -40,6 +40,10 @@ _Avoid_: active, spinning, online
 The smallest thing cachy relocates as a whole: a regular file, a hardlink group, or a symlink.
 _Avoid_: task, item, file (when a hardlink group or symlink is meant)
 
+**Hardlink group**:
+The names on the cache branch of one regular file with more than one link, keyed by `(st_dev, st_ino)`; it moves as one inode, with all its links, to one backing branch. It is partly excluded, and never moved, while its link count exceeds the names the walk found, for example because one is in an excluded directory.
+_Avoid_: hardlinked files, link set
+
 **Special file**:
 A FIFO, socket or device node on the cache branch; never a move unit, and skipped by every run.
 

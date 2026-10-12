@@ -202,6 +202,17 @@ impl Fixture {
         write_file(&self.on_cache_branch(rel), content, mtime);
     }
 
+    /// Creates a hardlink group on the cache branch: `names[0]` with the
+    /// given content and mtime, and every other name a link to it.
+    pub fn cache_branch_hardlinks(&self, names: &[&str], content: &[u8], mtime: i64) {
+        self.cache_branch_file(names[0], content, mtime);
+        for name in &names[1..] {
+            let link = self.on_cache_branch(name);
+            fs::create_dir_all(link.parent().unwrap()).unwrap();
+            fs::hard_link(self.on_cache_branch(names[0]), link).unwrap();
+        }
+    }
+
     pub fn backing_branch_file(&self, rel: &str, content: &[u8], mtime: i64) {
         write_file(&self.on_backing_branch(rel), content, mtime);
     }

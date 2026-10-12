@@ -9,7 +9,10 @@
 //!   it is identical to its published counterpart and not in use. Otherwise
 //!   it is renamed back to its relpath on the cache branch, which never
 //!   replaces a file. A crash releases the lease that kept openers away from
-//!   it, so recovery takes a lease of its own before deciding.
+//!   it, so recovery takes a lease of its own before deciding. A retired
+//!   name of a hardlink group is resolved on its own: once deleted, the
+//!   group's names left on the cache branch move as a smaller group, which
+//!   adopts the published copy.
 //! - A retired symlink is deleted if its published counterpart is an
 //!   identical symlink, and renamed back otherwise. Nothing can have a
 //!   symlink open, so it takes no lease.

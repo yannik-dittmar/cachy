@@ -72,6 +72,6 @@ The setup in question is a cache pool with the cache branch first and `category.
 ## Not verified
 
 - The kernel release that relaxed `linkat(AT_EMPTY_PATH)`.
-- Ubuntu ZFS and kernel patches beyond the noble series.
+- Distribution-specific ZFS and kernel patches (backports can change the version boundaries above).
 - The cow-shell tool in mergerfs-tools.
 - Whether a stale negative dentry can cause a `FUSE_CREATE` for an existing name.

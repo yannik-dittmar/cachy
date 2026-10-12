@@ -58,14 +58,24 @@ _Avoid_: conflict, duplicate, shadow
 One evaluation of the trigger followed by moves until the stop condition is reached.
 _Avoid_: job, pass, cycle
 
+**Free space**:
+The space on the cache branch that applications can still write into; the only measure of how full the cache is.
+_Avoid_: usage, Use%, used space (these drop on snapshot-holding filesystems even when no space is freed)
+
 **Threshold**:
-The cache-branch usage percentage above which a run starts moving.
+The free space below which a run starts moving.
 
 **Target**:
-The cache-branch usage percentage at which a run stops moving.
+The free space at which a run stops moving.
+
+**Byte budget**:
+The amount a run must free to reach the target, fixed when the run starts and consumed by the allocated size of each completed move.
+
+**Max age**:
+An optional age past which a move unit is moved in any run, regardless of the threshold.
 
 **Drain**:
-A run that ignores the threshold and uses a target of zero, moving every eligible move unit.
+A run that ignores the threshold and moves every eligible move unit.
 _Avoid_: empty-cache mode, flush
 
 **Wake trigger**:

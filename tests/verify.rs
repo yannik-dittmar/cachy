@@ -8,6 +8,7 @@
 mod common;
 
 use std::fs;
+use std::os::unix::fs::MetadataExt;
 
 use common::{Fixture, assert_exit};
 
@@ -29,6 +30,21 @@ fn readback_moves_files_whose_copy_reads_back_intact() {
     assert_eq!(fs::read(fx.on_backing_branch("empty")).unwrap(), b"");
     assert!(!fx.on_cache_branch("file.bin").exists());
     fx.assert_no_staging_directories();
+}
+
+/// Reading the copy back would update its atime, under `relatime` too: the
+/// source's atime is older than the copy's ctime.
+#[test]
+fn readback_keeps_the_source_atime() {
+    let fx = Fixture::new();
+    fx.cache_branch_file("file.bin", CONTENT, 1_000);
+    common::set_times(&fx.on_cache_branch("file.bin"), 500, 1_000);
+
+    assert_exit(&fx.run(&readback_config(&fx)), 0);
+
+    let moved = fs::metadata(fx.on_backing_branch("file.bin")).unwrap();
+    assert_eq!((moved.atime(), moved.atime_nsec()), (500, 0));
+    assert_eq!((moved.mtime(), moved.mtime_nsec()), (1_000, 0));
 }
 
 #[test]

@@ -71,7 +71,7 @@ cachy's own directory at the root of each filesystem it writes to, holding the t
 _Avoid_: temp dir, journal
 
 **Leftover**:
-A temp file or retired source that an unfinished move left in a staging directory, or an empty directory that an unfinished directory creation left there.
+A temp file or retired source (a regular file or a symlink) that an unfinished move left in a staging directory, or an empty directory that an unfinished directory creation left there.
 _Avoid_: orphan
 
 **Recovery**:

@@ -48,6 +48,11 @@ pub trait FsOps {
     /// exists.
     fn create_new(&self, dir: BorrowedFd, path: &Path, mode: u32) -> io::Result<OwnedFd>;
     fn mkdir(&self, dir: BorrowedFd, path: &Path, mode: u32) -> io::Result<()>;
+    /// Creates the symlink `path` relative to `dir`, with the link text
+    /// `target`; fails if `path` exists.
+    fn symlink(&self, target: &OsStr, dir: BorrowedFd, path: &Path) -> io::Result<()>;
+    /// The link text of the symlink `path` relative to `dir`.
+    fn read_link(&self, dir: BorrowedFd, path: &Path) -> io::Result<OsString>;
     fn fstat(&self, fd: BorrowedFd) -> io::Result<Stat>;
     /// Stats `path` relative to `dir`, without following a final symlink.
     fn stat_at(&self, dir: BorrowedFd, path: &Path) -> io::Result<Stat>;
@@ -94,6 +99,18 @@ pub trait FsOps {
     /// Sets the permission bits, including setuid, setgid and sticky.
     fn set_mode(&self, fd: BorrowedFd, mode: u32) -> io::Result<()>;
     fn set_times(&self, fd: BorrowedFd, atime: Timespec, mtime: Timespec) -> io::Result<()>;
+    /// Sets the owner of `path` relative to `dir`, without following a final
+    /// symlink.
+    fn set_owner_at(&self, dir: BorrowedFd, path: &Path, uid: u32, gid: u32) -> io::Result<()>;
+    /// Sets the times of `path` relative to `dir`, without following a final
+    /// symlink.
+    fn set_times_at(
+        &self,
+        dir: BorrowedFd,
+        path: &Path,
+        atime: Timespec,
+        mtime: Timespec,
+    ) -> io::Result<()>;
     /// The names of `fd`'s extended attributes, including ACLs.
     fn list_xattrs(&self, fd: BorrowedFd) -> io::Result<Vec<OsString>>;
     fn get_xattr(&self, fd: BorrowedFd, name: &OsStr) -> io::Result<Vec<u8>>;
@@ -127,6 +144,15 @@ impl FsOps for RealFs {
 
     fn mkdir(&self, dir: BorrowedFd, path: &Path, mode: u32) -> io::Result<()> {
         Ok(rustix::fs::mkdirat(dir, path, Mode::from_raw_mode(mode))?)
+    }
+
+    fn symlink(&self, target: &OsStr, dir: BorrowedFd, path: &Path) -> io::Result<()> {
+        Ok(rustix::fs::symlinkat(target, dir, path)?)
+    }
+
+    fn read_link(&self, dir: BorrowedFd, path: &Path) -> io::Result<OsString> {
+        let target = rustix::fs::readlinkat(dir, path, Vec::new())?;
+        Ok(OsString::from_vec(target.into_bytes()))
     }
 
     fn fstat(&self, fd: BorrowedFd) -> io::Result<Stat> {
@@ -248,6 +274,36 @@ impl FsOps for RealFs {
             last_modification: mtime,
         };
         Ok(rustix::fs::futimens(fd, &times)?)
+    }
+
+    fn set_owner_at(&self, dir: BorrowedFd, path: &Path, uid: u32, gid: u32) -> io::Result<()> {
+        let (uid, gid) = (Uid::from_raw(uid), Gid::from_raw(gid));
+        Ok(rustix::fs::chownat(
+            dir,
+            path,
+            Some(uid),
+            Some(gid),
+            AtFlags::SYMLINK_NOFOLLOW,
+        )?)
+    }
+
+    fn set_times_at(
+        &self,
+        dir: BorrowedFd,
+        path: &Path,
+        atime: Timespec,
+        mtime: Timespec,
+    ) -> io::Result<()> {
+        let times = Timestamps {
+            last_access: atime,
+            last_modification: mtime,
+        };
+        Ok(rustix::fs::utimensat(
+            dir,
+            path,
+            &times,
+            AtFlags::SYMLINK_NOFOLLOW,
+        )?)
     }
 
     fn list_xattrs(&self, fd: BorrowedFd) -> io::Result<Vec<OsString>> {

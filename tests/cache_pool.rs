@@ -65,3 +65,39 @@ fn file_open_for_writing_through_the_cache_pool_is_skipped_as_in_use() {
     );
     assert!(!fx.on_backing_branch("downloads/partial.bin").exists());
 }
+
+#[test]
+fn moved_relative_symlink_resolves_through_the_cache_pool_as_before() {
+    let _lock = free_space_lock();
+    let fx = Fixture::new();
+    let Some(cache_pool) = fx.cache_pool() else {
+        return;
+    };
+    cache_pool.file("media/show/episode.mkv", b"episode", 1_000);
+    fs::create_dir_all(cache_pool.path("links")).unwrap();
+    std::os::unix::fs::symlink("../media/show/episode.mkv", cache_pool.path("links/latest"))
+        .unwrap();
+    std::os::unix::fs::symlink("../media/show", cache_pool.path("links/show")).unwrap();
+    assert!(
+        fs::symlink_metadata(fx.on_cache_branch("links/latest")).is_ok(),
+        "the cache pool did not create the symlink on the cache branch"
+    );
+    let resolve = |rel| fs::canonicalize(cache_pool.path(rel)).unwrap();
+    let before = (resolve("links/latest"), resolve("links/show"));
+    let free = fx.cache_branch_free();
+    let config = fx.config(&(free + 1).to_string(), &(free + GIB).to_string());
+
+    assert_exit(&fx.run(&config), 0);
+
+    assert!(fs::symlink_metadata(fx.on_cache_branch("links/latest")).is_err());
+    assert!(fs::symlink_metadata(fx.on_backing_branch("links/latest")).is_ok());
+    assert_eq!((resolve("links/latest"), resolve("links/show")), before);
+    assert_eq!(
+        fs::read(cache_pool.path("links/latest")).unwrap(),
+        b"episode"
+    );
+    assert_eq!(
+        fs::read(cache_pool.path("links/show/episode.mkv")).unwrap(),
+        b"episode"
+    );
+}

@@ -139,7 +139,7 @@ pub fn copy_symlink(fs: &dyn FsOps, stat: &Stat, dir: BorrowedFd, name: &Path) -
 }
 
 /// Copies all metadata of the file `src`, whose metadata is `stat`, to `dst`
-/// and checks that owner, group, mode and mtime arrived unchanged.
+/// and checks that owner, group, mode, atime and mtime arrived unchanged.
 pub fn copy_file(
     fs: &dyn FsOps,
     stat: &Stat,
@@ -154,19 +154,27 @@ pub fn copy_file(
     check_preserved(stat, &copied)
 }
 
-/// Fails unless `copied` has the owner, group, mode and mtime of `stat`.
+/// Fails unless `copied`, right after its metadata was copied, has the
+/// owner, group, mode, atime and mtime of `stat`. Unlike [`same`], it checks
+/// the atime, which nothing has read the copy to change yet.
 fn check_preserved(stat: &Stat, copied: &Stat) -> Result<()> {
-    if !same(stat, copied) {
+    let atime = |s: &Stat| (s.st_atime, s.st_atime_nsec);
+    if !same(stat, copied) || atime(stat) != atime(copied) {
         bail!(
-            "not preserved: owner {}:{}, mode {:o}, mtime {}.{:09} became {}:{}, {:o}, {}.{:09}",
+            "not preserved: owner {}:{}, mode {:o}, atime {}.{:09}, mtime {}.{:09} \
+             became {}:{}, {:o}, {}.{:09}, {}.{:09}",
             stat.st_uid,
             stat.st_gid,
             stat.st_mode & 0o7777,
+            stat.st_atime,
+            stat.st_atime_nsec,
             stat.st_mtime,
             stat.st_mtime_nsec,
             copied.st_uid,
             copied.st_gid,
             copied.st_mode & 0o7777,
+            copied.st_atime,
+            copied.st_atime_nsec,
             copied.st_mtime,
             copied.st_mtime_nsec,
         );

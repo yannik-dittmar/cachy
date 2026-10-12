@@ -365,6 +365,11 @@ impl<'a> Mover<'a> {
     fn stage(&mut self, source: &Source, temp: &OwnedFd, rel: &Path) -> Result<Hash, Abort> {
         let fs = self.fs;
         let hash = self.copy(source, temp)?;
+        if self.verify == Verify::Readback {
+            // Before the metadata: reading the copy changes its atime.
+            fs.fsync(temp.as_fd()).context("fsync temp file")?;
+            self.read_back(source, temp, hash)?;
+        }
         metadata::copy_file(
             fs,
             &source.stat,
@@ -375,9 +380,6 @@ impl<'a> Mover<'a> {
         )
         .context("metadata")?;
         fs.fsync(temp.as_fd()).context("fsync temp file")?;
-        if self.verify == Verify::Readback {
-            self.read_back(source, temp, hash)?;
-        }
         source.revalidate()?;
         Ok(hash)
     }

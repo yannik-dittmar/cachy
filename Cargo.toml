@@ -1,0 +1,10 @@
+[package]
+name = "cachy"
+version = "0.1.0"
+edition = "2024"
+description = "Moves files from a mergerfs cache disk to the backing pool. A Rust rewrite of mergerfs-cache-mover."
+license = "GPL-3.0-or-later"
+repository = "https://github.com/yannik-dittmar/cachy"
+publish = false
+
+[dependencies]

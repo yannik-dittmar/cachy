@@ -6,8 +6,8 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
-use crate::config::Config;
-use crate::fsops::FsOps;
+use crate::config::{Config, LeaseType};
+use crate::fsops::{FsOps, Lease};
 use crate::scan::scan;
 use crate::transaction::{Branch, Guard, Outcome as MoveOutcome, STAGING, move_file};
 
@@ -53,6 +53,10 @@ pub fn run(fs: &dyn FsOps, config: &Config) -> Result<Outcome> {
 
     ignore_lease_break_signal();
     let guard = Guard {
+        lease: match config.lease_type {
+            LeaseType::Read => Lease::Read,
+            LeaseType::Write => Lease::Write,
+        },
         minimum_age: config.minimum_age,
     };
     let units = scan(&cache_branch.path)

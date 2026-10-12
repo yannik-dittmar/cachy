@@ -17,6 +17,19 @@ pub struct Config {
     pub target: u64,
     #[serde(default = "default_minimum_age", deserialize_with = "duration")]
     pub minimum_age: Duration,
+    #[serde(default)]
+    pub lease_type: LeaseType,
+}
+
+/// Which opens by other processes keep a move unit from being moved.
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LeaseType {
+    /// Opens for writing (`F_RDLCK`).
+    #[default]
+    Read,
+    /// Any open, even for reading only (`F_WRLCK`).
+    Write,
 }
 
 fn default_minimum_age() -> Duration {
@@ -112,7 +125,9 @@ fn parse_duration(s: &str) -> Option<Duration> {
     if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
-    Some(Duration::from_secs(digits.parse::<u64>().ok()?.checked_mul(unit)?))
+    Some(Duration::from_secs(
+        digits.parse::<u64>().ok()?.checked_mul(unit)?,
+    ))
 }
 
 fn parse_byte_size(s: &str) -> Option<u64> {

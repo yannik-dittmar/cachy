@@ -121,6 +121,17 @@ fn malformed_minimum_age_is_refused() {
 }
 
 #[test]
+fn unknown_lease_type_is_refused() {
+    let fx = Fixture::new();
+    let config = fx.config("1G", "2G") + "lease_type: exclusive\n";
+
+    let err = assert_exit(&fx.run(&config), 1);
+
+    assert!(err.contains("lease_type"), "stderr:\n{err}");
+    assert!(err.contains("exclusive"), "stderr:\n{err}");
+}
+
+#[test]
 fn malformed_byte_size_is_refused() {
     let fx = Fixture::new();
     let config = fx.config("1.5G", "2G");

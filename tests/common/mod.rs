@@ -200,7 +200,9 @@ impl Fixture {
 
     /// Runs `cachy run --config <file>` with the given config file content.
     pub fn run(&self, config: &str) -> Output {
-        self.spawn(config).wait_with_output().expect("wait for cachy")
+        self.spawn(config)
+            .wait_with_output()
+            .expect("wait for cachy")
     }
 
     /// Starts `cachy run --config <file>` without waiting for it, so a test

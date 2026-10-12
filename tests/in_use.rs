@@ -56,6 +56,34 @@ fn file_open_for_writing_is_skipped_as_in_use() {
     assert!(!fx.on_cache_branch("idle.bin").exists());
 }
 
+#[test]
+fn file_open_only_for_reading_is_moved() {
+    let fx = Fixture::new();
+    fx.cache_branch_file("stream.bin", &content(MIB, 7), 1_000);
+    let _reader = fs::File::open(fx.on_cache_branch("stream.bin")).unwrap();
+
+    assert_exit(&fx.run(&move_everything(&fx)), 0);
+
+    assert!(!fx.on_cache_branch("stream.bin").exists());
+    assert!(fs::read(fx.on_backing_branch("stream.bin")).unwrap() == content(MIB, 7));
+}
+
+#[test]
+fn write_lease_skips_files_open_only_for_reading() {
+    let fx = Fixture::new();
+    fx.cache_branch_file("stream.bin", &content(MIB, 8), 1_000);
+    fx.cache_branch_file("idle.bin", &content(MIB, 9), 2_000);
+    let _reader = fs::File::open(fx.on_cache_branch("stream.bin")).unwrap();
+    let config = move_everything(&fx) + "lease_type: write\n";
+
+    let err = assert_exit(&fx.run(&config), 0);
+
+    assert!(err.contains("stream.bin: in use"), "stderr:\n{err}");
+    assert!(fs::read(fx.on_cache_branch("stream.bin")).unwrap() == content(MIB, 8));
+    assert!(!fx.on_backing_branch("stream.bin").exists());
+    assert!(fs::read(fx.on_backing_branch("idle.bin")).unwrap() == content(MIB, 9));
+}
+
 /// Runs cachy on a fixture holding only `rel` and calls `during_copy` while
 /// the run is paused between creating its temp file and finishing the copy.
 /// Returns the run's output and when it resumed.

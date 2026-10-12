@@ -78,6 +78,9 @@ impl fmt::Display for Skip {
 
 /// What keeps a move away from move units that are in use.
 pub struct Guard {
+    /// The lease held on the source during a move. Any open that conflicts
+    /// with it, before or during the move, makes the move unit in use.
+    pub lease: Lease,
     /// Move units that changed more recently than this are never moved.
     pub minimum_age: Duration,
 }
@@ -133,8 +136,16 @@ fn transact(
     let staged = copy(fs, &source, &temp)
         .and_then(|()| Ok(fs.fsync(temp.as_fd()).context("fsync temp file")?))
         .and_then(|()| source.revalidate());
-    let published = staged
-        .and_then(|()| Ok(publish(fs, backing_branch, parent, name, &staged_parent, &temp)?));
+    let published = staged.and_then(|()| {
+        Ok(publish(
+            fs,
+            backing_branch,
+            parent,
+            name,
+            &staged_parent,
+            &temp,
+        )?)
+    });
     drop(temp);
     if published.is_err() {
         let _ = fs.unlink(staged_parent.as_fd(), name);
@@ -322,10 +333,12 @@ impl<'a> Source<'a> {
     ) -> Result<Source<'a>, Abort> {
         let dir = open_dirs(fs, &cache_branch.fd, parent).context("open source directory")?;
         let file = fs.open_read(dir.as_fd(), name).context("open source")?;
-        let lease = Lease::Read;
+        let lease = guard.lease;
         match fs.set_lease(file.as_fd(), lease) {
             Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Err(Abort::Skip(Skip::InUse)),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                return Err(Abort::Skip(Skip::InUse));
+            }
             Err(e) => return Err(anyhow::Error::from(e).context("take lease").into()),
         }
         let identity = Identity::of(&fs.fstat(file.as_fd()).context("fstat source")?);

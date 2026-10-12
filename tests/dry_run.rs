@@ -83,3 +83,18 @@ fn dry_run_writes_nothing_and_lists_planned_moves_in_order_and_skips_with_reason
         "stdout:\n{planned}"
     );
 }
+
+#[test]
+fn dry_run_without_work_says_so_and_plans_nothing() {
+    let fx = Fixture::new();
+    fx.cache_branch_file("file.bin", b"content", 1_000);
+
+    let out = output(fx.command(&fx.no_work_config()).arg("--dry-run")).unwrap();
+
+    assert_exit(&out, 0);
+    assert_eq!(
+        stdout(&out),
+        "byte budget: none (free space is at or above the threshold)\n"
+    );
+    assert!(fx.on_cache_branch("file.bin").exists());
+}

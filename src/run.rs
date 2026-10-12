@@ -14,7 +14,8 @@ use crate::scan::{Entry, scan};
 use crate::transaction::{Branch, Guard, MoveOutcome, Mover, STAGING, would_skip};
 
 pub struct Outcome {
-    /// Number of moves that were attempted and failed.
+    /// Number of moves that were attempted and failed; in a dry run, the
+    /// number of move units that could not be checked.
     pub failed: usize,
     /// Number of staging-directory leftovers that recovery could not resolve.
     pub unresolved: usize,
@@ -41,9 +42,9 @@ pub struct Options {
     pub drain: bool,
 }
 
-/// Free space should grow by at least this share of the bytes moved; less
+/// Free space should grow by at least the bytes moved divided by this; less
 /// means that something, such as a snapshot, still holds the moved data.
-const MIN_FREED_SHARE: u64 = 2;
+const FREED_DIVISOR: u64 = 2;
 
 /// Recovers from unfinished moves, then performs a check and, if free space
 /// is below the threshold, a run, which stops once its byte budget is
@@ -116,6 +117,9 @@ pub fn run(fs: &dyn FsOps, config: &Config, options: Options) -> Result<Outcome>
         eprintln!(
             "cachy: free space {free_before} bytes is at or above the threshold {threshold} bytes; nothing to do"
         );
+        if options.dry_run {
+            println!("byte budget: none (free space is at or above the threshold)");
+        }
         return Ok(outcome);
     } else {
         eprintln!(
@@ -195,9 +199,9 @@ pub fn run(fs: &dyn FsOps, config: &Config, options: Options) -> Result<Outcome>
                 );
             }
             let freed = free.saturating_sub(free_before);
-            if freed < moved_bytes / MIN_FREED_SHARE {
+            if freed < moved_bytes / FREED_DIVISOR {
                 eprintln!(
-                    "cachy: warning: free space grew by only {freed} bytes, but the moved files took up {moved_bytes} bytes; snapshots of the cache branch may be holding the space"
+                    "cachy: warning: free space grew by only {freed} bytes, but the moves took up {moved_bytes} bytes on it; snapshots of the cache branch may be holding the space"
                 );
             }
         }

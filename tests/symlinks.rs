@@ -81,8 +81,9 @@ fn moved_symlink_keeps_its_owner_and_group() {
         return;
     }
     symlink("/etc/hostname", fx.on_cache_branch("link")).unwrap();
-    chown(&fx.on_cache_branch("link"), 1234, 5678);
+    // Before the chown, after which only root may set the times.
     set_times(&fx.on_cache_branch("link"), 1_000, 1_000);
+    chown(&fx.on_cache_branch("link"), 1234, 5678);
 
     assert_exit(&fx.run_as_root(&fx.move_everything_config()), 0);
 

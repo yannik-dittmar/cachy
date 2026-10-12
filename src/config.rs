@@ -27,8 +27,8 @@ pub struct Config {
     pub allow_metadata_loss: Vec<MetadataKind>,
     #[serde(default)]
     pub verify: Verify,
-    /// Gitignore patterns, anchored at the cache branch root, for files and
-    /// directories that stay on the cache branch.
+    /// Gitignore patterns, as lines of a `.gitignore` at the cache branch
+    /// root, for files and directories that stay on the cache branch.
     #[serde(default, deserialize_with = "exclusions")]
     pub exclude: Exclusions,
 }

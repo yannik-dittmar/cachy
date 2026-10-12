@@ -5,10 +5,8 @@ use std::path::Path;
 
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 
-/// Compiled exclusion patterns. Unlike in a `.gitignore`, every pattern is
-/// anchored at the cache branch root: `appdata/` matches only the top-level
-/// `appdata` directory, and `**/` matches at any depth. A `#` is literal, not
-/// a comment.
+/// Compiled exclusion patterns, each one a line of a `.gitignore` at the cache
+/// branch root.
 #[derive(Debug)]
 pub struct Exclusions(Gitignore);
 
@@ -21,7 +19,7 @@ impl Exclusions {
                 return Err("a pattern is empty".to_owned());
             }
             builder
-                .add_line(None, &anchored(pattern))
+                .add_line(None, pattern)
                 .map_err(|e| format!("invalid pattern `{pattern}`: {e}"))?;
         }
         let gitignore = builder.build().map_err(|e| e.to_string())?;
@@ -40,19 +38,5 @@ impl Default for Exclusions {
     /// No patterns: nothing is excluded.
     fn default() -> Exclusions {
         Exclusions(Gitignore::empty())
-    }
-}
-
-/// `pattern` with a leading `/`, after any `!`, which gitignore takes as an
-/// anchor at the root.
-fn anchored(pattern: &str) -> String {
-    let (negation, rest) = match pattern.strip_prefix('!') {
-        Some(rest) => ("!", rest),
-        None => ("", pattern),
-    };
-    if rest.starts_with('/') {
-        pattern.to_owned()
-    } else {
-        format!("{negation}/{rest}")
     }
 }

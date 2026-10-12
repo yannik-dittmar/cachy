@@ -24,14 +24,7 @@ verify: readback
 
 cachy asks the kernel to drop the copy from the page cache before reading it back, so the read comes from storage; ZFS serves it from its own cache (ARC) instead, if the copy is still there.
 
-To keep files and directories on the cache branch, list gitignore patterns under `exclude`. Unlike in a `.gitignore`, every pattern is anchored at the cache branch root: `appdata/` excludes only the top-level `appdata` directory, and `**/` matches at any depth. Excluded directories are not walked at all. For SnapRAID, for example:
-
-```yaml
-exclude:
-  - snapraid.content
-  - snapraid.parity
-  - .snapraid/
-```
+To keep files and directories on the cache branch, list gitignore patterns under `exclude`. They follow the usual `.gitignore` rules, as if the file sat at the cache branch root: `*.part` matches at any depth, and `/appdata/` only the top-level `appdata` directory. Excluded directories are not walked at all. [`cachy.example.yml`](cachy.example.yml) documents every setting, with a summary of the pattern rules and SnapRAID examples.
 
 cachy moves regular files of any size, including empty ones, and never moves FIFOs, sockets or device nodes; it skips them as special files. It does not walk into other filesystems mounted inside the cache branch.
 

@@ -1,5 +1,5 @@
-//! Exclusions: gitignore patterns anchored at the cache branch root, which
-//! keep matching files and directories on the cache branch. Also: the walk
+//! Exclusions: gitignore patterns, read as if from a `.gitignore` at the cache
+//! branch root, which keep matching files and directories on the cache branch. Also: the walk
 //! never leaves the cache branch's filesystem.
 
 mod common;
@@ -38,17 +38,33 @@ fn assert_moved(fx: &Fixture, rel: &str) {
 }
 
 #[test]
-fn directory_pattern_excludes_that_directory_only_at_the_cache_branch_root() {
+fn leading_slash_anchors_a_pattern_at_the_cache_branch_root() {
     let fx = Fixture::new();
     fx.cache_branch_file("appdata/plex/db.sqlite", b"db", 1_000);
     fx.cache_branch_file("media/appdata/notes.txt", b"notes", 1_000);
     fx.cache_branch_file("appdata.txt", b"not a directory", 1_000);
 
-    assert_exit(&fx.run(&config_excluding(&fx, &["appdata/"])), 0);
+    assert_exit(&fx.run(&config_excluding(&fx, &["/appdata/"])), 0);
 
     assert_kept(&fx, "appdata/plex/db.sqlite");
     assert_moved(&fx, "media/appdata/notes.txt");
     assert_moved(&fx, "appdata.txt");
+}
+
+#[test]
+fn pattern_without_a_slash_matches_at_any_depth() {
+    let fx = Fixture::new();
+    fx.cache_branch_file("appdata/plex/db.sqlite", b"db", 1_000);
+    fx.cache_branch_file("media/appdata/notes.txt", b"notes", 1_000);
+    fx.cache_branch_file("media/a.part", b"part", 1_000);
+    fx.cache_branch_file("media/a.mkv", b"movie", 1_000);
+
+    assert_exit(&fx.run(&config_excluding(&fx, &["appdata/", "*.part"])), 0);
+
+    assert_kept(&fx, "appdata/plex/db.sqlite");
+    assert_kept(&fx, "media/appdata/notes.txt");
+    assert_kept(&fx, "media/a.part");
+    assert_moved(&fx, "media/a.mkv");
 }
 
 #[test]
@@ -57,7 +73,7 @@ fn file_pattern_excludes_that_file() {
     fx.cache_branch_file("snapraid.content", b"content", 1_000);
     fx.cache_branch_file("movie.mkv", b"movie", 1_000);
 
-    let err = assert_exit(&fx.run(&config_excluding(&fx, &["snapraid.content"])), 0);
+    let err = assert_exit(&fx.run(&config_excluding(&fx, &["/snapraid.content"])), 0);
 
     assert_kept(&fx, "snapraid.content");
     assert_moved(&fx, "movie.mkv");
@@ -105,8 +121,9 @@ fn nested_patterns_behave_like_gitignore() {
 }
 
 /// Creates `depth` nested directories with 200-byte names under `dir`, so
-/// that the deepest one's path is longer than `PATH_MAX`. Reading the deepest one by path fails, even
-/// as root, so a walk that enters the tree warns about it.
+/// that the deepest one's path is longer than `PATH_MAX`. Reading the
+/// deepest one by path fails, even as root, so a walk that enters the tree
+/// warns about it.
 fn too_deep_tree(dir: &Path, depth: usize) {
     let name = "d".repeat(200);
     let mut fd = rustix::fs::open(

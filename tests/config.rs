@@ -1,5 +1,7 @@
 mod common;
 
+use std::fs;
+
 use common::{Fixture, assert_exit, cachy};
 
 #[test]
@@ -151,4 +153,16 @@ fn unknown_metadata_loss_kind_is_refused() {
 
     assert!(err.contains("allow_metadata_loss"), "stderr:\n{err}");
     assert!(err.contains("owner"), "stderr:\n{err}");
+}
+
+#[test]
+fn example_config_is_valid() {
+    let example =
+        fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/cachy.example.yml")).unwrap();
+    let fx = Fixture::new();
+    let config = example
+        .replace("/mnt/cache", fx.cache_branch.path().to_str().unwrap())
+        .replace("/mnt/storage", fx.backing_branch.path().to_str().unwrap());
+
+    assert_exit(&fx.run(&config), 0);
 }

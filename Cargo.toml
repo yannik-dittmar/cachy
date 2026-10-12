@@ -15,6 +15,7 @@ fault-injection = []
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+ignore = "0.4.33"
 libc = "0.2"
 rustix = { version = "1", features = ["fs"] }
 serde = { version = "1", features = ["derive"] }

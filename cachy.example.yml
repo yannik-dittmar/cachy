@@ -1,0 +1,58 @@
+# Example cachy configuration. Copy it, then adjust the paths and sizes.
+# Byte sizes take a K, M, G or T suffix (binary: 1G is 1024^3 bytes);
+# durations take an s, m, h or d suffix.
+
+# The fast branch that cachy drains: the first branch of the cache pool.
+cache_branch: /mnt/cache
+
+# The slow branch that receives moved files. Exactly one, for now.
+backing_branches:
+  - /mnt/storage
+
+# A run starts when the cache branch's free space falls below the threshold,
+# and moves files until free space reaches the target.
+threshold: 100G
+target: 200G
+
+# Files changed more recently than this are never moved. Default: 15m.
+minimum_age: 15m
+
+# What makes a file in use, so that it is not moved:
+#   read  - it is open for writing (default)
+#   write - it is open at all, even for reading only
+lease_type: read
+
+# Metadata a move may lose, with a warning, when the backing branch cannot
+# store it: xattrs, acls. By default, any loss fails the move.
+allow_metadata_loss: []
+
+# How a move checks its copy:
+#   hash     - hash the source while copying (default)
+#   readback - also read the copy back from storage and compare hashes
+verify: hash
+
+# Files and directories that stay on the cache branch. Each entry is one line
+# of a .gitignore placed at the root of the cache branch, with the usual
+# gitignore rules:
+#   - A pattern without a slash matches at any depth: `*.part` matches
+#     movies/a.part as well as a.part.
+#   - A leading slash anchors a pattern at the cache branch root: `/appdata/`
+#     matches only the top-level appdata directory. So does any other slash
+#     before the end: `media/tmp` means `/media/tmp`.
+#   - A trailing slash matches only directories.
+#   - `**/` matches any number of directories; `!` re-includes a path that an
+#     earlier pattern excluded, unless a parent directory is excluded.
+#   - An entry starting with `#` is a comment; write `\#` for a literal `#`.
+# Patterns only ever see paths inside the cache branch. Excluded directories
+# are not walked at all. Quote patterns that start with `*`, `!` or `#`, which
+# YAML would otherwise read differently.
+exclude:
+  # Application data that must stay on the fast branch.
+  - /appdata/
+  # Unfinished downloads, anywhere.
+  - '*.part'
+  # SnapRAID content and parity files, and its directory, if they live on the
+  # cache branch.
+  - /snapraid.content
+  - /snapraid.parity
+  - /.snapraid/

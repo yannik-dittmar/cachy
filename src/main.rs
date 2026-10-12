@@ -1,4 +1,5 @@
 mod config;
+mod exclude;
 #[cfg(feature = "fault-injection")]
 mod fault;
 mod fsops;

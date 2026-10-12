@@ -6,6 +6,8 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
+use crate::exclude::Exclusions;
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -25,6 +27,10 @@ pub struct Config {
     pub allow_metadata_loss: Vec<MetadataKind>,
     #[serde(default)]
     pub verify: Verify,
+    /// Gitignore patterns, as lines of a `.gitignore` at the cache branch
+    /// root, for files and directories that stay on the cache branch.
+    #[serde(default, deserialize_with = "exclusions")]
+    pub exclude: Exclusions,
 }
 
 /// How a move checks its copy before publishing it.
@@ -62,6 +68,11 @@ pub enum LeaseType {
     /// A write lease (`F_WRLCK`): any open, even for reading only, makes a
     /// move unit in use.
     Write,
+}
+
+fn exclusions<'de, D: serde::Deserializer<'de>>(de: D) -> Result<Exclusions, D::Error> {
+    let patterns = Vec::<String>::deserialize(de)?;
+    Exclusions::new(&patterns).map_err(|e| serde::de::Error::custom(format!("exclude: {e}")))
 }
 
 fn default_minimum_age() -> Duration {

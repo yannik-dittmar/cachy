@@ -40,6 +40,13 @@ _Avoid_: active, spinning, online
 The smallest thing cachy relocates as a whole: a regular file, a hardlink group, or a symlink.
 _Avoid_: task, item, file (when a hardlink group or symlink is meant)
 
+**Special file**:
+A FIFO, socket or device node on the cache branch; never a move unit, and skipped by every run.
+
+**Exclusion**:
+A user-configured gitignore pattern, read as a line of a `.gitignore` at the cache branch root, for files and directories that stay on the cache branch; excluded directories are not walked.
+_Avoid_: ignore rule, filter
+
 **Move**:
 One transaction that relocates a single move unit from the cache branch to one backing branch, after which it exists on exactly one of them.
 _Avoid_: copy, transfer, migration

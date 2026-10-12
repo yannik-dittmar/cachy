@@ -2,7 +2,7 @@
 //! until free space reaches the target.
 
 use std::os::fd::AsFd;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
@@ -105,8 +105,8 @@ pub fn run(fs: &dyn FsOps, config: &Config) -> Result<Outcome> {
         if free + mover.retiring_bytes() >= config.target {
             break;
         }
-        mover.start(&entry.rel, entry.kind);
-        if entry.kind == Kind::Special {
+        mover.start(&entry.rels, entry.kind);
+        if matches!(entry.kind, Kind::Special | Kind::PartlyExcluded) {
             continue;
         }
         match free_space(fs, &cache_branch) {
@@ -164,20 +164,25 @@ struct Tally {
 }
 
 impl Tally {
-    fn record(&mut self, finished: Vec<(&Path, Result<MoveOutcome>)>) {
-        for (rel, outcome) in finished {
+    fn record(&mut self, finished: Vec<(&[PathBuf], Result<MoveOutcome>)>) {
+        for (rels, outcome) in finished {
+            let rel = rels
+                .iter()
+                .map(|rel| rel.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
             match outcome {
                 Ok(MoveOutcome::Moved(hash)) => {
                     self.moved += 1;
-                    eprintln!("cachy: moved {} (xxh3 {hash})", rel.display());
+                    eprintln!("cachy: moved {rel} (xxh3 {hash})");
                 }
                 Ok(MoveOutcome::Skipped(reason)) => {
                     self.skipped += 1;
-                    eprintln!("cachy: skipped {}: {reason}", rel.display());
+                    eprintln!("cachy: skipped {rel}: {reason}");
                 }
                 Err(e) => {
                     self.failed += 1;
-                    eprintln!("cachy: error: move of {} failed: {e:#}", rel.display());
+                    eprintln!("cachy: error: move of {rel} failed: {e:#}");
                 }
             }
         }

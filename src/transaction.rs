@@ -1,9 +1,12 @@
-//! The move transaction: relocates one regular file or symlink from the cache
-//! branch to a backing branch, so that afterwards it exists on exactly one of
-//! them.
+//! The move transaction: relocates one move unit (a regular file, a hardlink
+//! group or a symlink) from the cache branch to a backing branch, so that
+//! afterwards it exists on exactly one of them.
 //!
 //! A regular file is held under a lease for the whole move, so a move unit
-//! that is in use is never moved. A symlink cannot be opened, so it is never
+//! that is in use is never moved. A hardlink group moves as one inode: it is
+//! copied once, published under its first name and linked under the others,
+//! and all its names are retired together under the one lease, which any
+//! open through any name breaks. A symlink cannot be opened, so it is never
 //! in use; it is recreated with its link text verbatim.
 //!
 //! Each staging directory mirrors relpaths (`<root>/.cachy-staging/<relpath>`),
@@ -101,6 +104,8 @@ pub enum Skip {
     TooYoung,
     /// It is a FIFO, socket or device node, which cachy never moves.
     SpecialFile,
+    /// It is a hardlink group with names that the walk did not find.
+    PartlyExcluded,
 }
 
 impl fmt::Display for Skip {
@@ -110,6 +115,7 @@ impl fmt::Display for Skip {
             Skip::Changed => "changed",
             Skip::TooYoung => "too young",
             Skip::SpecialFile => "special file",
+            Skip::PartlyExcluded => "hardlink group partly excluded",
         })
     }
 }
@@ -149,15 +155,15 @@ pub struct Mover<'a> {
     /// Directories that moves created on the backing branch, by relpath.
     created_dirs: Vec<PathBuf>,
     retiring: VecDeque<Retiring<'a>>,
-    finished: Vec<(&'a Path, Result<MoveOutcome>)>,
+    finished: Vec<(&'a [PathBuf], Result<MoveOutcome>)>,
 }
 
 /// A move whose source is retired but not yet unlinked.
 struct Retiring<'a> {
     source: Source<'a>,
-    /// The mirror of the source's parent in the cache branch's staging
-    /// directory, which holds the retired source.
-    retired_parent: OwnedFd,
+    /// For each of the source's names that is retired, in order, the mirror
+    /// of its parent in the cache branch's staging directory, which holds it.
+    retired_parents: Vec<OwnedFd>,
     published: Published<'a>,
     hash: Hash,
     retired_at: Instant,
@@ -185,15 +191,17 @@ impl<'a> Mover<'a> {
         }
     }
 
-    /// Moves `rel`, a file of the given kind, from the cache branch to the
-    /// backing branch, unless the guard finds it in use; skips it if it is a
-    /// special file. The outcome is reported by [`Mover::finished`], possibly only
-    /// after later moves have started.
+    /// Moves the move unit of the given kind at `rels` (its names, as the
+    /// scanner lists them) from the cache branch to the backing branch, unless
+    /// the guard finds it in use; skips it if it is a special file or a partly
+    /// excluded hardlink group. The outcome is reported by
+    /// [`Mover::finished`], possibly only after later moves have started.
     ///
     /// A skipped move, or one that fails before publish, leaves the source
-    /// where it was and no copy behind. A stale copy at `rel` on the backing
-    /// branch is not replaced yet: the publish fails and the move with it.
-    pub fn start(&mut self, rel: &'a Path, kind: Kind) {
+    /// where it was and no copy behind. A stale copy at one of `rels` on the
+    /// backing branch is not replaced yet: the publish fails and the move
+    /// with it.
+    pub fn start(&mut self, rels: &'a [PathBuf], kind: Kind) {
         self.service();
         let finished = match kind {
             Kind::Regular => {
@@ -202,13 +210,14 @@ impl<'a> Mover<'a> {
                     self.service();
                 }
                 // A move that reaches its retire finishes once serviced.
-                self.transact(rel).err().map(Err)
+                self.transact(rels).err().map(Err)
             }
-            Kind::Symlink => Some(self.transact_symlink(rel)),
+            Kind::Symlink => Some(self.transact_symlink(&rels[0])),
             Kind::Special => Some(Err(Abort::Skip(Skip::SpecialFile))),
+            Kind::PartlyExcluded => Some(Err(Abort::Skip(Skip::PartlyExcluded))),
         };
         if let Some(result) = finished {
-            self.finished.push((rel, outcome(result)));
+            self.finished.push((rels, outcome(result)));
         }
     }
 
@@ -250,7 +259,7 @@ impl<'a> Mover<'a> {
     }
 
     /// The outcomes of the moves that finished since the last call.
-    pub fn finished(&mut self) -> Vec<(&'a Path, Result<MoveOutcome>)> {
+    pub fn finished(&mut self) -> Vec<(&'a [PathBuf], Result<MoveOutcome>)> {
         std::mem::take(&mut self.finished)
     }
 
@@ -259,7 +268,7 @@ impl<'a> Mover<'a> {
     /// wait is over has its source unlinked.
     fn service(&mut self) {
         for retiring in std::mem::take(&mut self.retiring) {
-            let (rel, hash) = (retiring.source.rel, retiring.hash);
+            let (rels, hash) = (retiring.source.rels, retiring.hash);
             let finished = match retiring.source.check_lease() {
                 Err(abort) => Some(retiring.roll_back(self.fs).and_then(|()| Err(abort))),
                 Ok(()) if retiring.retired_at.elapsed() >= retire_wait() => {
@@ -271,18 +280,19 @@ impl<'a> Mover<'a> {
                 }
             };
             if let Some(result) = finished {
-                self.finished.push((rel, outcome(result)));
+                self.finished.push((rels, outcome(result)));
             }
         }
     }
 
-    /// Runs a move up to its retire, after which it waits in the queue of
-    /// retiring moves.
-    fn transact(&mut self, rel: &'a Path) -> Result<(), Abort> {
+    /// Runs a move of the regular file or hardlink group `rels` up to its
+    /// retire, after which it waits in the queue of retiring moves.
+    fn transact(&mut self, rels: &'a [PathBuf]) -> Result<(), Abort> {
         let fs = self.fs;
+        let rel = &rels[0];
         let (parent, name) = split(rel);
 
-        let source = Source::open(fs, self.cache_branch, rel, self.guard)?;
+        let source = Source::open(fs, self.cache_branch, rels, self.guard)?;
         let (backing_staging, staged_parent) = staging_dirs(fs, self.backing_branch, parent)
             .context("create staging directory on the backing branch")?;
 
@@ -300,7 +310,15 @@ impl<'a> Mover<'a> {
                 &mut self.created_dirs,
             )
             .context("create destination directory")?;
-            let published = publish(fs, dest_parent, name, &staged_parent, &temp)?;
+            let mut published = publish(fs, dest_parent, name, &staged_parent, &temp)?;
+            for rel in &rels[1..] {
+                if let Err(e) = self.link(&mut published, rel) {
+                    // A link that cannot be removed stays as a stale copy,
+                    // identical to the source.
+                    let _ = published.remove(fs);
+                    return Err(e.into());
+                }
+            }
             Ok((published, hash))
         });
         drop(temp);
@@ -312,6 +330,74 @@ impl<'a> Mover<'a> {
         let (published, hash) = published?;
         let retiring = retire(fs, source, published, hash)?;
         self.retiring.push_back(retiring);
+        Ok(())
+    }
+
+    /// Publishes the copy of a hardlink group under its further name `rel`,
+    /// as a link to the name it was published under first. A link to the
+    /// copy that is already there, left by a crash, is adopted.
+    fn link(&mut self, published: &mut Published<'a>, rel: &'a Path) -> Result<()> {
+        let fs = self.fs;
+        let (parent, name) = split(rel);
+        let dest_parent = make_dirs_like(
+            fs,
+            self.backing_branch,
+            parent,
+            &self.cache_branch.fd,
+            self.allowed_losses,
+            &mut self.created_dirs,
+        )
+        .context("create destination directory")?;
+        let first = &published.names[0];
+        let linked = match fs.link(first.dir.as_fd(), first.name, dest_parent.as_fd(), name) {
+            Ok(()) => true,
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => false,
+            Err(e) => return Err(e).with_context(|| format!("publish {}", rel.display())),
+        };
+        let stat = (|| {
+            if linked {
+                fs.fsync(dest_parent.as_fd())
+                    .context("fsync destination directory")?;
+            }
+            fs.stat_at(dest_parent.as_fd(), name)
+                .context("stat published link")
+        })();
+        let stat = match stat {
+            Ok(stat) if published.identity.same_inode(&stat) => stat,
+            Ok(_) if !linked => {
+                return Err(anyhow!("publish {}: File exists", rel.display()));
+            }
+            // The first name was replaced before it was linked, so the link
+            // is not to the copy.
+            Ok(_) => {
+                let _ = fs.unlink(dest_parent.as_fd(), name);
+                return Err(anyhow!(
+                    "publish {}: the published copy was replaced",
+                    rel.display()
+                ));
+            }
+            Err(e) => {
+                if linked {
+                    unpublish_inode(fs, &dest_parent, name, &published.identity);
+                    // Linking and unlinking changed the copy's ctime, which
+                    // would make a rollback take it for no longer its own.
+                    let first = &published.names[0];
+                    if let Ok(stat) = fs.stat_at(first.dir.as_fd(), first.name)
+                        && published.identity.same_inode(&stat)
+                    {
+                        published.identity = Identity::of(&stat);
+                    }
+                }
+                return Err(e);
+            }
+        };
+        // Linking changed the copy's ctime.
+        published.identity = Identity::of(&stat);
+        published.names.push(PublishedName {
+            dir: dest_parent,
+            name,
+            adopted: !linked,
+        });
         Ok(())
     }
 
@@ -491,31 +577,49 @@ fn outcome(result: Result<Hash, Abort>) -> Result<MoveOutcome> {
 /// A published copy, identified so that a rollback removes it only while it
 /// is still cachy's own.
 struct Published<'a> {
-    dir: OwnedFd,
-    name: &'a Path,
+    /// The names it is published under: one, or each name of a hardlink
+    /// group, in the order of the source's names.
+    names: Vec<PublishedName<'a>>,
     /// The copy as it was right after publishing.
     identity: Identity,
-    /// The copy was already on the backing branch, not written by this move.
+}
+
+struct PublishedName<'a> {
+    dir: OwnedFd,
+    name: &'a Path,
+    /// The name was already on the backing branch, not created by this move.
     adopted: bool,
 }
 
-impl Published<'_> {
-    /// Removes the copy, unless it was adopted or is no longer cachy's own.
+impl<'a> Published<'a> {
+    fn one(dir: OwnedFd, name: &'a Path, identity: Identity, adopted: bool) -> Published<'a> {
+        Published {
+            names: vec![PublishedName { dir, name, adopted }],
+            identity,
+        }
+    }
+
+    /// Removes the names that this move created, unless the copy is no
+    /// longer cachy's own under them. All are checked before any is removed,
+    /// since removing one changes the copy's ctime.
     fn remove(&self, fs: &dyn FsOps) -> Result<()> {
-        if self.adopted {
-            return Ok(());
+        let mut ours = Vec::new();
+        for published in self.names.iter().filter(|n| !n.adopted) {
+            match fs.stat_at(published.dir.as_fd(), published.name) {
+                Ok(stat) if Identity::of(&stat) == self.identity => ours.push(published),
+                // Replaced, changed or removed since: no longer cachy's own.
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e).context("stat published copy"),
+            }
         }
-        match fs.stat_at(self.dir.as_fd(), self.name) {
-            Ok(stat) if Identity::of(&stat) == self.identity => {}
-            // Replaced, changed or removed since: no longer cachy's own.
-            Ok(_) => return Ok(()),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
-            Err(e) => return Err(e).context("stat published copy"),
+        for published in ours {
+            fs.unlink(published.dir.as_fd(), published.name)
+                .context("remove published copy")?;
+            fs.fsync(published.dir.as_fd())
+                .context("fsync destination directory")?;
         }
-        fs.unlink(self.dir.as_fd(), self.name)
-            .context("remove published copy")?;
-        fs.fsync(self.dir.as_fd())
-            .context("fsync destination directory")
+        Ok(())
     }
 }
 
@@ -553,12 +657,7 @@ fn publish<'a>(
             ))
         });
     match identity {
-        Ok(identity) => Ok(Published {
-            dir: dest_parent,
-            name,
-            identity,
-            adopted: false,
-        }),
+        Ok(identity) => Ok(Published::one(dest_parent, name, identity, false)),
         Err(e) => {
             unpublish(fs, &dest_parent, name, copy);
             Err(e)
@@ -571,15 +670,15 @@ fn publish<'a>(
 /// identical to the source.
 fn unpublish(fs: &dyn FsOps, dest_parent: &OwnedFd, name: &Path, copy: &OwnedFd) {
     if let Ok(copy) = fs.fstat(copy.as_fd()) {
-        unpublish_inode(fs, dest_parent, name, &copy);
+        unpublish_inode(fs, dest_parent, name, &Identity::of(&copy));
     }
 }
 
 /// Removes `<dest_parent>/<name>` if it is still the inode of `copy`.
-fn unpublish_inode(fs: &dyn FsOps, dest_parent: &OwnedFd, name: &Path, copy: &Stat) {
+fn unpublish_inode(fs: &dyn FsOps, dest_parent: &OwnedFd, name: &Path, copy: &Identity) {
     let ours = fs
         .stat_at(dest_parent.as_fd(), name)
-        .is_ok_and(|at_name| Identity::of(copy).same_inode(&at_name));
+        .is_ok_and(|at_name| copy.same_inode(&at_name));
     if ours && fs.unlink(dest_parent.as_fd(), name).is_ok() {
         let _ = fs.fsync(dest_parent.as_fd());
     }
@@ -612,12 +711,7 @@ fn publish_symlink<'a>(
                 .context("delete temp file")?;
             fs.fsync(staged_parent.as_fd())
                 .context("fsync staging directory on the backing branch")?;
-            return Ok(Published {
-                dir: dest_parent,
-                name,
-                identity,
-                adopted: true,
-            });
+            return Ok(Published::one(dest_parent, name, identity, true));
         }
         Err(e) => return Err(e).context("publish"),
     }
@@ -638,15 +732,12 @@ fn publish_symlink<'a>(
             ))
         });
     match identity {
-        Ok(identity) if identity.same_inode(&staged) => Ok(Published {
-            dir: dest_parent,
-            name,
-            identity,
-            adopted: false,
-        }),
+        Ok(identity) if identity.same_inode(&staged) => {
+            Ok(Published::one(dest_parent, name, identity, false))
+        }
         Ok(_) => Err(anyhow!("publish: the published copy was replaced")),
         Err(e) => {
-            unpublish_inode(fs, &dest_parent, name, &staged);
+            unpublish_inode(fs, &dest_parent, name, &Identity::of(&staged));
             Err(e)
         }
     }
@@ -676,93 +767,98 @@ fn adopt_identical<'a>(
     }
     fs.unlink(staged_parent.as_fd(), name)?;
     fs.fsync(staged_parent.as_fd())?;
-    Ok(Some(Published {
-        dir: dest_parent,
-        name,
-        identity,
-        adopted: true,
-    }))
+    Ok(Some(Published::one(dest_parent, name, identity, true)))
 }
 
-/// Starts removing the source from the cache branch: renames it into the
-/// cache branch's staging directory, where it waits for [`RETIRE_WAIT`] so an
-/// open that looked up the source before the rename reaches the lease check
-/// in time to roll the move back.
+/// Starts removing the source from the cache branch: renames each of its
+/// names into the cache branch's staging directory, where they wait for
+/// [`RETIRE_WAIT`] so an open that looked up the source before the rename
+/// reaches the lease check in time to roll the move back.
 fn retire<'a>(
     fs: &dyn FsOps,
     source: Source<'a>,
     published: Published<'a>,
     hash: Hash,
 ) -> Result<Retiring<'a>, Abort> {
-    let (parent, name) = split(source.rel);
-    let renamed = staging_dirs(fs, source.cache_branch, parent)
-        .context("create staging directory on the cache branch")
-        .and_then(|(_, retired_parent)| {
-            fs.rename_noreplace(source.dir.as_fd(), name, retired_parent.as_fd(), name)
-                .context("retire: rename source into staging directory")?;
-            Ok(retired_parent)
-        });
-    let retired_parent = match renamed {
-        Ok(retired_parent) => retired_parent,
-        Err(e) => {
-            // The source is still in place. A published copy that cannot be
-            // removed stays as a stale copy, identical to the source.
-            let _ = published.remove(fs);
-            return Err(Abort::Fail(e));
-        }
-    };
-    let retiring = Retiring {
+    let mut retiring = Retiring {
         source,
-        retired_parent,
+        retired_parents: Vec::new(),
         published,
         hash,
         retired_at: Instant::now(),
     };
-    // From here on, every way out either unlinks the retired source or puts
-    // it back, so no opener blocked on the lease is left with a hidden file.
-    if let Err(e) = fs
-        .fsync(retiring.source.dir.as_fd())
-        .context("fsync source directory")
-    {
-        retiring.roll_back(fs)?;
-        return Err(Abort::Fail(e));
+    // From here on, every way out either unlinks the retired names or puts
+    // them back, so no opener blocked on the lease is left with a hidden file.
+    let retired = (|| {
+        for (rel, dir) in retiring.source.rels.iter().zip(&retiring.source.dirs) {
+            let (parent, name) = split(rel);
+            let (_, retired_parent) = staging_dirs(fs, retiring.source.cache_branch, parent)
+                .context("create staging directory on the cache branch")?;
+            fs.rename_noreplace(dir.as_fd(), name, retired_parent.as_fd(), name)
+                .context("retire: rename source into staging directory")?;
+            retiring.retired_parents.push(retired_parent);
+        }
+        for dir in &retiring.source.dirs {
+            fs.fsync(dir.as_fd()).context("fsync source directory")?;
+        }
+        Ok(())
+    })();
+    match retired {
+        Ok(()) => {
+            retiring.retired_at = Instant::now();
+            Ok(retiring)
+        }
+        Err(e) => {
+            // A published copy that cannot be removed stays as a stale copy,
+            // identical to the source.
+            retiring.roll_back(fs)?;
+            Err(Abort::Fail(e))
+        }
     }
-    Ok(retiring)
 }
 
 impl Retiring<'_> {
+    /// The retired names, each with the mirror of its parent that holds it.
+    fn retired(&self) -> impl Iterator<Item = (&Path, &OwnedFd)> {
+        self.source
+            .rels
+            .iter()
+            .map(|rel| split(rel).1)
+            .zip(&self.retired_parents)
+    }
+
+    /// Unlinks every retired name. One that cannot be unlinked stays in the
+    /// staging directory, for recovery to delete.
     fn unlink(self, fs: &dyn FsOps) -> Result<(), Abort> {
-        let name = split(self.source.rel).1;
-        let unlinked = fs
-            .unlink(self.retired_parent.as_fd(), name)
-            .context("retire: unlink source")
-            .and_then(|()| {
-                fs.fsync(self.retired_parent.as_fd())
-                    .context("fsync staging directory on the cache branch")
-            });
+        let mut unlinked = Ok(());
+        for (name, retired_parent) in self.retired() {
+            let result = fs
+                .unlink(retired_parent.as_fd(), name)
+                .context("retire: unlink source")
+                .and_then(|()| {
+                    fs.fsync(retired_parent.as_fd())
+                        .context("fsync staging directory on the cache branch")
+                });
+            if unlinked.is_ok() {
+                unlinked = result;
+            }
+        }
         self.remove_empty_staging_dirs(fs);
         Ok(unlinked?)
     }
 
-    /// Undoes the move: renames the source back and removes the published
-    /// copy. The source's lease is still held, so whoever broke it opens the
-    /// source only once it is back.
+    /// Undoes the move: renames the retired names back and removes the
+    /// published copy. The source's lease is still held, so whoever broke it
+    /// opens the source only once it is back.
     fn roll_back(self, fs: &dyn FsOps) -> Result<(), Abort> {
-        let name = split(self.source.rel).1;
-        let rolled_back = fs
-            .rename_noreplace(
-                self.retired_parent.as_fd(),
-                name,
-                self.source.dir.as_fd(),
-                name,
-            )
-            .context("roll back: rename source back")
-            .and_then(|()| {
-                fs.fsync(self.source.dir.as_fd())
-                    .context("fsync source directory")
-            })
-            .and_then(|()| {
-                fs.fsync(self.retired_parent.as_fd())
+        let rolled_back = self
+            .retired()
+            .zip(&self.source.dirs)
+            .try_for_each(|((name, retired_parent), dir)| {
+                fs.rename_noreplace(retired_parent.as_fd(), name, dir.as_fd(), name)
+                    .context("roll back: rename source back")?;
+                fs.fsync(dir.as_fd()).context("fsync source directory")?;
+                fs.fsync(retired_parent.as_fd())
                     .context("fsync staging directory on the cache branch")
             })
             .and_then(|()| self.published.remove(fs).context("roll back"));
@@ -771,7 +867,9 @@ impl Retiring<'_> {
     }
 
     fn remove_empty_staging_dirs(&self, fs: &dyn FsOps) {
-        remove_empty_retired_dirs(fs, self.source.cache_branch, self.source.rel);
+        for rel in self.source.rels {
+            remove_empty_retired_dirs(fs, self.source.cache_branch, rel);
+        }
     }
 }
 
@@ -787,9 +885,11 @@ fn staging_dirs(fs: &dyn FsOps, branch: &Branch, parent: &Path) -> io::Result<(O
 struct Source<'a> {
     fs: &'a dyn FsOps,
     cache_branch: &'a Branch,
-    rel: &'a Path,
-    /// The parent directory, as opened when the move started.
-    dir: OwnedFd,
+    /// Its names: one, or each name of a hardlink group.
+    rels: &'a [PathBuf],
+    /// The parent directory of each name, as opened when the move started.
+    dirs: Vec<OwnedFd>,
+    /// The source, opened through its first name.
     file: OwnedFd,
     lease: Lease,
     /// The source as it was when the lease was taken.
@@ -843,16 +943,17 @@ impl Identity {
 }
 
 impl<'a> Source<'a> {
-    /// Opens `rel` on the cache branch and takes a lease on it. Skips it if
-    /// another open conflicts with the lease, or if it is younger than the
-    /// minimum age.
+    /// Opens the regular file or hardlink group `rels` on the cache branch
+    /// and takes a lease on it. Skips it if another open conflicts with the
+    /// lease, if it is younger than the minimum age, or if `rels` are no
+    /// longer all of its names.
     fn open(
         fs: &'a dyn FsOps,
         cache_branch: &'a Branch,
-        rel: &'a Path,
+        rels: &'a [PathBuf],
         guard: &Guard,
     ) -> Result<Source<'a>, Abort> {
-        let (parent, name) = split(rel);
+        let (parent, name) = split(&rels[0]);
         let dir = open_dirs(fs, &cache_branch.fd, parent).context("open source directory")?;
         let file = fs.open_read(dir.as_fd(), name).context("open source")?;
         let lease = guard.lease;
@@ -868,11 +969,28 @@ impl<'a> Source<'a> {
         if identity.is_younger_than(guard.minimum_age) {
             return Err(Abort::Skip(Skip::TooYoung));
         }
+        // A link added or removed since the scan.
+        if stat.st_nlink != rels.len() as u64 {
+            return Err(Abort::Skip(Skip::Changed));
+        }
+        let mut dirs = vec![dir];
+        for rel in &rels[1..] {
+            let (parent, name) = split(rel);
+            let dir = open_dirs(fs, &cache_branch.fd, parent).context("open source directory")?;
+            match fs.stat_at(dir.as_fd(), name) {
+                Ok(at_name) if identity.same_inode(&at_name) => dirs.push(dir),
+                Ok(_) => return Err(Abort::Skip(Skip::Changed)),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    return Err(Abort::Skip(Skip::Changed));
+                }
+                Err(e) => return Err(anyhow::Error::from(e).context("stat source").into()),
+            }
+        }
         Ok(Source {
             fs,
             cache_branch,
-            rel,
-            dir,
+            rels,
+            dirs,
             file,
             lease,
             identity,
@@ -882,16 +1000,19 @@ impl<'a> Source<'a> {
     }
 
     /// Checks, right before publishing, that the copy is still current: the
-    /// lease is held, the source is unchanged, and its relpath, looked up
-    /// afresh from the cache branch root, still names it. An atomic save or a
-    /// renamed directory during the copy fails the last check.
+    /// lease is held, the source is unchanged, and each of its relpaths,
+    /// looked up afresh from the cache branch root, still names it. An atomic
+    /// save or a renamed directory during the copy fails the last check.
     fn revalidate(&self) -> Result<(), Abort> {
         self.check_lease()?;
         let now = self.fs.fstat(self.file.as_fd()).context("fstat source")?;
         if Identity::of(&now) != self.identity {
             return Err(Abort::Skip(Skip::Changed));
         }
-        still_at_relpath(self.fs, self.cache_branch, self.rel, &self.identity)
+        for rel in self.rels {
+            still_at_relpath(self.fs, self.cache_branch, rel, &self.identity)?;
+        }
+        Ok(())
     }
 
     /// Skips the move as in use once a conflicting open has started to break

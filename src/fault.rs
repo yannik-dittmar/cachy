@@ -237,6 +237,17 @@ impl FsOps for FaultyFs {
         RealFs.rename_noreplace(from_dir, from, to_dir, to)
     }
 
+    fn link(
+        &self,
+        from_dir: BorrowedFd,
+        from: &Path,
+        to_dir: BorrowedFd,
+        to: &Path,
+    ) -> io::Result<()> {
+        self.count_op("link")?;
+        RealFs.link(from_dir, from, to_dir, to)
+    }
+
     fn unlink(&self, dir: BorrowedFd, path: &Path) -> io::Result<()> {
         self.count_op("unlink")?;
         RealFs.unlink(dir, path)

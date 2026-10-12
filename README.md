@@ -6,7 +6,7 @@ cachy is heavily inspired by [mergerfs-cache-mover](https://github.com/monstermu
 
 ## Status
 
-Early development. Do not use it on real data yet: `cachy run` moves files and skips files in use, but it cannot yet recover from a crash in the middle of a move.
+Early development. Do not use it on real data yet. `cachy run` moves files, skips files in use and recovers from a crash in the middle of a move, but it does not yet preserve metadata such as owner, mode and timestamps.
 
 cachy detects files in use with kernel file leases. One race remains that leases cannot close: an application that looked up a file's path just before cachy retired it, but stalled for more than a second before opening it, opens the retired copy, and its writes are lost.
 
@@ -22,6 +22,12 @@ ci/test-filesystem-pairs.sh /tmp/cachy-fs
 ```
 
 `tests/common/mod.rs` documents the environment variables that select the filesystems.
+
+The crash tests kill cachy, or fail a syscall, at every filesystem operation of a run, and check that the next run recovers without losing anything. They need a test-only build of cachy with fault injection; in a normal build they are skipped:
+
+```sh
+cargo test --features fault-injection
+```
 
 ## Licence
 

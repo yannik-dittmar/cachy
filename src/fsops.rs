@@ -4,8 +4,10 @@
 //!
 //! File descriptors are closed on drop, outside the port.
 
+use std::ffi::OsString;
 use std::io;
 use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
+use std::os::unix::ffi::OsStringExt;
 use std::path::Path;
 
 pub use rustix::fs::Stat;
@@ -58,6 +60,8 @@ pub trait FsOps {
     ) -> io::Result<()>;
     fn unlink(&self, dir: BorrowedFd, path: &Path) -> io::Result<()>;
     fn rmdir(&self, dir: BorrowedFd, path: &Path) -> io::Result<()>;
+    /// The names of the entries in the directory `dir`, without `.` and `..`.
+    fn list_dir(&self, dir: BorrowedFd) -> io::Result<Vec<OsString>>;
     /// Bytes available to unprivileged writers on `fd`'s filesystem.
     fn free_space(&self, fd: BorrowedFd) -> io::Result<u64>;
     /// Takes, changes or releases the lease on `fd`'s file. Fails with
@@ -137,6 +141,17 @@ impl FsOps for RealFs {
 
     fn rmdir(&self, dir: BorrowedFd, path: &Path) -> io::Result<()> {
         Ok(rustix::fs::unlinkat(dir, path, AtFlags::REMOVEDIR)?)
+    }
+
+    fn list_dir(&self, dir: BorrowedFd) -> io::Result<Vec<OsString>> {
+        let mut names = Vec::new();
+        for entry in rustix::fs::Dir::read_from(dir)? {
+            let name = entry?.file_name().to_bytes().to_vec();
+            if name != b"." && name != b".." {
+                names.push(OsString::from_vec(name));
+            }
+        }
+        Ok(names)
     }
 
     fn free_space(&self, fd: BorrowedFd) -> io::Result<u64> {

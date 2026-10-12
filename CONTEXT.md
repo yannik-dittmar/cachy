@@ -63,6 +63,14 @@ _Avoid_: delete, clean up
 cachy's own directory at the root of each filesystem it writes to, holding the temp files and retired sources of unfinished moves; anything left in it after a crash belongs to an unfinished move and nothing else.
 _Avoid_: temp dir, journal
 
+**Leftover**:
+A temp file or retired source that an unfinished move left in a staging directory.
+_Avoid_: orphan
+
+**Recovery**:
+The first step of every run, which resolves each leftover against its published counterpart (deleting it if it is redundant, renaming a retired source back otherwise) and then removes empty staging directories.
+_Avoid_: cleanup, orphan cleaning
+
 ### Checks and runs
 
 **Free space**:

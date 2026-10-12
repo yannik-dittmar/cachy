@@ -1,0 +1,170 @@
+//! Recovery: resolves what unfinished moves left in the staging directories,
+//! so that a crash at any step of a move loses nothing.
+//!
+//! Recovery lists only the staging directories, never the rest of a branch,
+//! and deletes nothing outside them. Each leftover is resolved against its
+//! published counterpart, the file at the same relpath on the backing branch:
+//!
+//! - A retired source (in the cache branch's staging directory) is deleted if
+//!   it is identical to its published counterpart. Otherwise it is renamed
+//!   back to its relpath on the cache branch, which never replaces a file.
+//! - A temp file (in a backing branch's staging directory) is deleted. A move
+//!   retires its source only once the copy is published, so a temp file is
+//!   never the only copy of anything.
+
+use std::io;
+use std::os::fd::{AsFd, OwnedFd};
+use std::path::Path;
+
+use anyhow::{Context, Result};
+
+use crate::fsops::FsOps;
+use crate::transaction::{Branch, DIR_MODE, STAGING, make_dirs, open_dirs, same_content, split};
+
+/// Resolves the leftovers in the staging directories of the cache branch and
+/// the backing branch, then removes the staging directories once empty.
+/// Returns how many leftovers could not be resolved; they stay where they are.
+pub fn recover(fs: &dyn FsOps, cache_branch: &Branch, backing_branch: &Branch) -> usize {
+    let mut recovery = Recovery {
+        fs,
+        cache_branch,
+        backing_branch,
+        unresolved: 0,
+    };
+    recovery.staging_directory(cache_branch, Leftover::RetiredSource);
+    recovery.staging_directory(backing_branch, Leftover::TempFile);
+    recovery.unresolved
+}
+
+/// What a regular file in a staging directory is left over from.
+#[derive(Clone, Copy)]
+enum Leftover {
+    /// A source that was renamed into the cache branch's staging directory to
+    /// retire it.
+    RetiredSource,
+    /// A copy that was being written in a backing branch's staging directory.
+    TempFile,
+}
+
+struct Recovery<'a> {
+    fs: &'a dyn FsOps,
+    cache_branch: &'a Branch,
+    backing_branch: &'a Branch,
+    unresolved: usize,
+}
+
+impl Recovery<'_> {
+    fn staging_directory(&mut self, branch: &Branch, kind: Leftover) {
+        let staging = match self.fs.open_dir(branch.fd.as_fd(), Path::new(STAGING)) {
+            Ok(staging) => staging,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return,
+            Err(e) => {
+                self.unresolved(&branch.path.join(STAGING), anyhow::Error::from(e));
+                return;
+            }
+        };
+        self.directory(branch, &staging, Path::new(""), kind);
+        // Fails harmlessly if a leftover could not be resolved.
+        let _ = self.fs.rmdir(branch.fd.as_fd(), Path::new(STAGING));
+    }
+
+    /// Resolves the leftovers below `rel_dir`, the directory `dir` in
+    /// `branch`'s staging directory, and removes the directories they leave
+    /// empty.
+    fn directory(&mut self, branch: &Branch, dir: &OwnedFd, rel_dir: &Path, kind: Leftover) {
+        let staged = |rel: &Path| branch.path.join(STAGING).join(rel);
+        let names = match self.fs.list_dir(dir.as_fd()) {
+            Ok(names) => names,
+            Err(e) => {
+                self.unresolved(&staged(rel_dir), anyhow::Error::from(e).context("list"));
+                return;
+            }
+        };
+        for name in names {
+            let name = Path::new(&name);
+            let rel = rel_dir.join(name);
+            let stat = match self.fs.stat_at(dir.as_fd(), name) {
+                Ok(stat) => stat,
+                Err(e) => {
+                    self.unresolved(&staged(&rel), anyhow::Error::from(e).context("stat"));
+                    continue;
+                }
+            };
+            match stat.st_mode & libc::S_IFMT {
+                libc::S_IFDIR => {
+                    match self.fs.open_dir(dir.as_fd(), name) {
+                        Ok(child) => self.directory(branch, &child, &rel, kind),
+                        Err(e) => {
+                            self.unresolved(&staged(&rel), anyhow::Error::from(e).context("open"));
+                            continue;
+                        }
+                    }
+                    // Fails harmlessly if a leftover could not be resolved.
+                    let _ = self.fs.rmdir(dir.as_fd(), name);
+                }
+                libc::S_IFREG => {
+                    let resolved = match kind {
+                        Leftover::RetiredSource => self.retired_source(dir, &rel),
+                        Leftover::TempFile => self.temp_file(dir, &rel),
+                    };
+                    match resolved {
+                        Ok(how) => eprintln!("cachy: recovery: {}: {how}", staged(&rel).display()),
+                        Err(e) => self.unresolved(&staged(&rel), e),
+                    }
+                }
+                _ => self.unresolved(
+                    &staged(&rel),
+                    anyhow::anyhow!("not a regular file or directory"),
+                ),
+            }
+        }
+    }
+
+    /// Deletes the retired source `rel` (in `staged_dir`) if its published
+    /// counterpart is identical, and renames it back to the cache branch
+    /// otherwise.
+    fn retired_source(&self, staged_dir: &OwnedFd, rel: &Path) -> Result<&'static str> {
+        let fs = self.fs;
+        let (parent, name) = split(rel);
+        // Anything short of proof that the published counterpart is identical
+        // keeps the retired source, which renaming it back always does.
+        let identical = open_dirs(fs, &self.backing_branch.fd, parent)
+            .and_then(|dir| same_content(fs, staged_dir, name, &dir, name))
+            .unwrap_or(false);
+        if identical {
+            fs.unlink(staged_dir.as_fd(), name)
+                .context("delete retired source")?;
+            fs.fsync(staged_dir.as_fd())
+                .context("fsync staging directory")?;
+            return Ok("deleted, identical to its published copy");
+        }
+        let dest = make_dirs(fs, &self.cache_branch.fd, parent, DIR_MODE)
+            .context("create directory on the cache branch")?;
+        fs.rename_noreplace(staged_dir.as_fd(), name, dest.as_fd(), name)
+            .context("rename retired source back")?;
+        fs.fsync(dest.as_fd())
+            .context("fsync directory on the cache branch")?;
+        fs.fsync(staged_dir.as_fd())
+            .context("fsync staging directory")?;
+        Ok("renamed back to the cache branch")
+    }
+
+    fn temp_file(&self, staged_dir: &OwnedFd, rel: &Path) -> Result<&'static str> {
+        let name = split(rel).1;
+        self.fs
+            .unlink(staged_dir.as_fd(), name)
+            .context("delete unfinished copy")?;
+        self.fs
+            .fsync(staged_dir.as_fd())
+            .context("fsync staging directory")?;
+        Ok("deleted unfinished copy")
+    }
+
+    fn unresolved(&mut self, path: &Path, e: anyhow::Error) {
+        self.unresolved += 1;
+        eprintln!(
+            "cachy: error: cannot resolve staging leftover {}: {e:#}",
+            path.display()
+        );
+    }
+}

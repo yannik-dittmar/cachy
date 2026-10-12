@@ -32,9 +32,18 @@ const MAX_RETIRING: usize = 128;
 /// How often retiring moves are serviced while nothing else is running.
 const RETIRING_POLL: Duration = Duration::from_millis(10);
 const COPY_BUF: usize = 1 << 20;
-const DIR_MODE: u32 = 0o755;
+pub const DIR_MODE: u32 = 0o755;
 const STAGING_MODE: u32 = 0o700;
 const TEMP_MODE: u32 = 0o600;
+
+/// [`RETIRE_WAIT`], unless a fault-injection build is told otherwise.
+fn retire_wait() -> Duration {
+    #[cfg(feature = "fault-injection")]
+    if let Some(wait) = crate::fault::retire_wait() {
+        return wait;
+    }
+    RETIRE_WAIT
+}
 
 /// A branch root, held open so every operation is relative to it.
 pub struct Branch {
@@ -192,7 +201,7 @@ impl<'a> Mover<'a> {
             let rel = retiring.source.rel;
             let finished = match retiring.source.check_lease() {
                 Err(abort) => Some(retiring.roll_back(self.fs).and(Err(abort))),
-                Ok(()) if retiring.retired_at.elapsed() >= RETIRE_WAIT => {
+                Ok(()) if retiring.retired_at.elapsed() >= retire_wait() => {
                     Some(retiring.unlink(self.fs))
                 }
                 Ok(()) => {
@@ -305,7 +314,9 @@ impl Published<'_> {
 }
 
 /// Makes the staged temp file `copy` visible as
-/// `<backing branch>/<parent>/<name>`, never replacing an existing file.
+/// `<backing branch>/<parent>/<name>`, never replacing an existing file. An
+/// existing file identical to the copy is adopted as the published copy
+/// instead.
 fn publish<'a>(
     fs: &dyn FsOps,
     backing_branch: &Branch,
@@ -316,19 +327,86 @@ fn publish<'a>(
 ) -> Result<Published<'a>> {
     let dest_parent = make_dirs(fs, &backing_branch.fd, parent, DIR_MODE)
         .context("create destination directory")?;
-    fs.rename_noreplace(staged_parent.as_fd(), name, dest_parent.as_fd(), name)
-        .context("publish")?;
-    fs.fsync(dest_parent.as_fd())
-        .context("fsync destination directory")?;
-    fs.fsync(staged_parent.as_fd())
-        .context("fsync staging directory on the backing branch")?;
-    // After the rename, which may have changed the copy's ctime.
-    let identity = Identity::of(&fs.fstat(copy.as_fd()).context("fstat published copy")?);
-    Ok(Published {
+    match fs.rename_noreplace(staged_parent.as_fd(), name, dest_parent.as_fd(), name) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            return match adopt_identical(fs, dest_parent, name, staged_parent) {
+                Ok(Some(published)) => Ok(published),
+                _ => Err(e).context("publish"),
+            };
+        }
+        Err(e) => return Err(e).context("publish"),
+    }
+    let identity = fs
+        .fsync(dest_parent.as_fd())
+        .context("fsync destination directory")
+        .and_then(|()| {
+            fs.fsync(staged_parent.as_fd())
+                .context("fsync staging directory on the backing branch")
+        })
+        // After the rename, which may have changed the copy's ctime.
+        .and_then(|()| {
+            Ok(Identity::of(
+                &fs.fstat(copy.as_fd()).context("fstat published copy")?,
+            ))
+        });
+    match identity {
+        Ok(identity) => Ok(Published {
+            dir: dest_parent,
+            name,
+            identity,
+        }),
+        Err(e) => {
+            unpublish(fs, &dest_parent, name, copy);
+            Err(e)
+        }
+    }
+}
+
+/// Removes the copy published as `<dest_parent>/<name>` after a failure, if
+/// that name still refers to it. If it cannot, the copy stays as a stale copy,
+/// identical to the source.
+fn unpublish(fs: &dyn FsOps, dest_parent: &OwnedFd, name: &Path, copy: &OwnedFd) {
+    let inode = |stat: Stat| (stat.st_dev, stat.st_ino);
+    let ours = match (
+        fs.fstat(copy.as_fd()),
+        fs.stat_at(dest_parent.as_fd(), name),
+    ) {
+        (Ok(copy), Ok(at_name)) => inode(copy) == inode(at_name),
+        _ => false,
+    };
+    if ours && fs.unlink(dest_parent.as_fd(), name).is_ok() {
+        let _ = fs.fsync(dest_parent.as_fd());
+    }
+}
+
+/// Adopts the existing file `<dest_parent>/<name>` as the published copy if
+/// it is identical to the staged copy, which is then deleted. A run that was
+/// interrupted between publish and retire leaves such a file behind.
+///
+/// A rollback removes an adopted copy like one cachy published, which loses
+/// nothing: it is identical to the source that the rollback puts back.
+fn adopt_identical<'a>(
+    fs: &dyn FsOps,
+    dest_parent: OwnedFd,
+    name: &'a Path,
+    staged_parent: &OwnedFd,
+) -> io::Result<Option<Published<'a>>> {
+    let before = Identity::of(&fs.stat_at(dest_parent.as_fd(), name)?);
+    if !same_content(fs, staged_parent, name, &dest_parent, name)? {
+        return Ok(None);
+    }
+    let identity = Identity::of(&fs.stat_at(dest_parent.as_fd(), name)?);
+    if identity != before {
+        return Ok(None);
+    }
+    fs.unlink(staged_parent.as_fd(), name)?;
+    fs.fsync(staged_parent.as_fd())?;
+    Ok(Some(Published {
         dir: dest_parent,
         name,
         identity,
-    })
+    }))
 }
 
 /// Starts removing the source from the cache branch: renames it into the
@@ -341,11 +419,22 @@ fn retire<'a>(
     published: Published<'a>,
 ) -> Result<Retiring<'a>, Abort> {
     let (parent, name) = split(source.rel);
-    let (_, retired_parent) = staging_dirs(fs, source.cache_branch, parent)
-        .context("create staging directory on the cache branch")?;
-
-    fs.rename_noreplace(source.dir.as_fd(), name, retired_parent.as_fd(), name)
-        .context("retire: rename source into staging directory")?;
+    let renamed = staging_dirs(fs, source.cache_branch, parent)
+        .context("create staging directory on the cache branch")
+        .and_then(|(_, retired_parent)| {
+            fs.rename_noreplace(source.dir.as_fd(), name, retired_parent.as_fd(), name)
+                .context("retire: rename source into staging directory")?;
+            Ok(retired_parent)
+        });
+    let retired_parent = match renamed {
+        Ok(retired_parent) => retired_parent,
+        Err(e) => {
+            // The source is still in place. A published copy that cannot be
+            // removed stays as a stale copy, identical to the source.
+            let _ = published.remove(fs);
+            return Err(Abort::Fail(e));
+        }
+    };
     let retiring = Retiring {
         source,
         retired_parent,
@@ -549,9 +638,49 @@ impl<'a> Source<'a> {
     }
 }
 
+/// Whether `a_name` in `a_dir` and `b_name` in `b_dir` are regular files with
+/// the same content.
+pub fn same_content(
+    fs: &dyn FsOps,
+    a_dir: &OwnedFd,
+    a_name: &Path,
+    b_dir: &OwnedFd,
+    b_name: &Path,
+) -> io::Result<bool> {
+    let a = fs.open_read(a_dir.as_fd(), a_name)?;
+    let b = fs.open_read(b_dir.as_fd(), b_name)?;
+    let (a_stat, b_stat) = (fs.fstat(a.as_fd())?, fs.fstat(b.as_fd())?);
+    let regular = |stat: &Stat| stat.st_mode & libc::S_IFMT == libc::S_IFREG;
+    if !regular(&a_stat) || !regular(&b_stat) || a_stat.st_size != b_stat.st_size {
+        return Ok(false);
+    }
+    let (mut a_buf, mut b_buf) = (vec![0; COPY_BUF], vec![0; COPY_BUF]);
+    loop {
+        let n = read_full(fs, &a, &mut a_buf)?;
+        if n != read_full(fs, &b, &mut b_buf)? || a_buf[..n] != b_buf[..n] {
+            return Ok(false);
+        }
+        if n == 0 {
+            return Ok(true);
+        }
+    }
+}
+
+/// Reads into `buf` until it is full or the file ends.
+fn read_full(fs: &dyn FsOps, fd: &OwnedFd, buf: &mut [u8]) -> io::Result<usize> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match fs.read(fd.as_fd(), &mut buf[filled..])? {
+            0 => break,
+            n => filled += n,
+        }
+    }
+    Ok(filled)
+}
+
 /// Opens `path` below `root`, creating missing directories. Each created
 /// directory's parent is fsynced so the new entry is durable.
-fn make_dirs(fs: &dyn FsOps, root: &OwnedFd, path: &Path, mode: u32) -> io::Result<OwnedFd> {
+pub fn make_dirs(fs: &dyn FsOps, root: &OwnedFd, path: &Path, mode: u32) -> io::Result<OwnedFd> {
     let mut dir = fs.open_dir(root.as_fd(), Path::new("."))?;
     for component in normal_components(path) {
         let created = match fs.mkdir(dir.as_fd(), component, mode) {
@@ -568,7 +697,7 @@ fn make_dirs(fs: &dyn FsOps, root: &OwnedFd, path: &Path, mode: u32) -> io::Resu
     Ok(dir)
 }
 
-fn open_dirs(fs: &dyn FsOps, root: &OwnedFd, path: &Path) -> io::Result<OwnedFd> {
+pub fn open_dirs(fs: &dyn FsOps, root: &OwnedFd, path: &Path) -> io::Result<OwnedFd> {
     let mut dir = fs.open_dir(root.as_fd(), Path::new("."))?;
     for component in normal_components(path) {
         dir = fs.open_dir(dir.as_fd(), component)?;
@@ -578,7 +707,7 @@ fn open_dirs(fs: &dyn FsOps, root: &OwnedFd, path: &Path) -> io::Result<OwnedFd>
 
 /// Removes `path` below `root` and its ancestors (but not `root`) while they
 /// are empty.
-fn remove_empty_dirs(fs: &dyn FsOps, root: &OwnedFd, path: &Path) {
+pub fn remove_empty_dirs(fs: &dyn FsOps, root: &OwnedFd, path: &Path) {
     for dir in path.ancestors().filter(|p| !p.as_os_str().is_empty()) {
         if fs.rmdir(root.as_fd(), dir).is_err() {
             return;
@@ -593,120 +722,8 @@ fn normal_components(path: &Path) -> impl Iterator<Item = &Path> {
     })
 }
 
-fn split(rel: &Path) -> (&Path, &Path) {
+pub fn split(rel: &Path) -> (&Path, &Path) {
     let parent = rel.parent().unwrap_or(Path::new(""));
     let name = Path::new(rel.file_name().expect("a move unit's relpath names a file"));
     (parent, name)
-}
-
-#[cfg(test)]
-mod tests {
-    use std::os::fd::BorrowedFd;
-    use std::os::unix::fs::MetadataExt;
-
-    use super::*;
-    use crate::fsops::RealFs;
-
-    /// The real filesystem operations, except that every fsync of one
-    /// directory fails with EIO.
-    struct FailingDirFsync {
-        dir: (u64, u64),
-    }
-
-    impl FsOps for FailingDirFsync {
-        fn open_dir(&self, dir: BorrowedFd, path: &Path) -> io::Result<OwnedFd> {
-            RealFs.open_dir(dir, path)
-        }
-        fn open_read(&self, dir: BorrowedFd, path: &Path) -> io::Result<OwnedFd> {
-            RealFs.open_read(dir, path)
-        }
-        fn create_new(&self, dir: BorrowedFd, path: &Path, mode: u32) -> io::Result<OwnedFd> {
-            RealFs.create_new(dir, path, mode)
-        }
-        fn mkdir(&self, dir: BorrowedFd, path: &Path, mode: u32) -> io::Result<()> {
-            RealFs.mkdir(dir, path, mode)
-        }
-        fn fstat(&self, fd: BorrowedFd) -> io::Result<Stat> {
-            RealFs.fstat(fd)
-        }
-        fn stat_at(&self, dir: BorrowedFd, path: &Path) -> io::Result<Stat> {
-            RealFs.stat_at(dir, path)
-        }
-        fn read(&self, fd: BorrowedFd, buf: &mut [u8]) -> io::Result<usize> {
-            RealFs.read(fd, buf)
-        }
-        fn write(&self, fd: BorrowedFd, buf: &[u8]) -> io::Result<usize> {
-            RealFs.write(fd, buf)
-        }
-        fn fsync(&self, fd: BorrowedFd) -> io::Result<()> {
-            let stat = RealFs.fstat(fd)?;
-            if (stat.st_dev, stat.st_ino) == self.dir {
-                return Err(io::Error::from_raw_os_error(libc::EIO));
-            }
-            RealFs.fsync(fd)
-        }
-        fn rename_noreplace(
-            &self,
-            from_dir: BorrowedFd,
-            from: &Path,
-            to_dir: BorrowedFd,
-            to: &Path,
-        ) -> io::Result<()> {
-            RealFs.rename_noreplace(from_dir, from, to_dir, to)
-        }
-        fn unlink(&self, dir: BorrowedFd, path: &Path) -> io::Result<()> {
-            RealFs.unlink(dir, path)
-        }
-        fn rmdir(&self, dir: BorrowedFd, path: &Path) -> io::Result<()> {
-            RealFs.rmdir(dir, path)
-        }
-        fn free_space(&self, fd: BorrowedFd) -> io::Result<u64> {
-            RealFs.free_space(fd)
-        }
-        fn set_lease(&self, fd: BorrowedFd, lease: Lease) -> io::Result<()> {
-            RealFs.set_lease(fd, lease)
-        }
-        fn lease(&self, fd: BorrowedFd) -> io::Result<Lease> {
-            RealFs.lease(fd)
-        }
-    }
-
-    /// If the source's directory cannot be fsynced once the source is
-    /// retired, the move fails with the source back in place, not left in the
-    /// staging directory where a blocked opener would write into it unseen.
-    #[test]
-    fn failed_fsync_after_retiring_the_source_puts_it_back() {
-        let cache = tempfile::tempdir_in("/dev/shm").unwrap();
-        let backing = tempfile::tempdir().unwrap();
-        std::fs::create_dir(cache.path().join("dir")).unwrap();
-        std::fs::write(cache.path().join("dir/file.bin"), b"content").unwrap();
-        let meta = std::fs::metadata(cache.path().join("dir")).unwrap();
-        let fs = FailingDirFsync {
-            dir: (meta.dev(), meta.ino()),
-        };
-        let cache_branch = Branch::open(cache.path()).unwrap();
-        let backing_branch = Branch::open(backing.path()).unwrap();
-        let guard = Guard {
-            lease: Lease::Read,
-            minimum_age: Duration::ZERO,
-        };
-        let rel = Path::new("dir/file.bin");
-
-        let mut mover = Mover::new(&fs, &cache_branch, &backing_branch, &guard);
-        mover.start(rel);
-        mover.finish();
-        let finished = mover.finished();
-
-        assert_eq!(finished.len(), 1);
-        let err = finished[0].1.as_ref().err().expect("the move failed");
-        assert!(
-            format!("{err:#}").contains("fsync source directory"),
-            "{err:#}"
-        );
-        assert_eq!(
-            std::fs::read(cache.path().join("dir/file.bin")).unwrap(),
-            b"content"
-        );
-        assert!(!cache.path().join(STAGING).join(rel).exists());
-    }
 }

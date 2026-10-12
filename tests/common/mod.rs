@@ -182,6 +182,20 @@ impl Fixture {
         )
     }
 
+    /// A cache pool over this fixture's branches, or `None` (with a note on
+    /// stderr) if mergerfs or passwordless sudo is unavailable outside the
+    /// privileged tier.
+    pub fn cache_pool(&self) -> Option<CachePool> {
+        match CachePool::mount(self.cache_branch.path(), self.backing_branch.path()) {
+            Ok(pool) => Some(pool),
+            Err(e) if !privileged() => {
+                eprintln!("skipped: no cache pool: {e}");
+                None
+            }
+            Err(e) => panic!("no cache pool: {e}"),
+        }
+    }
+
     /// Runs `cachy run --config <file>` with the given config file content.
     pub fn run(&self, config: &str) -> Output {
         let path = self.scratch.path().join("cachy.yml");
@@ -196,6 +210,74 @@ impl Fixture {
         walk(root, root, &mut out);
         out.sort();
         out
+    }
+}
+
+/// A mergerfs cache pool with the cache branch first and
+/// `category.create=ff`, so new files land on the cache branch. mergerfs's
+/// default `minfreespace` (4G) would fail every create on small test
+/// filesystems with ENOSPC, so the pool sets 1M.
+///
+/// Like a production pool, it is mounted by root (through passwordless sudo)
+/// with `allow_other`; it is unmounted on drop.
+pub struct CachePool {
+    mountpoint: TempDir,
+}
+
+impl CachePool {
+    fn mount(cache_branch: &Path, backing_branch: &Path) -> Result<CachePool, String> {
+        let mountpoint = tempfile::Builder::new()
+            .prefix("cachy-pool-")
+            .tempdir()
+            .map_err(|e| e.to_string())?;
+        let branches = format!("{}:{}", cache_branch.display(), backing_branch.display());
+        sudo(&[
+            "mergerfs".as_ref(),
+            "-o".as_ref(),
+            "category.create=ff,minfreespace=1M,allow_other,fsname=cachy-test-pool".as_ref(),
+            branches.as_ref(),
+            mountpoint.path().as_os_str(),
+        ])?;
+        Ok(CachePool { mountpoint })
+    }
+
+    /// The path of `rel` as applications see it, through the pool.
+    pub fn path(&self, rel: &str) -> PathBuf {
+        self.mountpoint.path().join(rel)
+    }
+
+    /// Creates a file through the pool with the given content and mtime
+    /// (seconds since the epoch).
+    pub fn file(&self, rel: &str, content: &[u8], mtime: i64) {
+        write_file(&self.path(rel), content, mtime);
+    }
+}
+
+impl Drop for CachePool {
+    fn drop(&mut self) {
+        if let Err(e) = sudo(&["umount".as_ref(), self.mountpoint.path().as_os_str()]) {
+            // Leave the mountpoint behind rather than delete through the pool.
+            eprintln!("cannot unmount the cache pool: {e}");
+            self.mountpoint.disable_cleanup(true);
+        }
+    }
+}
+
+/// Runs a command as root through passwordless sudo.
+fn sudo(args: &[&std::ffi::OsStr]) -> Result<(), String> {
+    let out = Command::new("sudo")
+        .arg("-n")
+        .args(args)
+        .output()
+        .map_err(|e| format!("sudo: {e}"))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "sudo {}: {}",
+            args[0].display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ))
     }
 }
 

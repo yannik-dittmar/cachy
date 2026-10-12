@@ -20,3 +20,34 @@ jobs:
       # Integration tests put the cache branch on /dev/shm (tmpfs) and the
       # backing branch on the runner's temp directory.
       - run: cargo test --locked
+
+  # The same integration tests on every pair of tmpfs, ext4 and ZFS (as cache
+  # branch and as backing branch), plus mergerfs cache pools. Hosted runners
+  # allow passwordless sudo, the zfs module, loop devices and /dev/fuse; see
+  # docs/research/mergerfs-and-openzfs-semantics.md §3.
+  privileged:
+    name: privileged tests (tmpfs, ext4, ZFS, mergerfs)
+    # The mergerfs package below is built for this release.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      # The apt mergerfs is outdated, so install a pinned release.
+      MERGERFS_VERSION: 2.42.0
+      MERGERFS_SHA256: 7161ac65fb12cda88832a32226451d2dd83d1f56b84f3ed18f3e303233bc7760
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup update stable && rustup default stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install ZFS and mergerfs
+        run: |
+          deb=$RUNNER_TEMP/mergerfs.deb
+          curl -fsSL -o "$deb" "https://github.com/trapexit/mergerfs/releases/download/$MERGERFS_VERSION/mergerfs_$MERGERFS_VERSION.ubuntu-noble_amd64.deb"
+          echo "$MERGERFS_SHA256  $deb" | sha256sum --check
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq zfsutils-linux "$deb"
+          sudo modprobe zfs
+          zfs version
+          mergerfs --version
+      - run: ci/setup-test-filesystems.sh "$RUNNER_TEMP/cachy-fs"
+      - run: cargo test --locked --no-run
+      - run: ci/test-filesystem-pairs.sh "$RUNNER_TEMP/cachy-fs" --locked

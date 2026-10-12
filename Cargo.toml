@@ -7,6 +7,11 @@ license = "GPL-3.0-or-later"
 repository = "https://github.com/yannik-dittmar/cachy"
 publish = false
 
+[features]
+# Test-only: lets the CACHY_FAULT environment variable inject a syscall error
+# or a crash at any filesystem operation. See src/fault.rs.
+fault-injection = []
+
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }

@@ -34,7 +34,7 @@ const BACKING_BRANCH_FS: &str = "CACHY_TEST_BACKING_BRANCH_FS";
 const PRIVILEGED: &str = "CACHY_TEST_PRIVILEGED";
 
 /// The staging directory at the root of each branch.
-const STAGING: &str = ".cachy-staging";
+pub const STAGING: &str = ".cachy-staging";
 
 /// A filesystem kind, recognised by its `statfs` magic number.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -182,6 +182,18 @@ impl Fixture {
         write_file(&self.on_backing_branch(rel), content, mtime);
     }
 
+    /// Creates a file where a move of `rel` keeps the retired source, as if
+    /// cachy had crashed while retiring it.
+    pub fn staged_cache_branch_file(&self, rel: &str, content: &[u8], mtime: i64) {
+        write_file(&self.staged_on_cache_branch(rel), content, mtime);
+    }
+
+    /// Creates a file where a move of `rel` writes its copy, as if cachy had
+    /// crashed while copying it.
+    pub fn staged_backing_branch_file(&self, rel: &str, content: &[u8], mtime: i64) {
+        write_file(&self.staged_on_backing_branch(rel), content, mtime);
+    }
+
     /// Free space of the cache branch as cachy measures it. The filesystem is
     /// synced first: ZFS reports writes and frees only once their transaction
     /// group has synced, so without it a later sync could change free space
@@ -201,6 +213,17 @@ impl Fixture {
             self.cache_branch.path().display(),
             self.backing_branch.path().display(),
         )
+    }
+
+    /// A config whose threshold and target lie far above any test
+    /// filesystem's free space, so a run moves every eligible move unit.
+    pub fn move_everything_config(&self) -> String {
+        self.config("1T", "2T")
+    }
+
+    /// A config under which the check finds no work, so cachy only recovers.
+    pub fn no_work_config(&self) -> String {
+        self.config("0", "1")
     }
 
     /// A cache pool over this fixture's branches, or `None` (with a note on
@@ -227,14 +250,20 @@ impl Fixture {
     /// Starts `cachy run --config <file>` without waiting for it, so a test
     /// can act on the branches while the run is in progress.
     pub fn spawn(&self, config: &str) -> Child {
+        self.command(config).spawn().expect("spawn cachy")
+    }
+
+    /// `cachy run --config <file>` with the given config file content, for a
+    /// test to adjust before running it.
+    pub fn command(&self, config: &str) -> Command {
         let path = self.scratch.path().join("cachy.yml");
         fs::write(&path, config).unwrap();
-        Command::new(env!("CARGO_BIN_EXE_cachy"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_cachy"));
+        command
             .args(["run", "--config", path.to_str().unwrap()])
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn cachy")
+            .stderr(Stdio::piped());
+        command
     }
 
     /// Relative paths of all entries (files and directories) under a branch,

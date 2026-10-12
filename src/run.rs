@@ -8,12 +8,15 @@ use anyhow::{Context, Result};
 
 use crate::config::{Config, LeaseType};
 use crate::fsops::{FsOps, Lease};
+use crate::recovery::recover;
 use crate::scan::scan;
 use crate::transaction::{Branch, Guard, MoveOutcome, Mover, STAGING};
 
 pub struct Outcome {
     /// Number of moves that were attempted and failed.
     pub failed: usize,
+    /// Number of staging-directory leftovers that recovery could not resolve.
+    pub unresolved: usize,
     /// The run stopped early on an error outside any move.
     pub stopped: bool,
 }
@@ -21,35 +24,19 @@ pub struct Outcome {
 impl Outcome {
     /// Every attempted move succeeded and the run was not cut short.
     pub fn succeeded(&self) -> bool {
-        self.failed == 0 && !self.stopped
+        self.failed == 0 && self.unresolved == 0 && !self.stopped
     }
 }
 
-/// Performs a check and, if free space is below the threshold, a run. An
-/// error means cachy refused to run; once moving has started, errors are
-/// reported in the outcome instead.
+/// Recovers from unfinished moves, then performs a check and, if free space
+/// is below the threshold, a run. An error means cachy refused to run; once
+/// recovery has started, errors are reported in the outcome instead.
 pub fn run(fs: &dyn FsOps, config: &Config) -> Result<Outcome> {
     let cache_branch = Branch::open(&config.cache_branch)
         .with_context(|| format!("cannot open cache branch {}", config.cache_branch.display()))?;
     let backing_root = &config.backing_branches[0];
     let backing_branch = Branch::open(backing_root)
         .with_context(|| format!("cannot open backing branch {}", backing_root.display()))?;
-
-    let mut free = free_space(fs, &cache_branch)?;
-    if free >= config.threshold {
-        eprintln!(
-            "cachy: free space {free} bytes is at or above the threshold {} bytes; nothing to do",
-            config.threshold
-        );
-        return Ok(Outcome {
-            failed: 0,
-            stopped: false,
-        });
-    }
-    eprintln!(
-        "cachy: free space {free} bytes is below the threshold {} bytes; moving until {} bytes are free",
-        config.threshold, config.target
-    );
 
     ignore_lease_break_signal();
     let guard = Guard {
@@ -59,6 +46,34 @@ pub fn run(fs: &dyn FsOps, config: &Config) -> Result<Outcome> {
         },
         minimum_age: config.minimum_age,
     };
+    let unresolved = recover(fs, &cache_branch, &backing_branch, guard.lease);
+    let mut free = match free_space(fs, &cache_branch) {
+        Ok(free) => free,
+        Err(e) => {
+            eprintln!("cachy: error: run stopped: {e:#}");
+            return Ok(Outcome {
+                failed: 0,
+                unresolved,
+                stopped: true,
+            });
+        }
+    };
+    if free >= config.threshold {
+        eprintln!(
+            "cachy: free space {free} bytes is at or above the threshold {} bytes; nothing to do",
+            config.threshold
+        );
+        return Ok(Outcome {
+            failed: 0,
+            unresolved,
+            stopped: false,
+        });
+    }
+    eprintln!(
+        "cachy: free space {free} bytes is below the threshold {} bytes; moving until {} bytes are free",
+        config.threshold, config.target
+    );
+
     let units = scan(&cache_branch.path)
         .with_context(|| format!("cannot scan cache branch {}", cache_branch.path.display()))?;
     let mut tally = Tally::default();
@@ -102,7 +117,11 @@ pub fn run(fs: &dyn FsOps, config: &Config) -> Result<Outcome> {
         failed,
     } = tally;
     eprintln!("cachy: run finished: {moved} moved, {skipped} skipped, {failed} failed");
-    Ok(Outcome { failed, stopped })
+    Ok(Outcome {
+        failed,
+        unresolved,
+        stopped,
+    })
 }
 
 /// Counts finished moves by outcome, logging skips and failures.

@@ -17,10 +17,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo clippy --all-targets --all-features --locked -- -D warnings
       # Integration tests put the cache branch on /dev/shm (tmpfs) and the
       # backing branch on the runner's temp directory. Output is shown so that
-      # skipped tests are visible.
+      # skipped tests are visible. The normal build checks that fault injection
+      # is absent; the fault-injection build runs the crash tests.
       - run: cargo test --locked -- --show-output
+      - run: cargo test --locked --features fault-injection -- --show-output
 
   # The same integration tests on every pair of tmpfs, ext4 and ZFS (as cache
   # branch and as backing branch), plus mergerfs cache pools. Hosted runners
@@ -50,5 +53,5 @@ jobs:
           zfs version
           mergerfs --version
       - run: ci/setup-test-filesystems.sh "$RUNNER_TEMP/cachy-fs"
-      - run: cargo test --locked --no-run
-      - run: ci/test-filesystem-pairs.sh "$RUNNER_TEMP/cachy-fs" --locked
+      - run: cargo test --locked --features fault-injection --no-run
+      - run: ci/test-filesystem-pairs.sh "$RUNNER_TEMP/cachy-fs" --locked --features fault-injection

@@ -15,7 +15,7 @@ use run::run;
 
 /// Exit code when cachy refused to run.
 const EXIT_REFUSED: u8 = 1;
-/// Exit code when a run finished but at least one move failed.
+/// Exit code when at least one move failed, or the run stopped early.
 const EXIT_MOVE_FAILED: u8 = 2;
 
 #[derive(Parser)]
@@ -50,8 +50,8 @@ fn main() -> ExitCode {
     };
     match cli.command {
         Command::Run { config } => match Config::load(&config).and_then(|c| run(&RealFs, &c)) {
-            Ok(outcome) if outcome.failed > 0 => ExitCode::from(EXIT_MOVE_FAILED),
-            Ok(_) => ExitCode::SUCCESS,
+            Ok(outcome) if outcome.succeeded() => ExitCode::SUCCESS,
+            Ok(_) => ExitCode::from(EXIT_MOVE_FAILED),
             Err(e) => {
                 eprintln!("cachy: error: {e:#}");
                 ExitCode::from(EXIT_REFUSED)

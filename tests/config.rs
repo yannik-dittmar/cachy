@@ -77,7 +77,7 @@ fn empty_backing_branches_are_refused() {
     let fx = Fixture::new();
     let config = format!(
         "cache_branch: {}\nbacking_branches: []\nthreshold: 1G\ntarget: 2G\n",
-        fx.cache.path().display()
+        fx.cache_branch.path().display()
     );
 
     let err = assert_exit(&fx.run(&config), 1);
@@ -96,7 +96,7 @@ fn missing_config_file_is_refused() {
 fn missing_backing_branch_is_refused() {
     let fx = Fixture::new();
     let config = fx.config("1G", "2G").replace(
-        &fx.backing.path().display().to_string(),
+        &fx.backing_branch.path().display().to_string(),
         "/nonexistent/backing",
     );
 

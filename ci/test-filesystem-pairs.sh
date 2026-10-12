@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Runs the integration tests once per pair of cache-branch and backing-branch
 # filesystems, on the filesystems that ci/setup-test-filesystems.sh prepared
-# below <dir>. Every filesystem takes both roles; ZFS to ZFS goes from one pool
-# to the other. Extra arguments are passed to `cargo test`.
+# below <dir>. Every filesystem takes both roles; ZFS to ZFS goes from one zpool
+# to the other. Extra arguments are passed to `cargo test`; test output is shown
+# so that skipped tests are visible.
 #
 # Usage: ci/test-filesystem-pairs.sh <dir> [cargo test args...]
 set -uo pipefail
@@ -17,12 +18,12 @@ pairs=(tmpfs:ext4 tmpfs:zfs ext4:tmpfs ext4:zfs zfs:tmpfs zfs:ext4 zfs:zfs)
 export CACHY_TEST_PRIVILEGED=1
 failed=()
 for pair in "${pairs[@]}"; do
-  cache=${pair%:*} backing=${pair#*:}
-  echo "::group::cache branch on $cache, backing branch on $backing"
-  if ! CACHY_TEST_CACHE_BRANCH_FS="$cache:${cache_dir[$cache]}" \
-    CACHY_TEST_BACKING_BRANCH_FS="$backing:${backing_dir[$backing]}" \
-    cargo test "$@"; then
-    failed+=("$cache -> $backing")
+  cache_fs=${pair%:*} backing_fs=${pair#*:}
+  echo "::group::cache branch on $cache_fs, backing branch on $backing_fs"
+  if ! CACHY_TEST_CACHE_BRANCH_FS="$cache_fs:${cache_dir[$cache_fs]}" \
+    CACHY_TEST_BACKING_BRANCH_FS="$backing_fs:${backing_dir[$backing_fs]}" \
+    cargo test "$@" -- --show-output; then
+    failed+=("$cache_fs -> $backing_fs")
   fi
   echo "::endgroup::"
 done

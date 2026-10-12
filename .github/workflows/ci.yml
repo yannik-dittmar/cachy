@@ -18,8 +18,9 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --locked -- -D warnings
       # Integration tests put the cache branch on /dev/shm (tmpfs) and the
-      # backing branch on the runner's temp directory.
-      - run: cargo test --locked
+      # backing branch on the runner's temp directory. Output is shown so that
+      # skipped tests are visible.
+      - run: cargo test --locked -- --show-output
 
   # The same integration tests on every pair of tmpfs, ext4 and ZFS (as cache
   # branch and as backing branch), plus mergerfs cache pools. Hosted runners

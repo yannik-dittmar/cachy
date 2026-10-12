@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Prepares the filesystems of the privileged test tier below <dir>:
-#   zfs-cache/, zfs-backing/  two ZFS pools on loop files, so a cache branch and
-#                             a backing branch can both be ZFS (as two pools)
+#   zfs-cache/, zfs-backing/  two zpools on loop files, so a cache branch and a
+#                             backing branch can both be ZFS (on two zpools)
 #   ext4/                     an ext4 loop mount
 # tmpfs comes from /dev/shm. Each mount is owned by the invoking user, who runs
 # the tests. Needs passwordless sudo, ZFS userland and the zfs kernel module.

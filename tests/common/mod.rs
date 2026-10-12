@@ -18,6 +18,7 @@
 
 #![allow(dead_code)]
 
+use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -32,31 +33,31 @@ const PRIVILEGED: &str = "CACHY_TEST_PRIVILEGED";
 
 /// A filesystem kind, recognised by its `statfs` magic number.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Fs {
+pub enum FsKind {
     Tmpfs,
     Ext4,
     Zfs,
     Other,
 }
 
-impl Fs {
-    fn of(path: &Path) -> Fs {
+impl FsKind {
+    fn of(path: &Path) -> FsKind {
         let magic = rustix::fs::statfs(path)
             .unwrap_or_else(|e| panic!("statfs {}: {e}", path.display()))
             .f_type as i64;
         match magic {
-            0x0102_1994 => Fs::Tmpfs,
-            0xEF53 => Fs::Ext4,
-            0x2FC1_2FC1 => Fs::Zfs,
-            _ => Fs::Other,
+            0x0102_1994 => FsKind::Tmpfs,
+            0xEF53 => FsKind::Ext4,
+            0x2FC1_2FC1 => FsKind::Zfs,
+            _ => FsKind::Other,
         }
     }
 
-    fn parse(kind: &str) -> Fs {
+    fn parse(kind: &str) -> FsKind {
         match kind {
-            "tmpfs" => Fs::Tmpfs,
-            "ext4" => Fs::Ext4,
-            "zfs" => Fs::Zfs,
+            "tmpfs" => FsKind::Tmpfs,
+            "ext4" => FsKind::Ext4,
+            "zfs" => FsKind::Zfs,
             _ => panic!("unknown filesystem kind `{kind}`: expected tmpfs, ext4 or zfs"),
         }
     }
@@ -64,13 +65,13 @@ impl Fs {
 
 /// Where a fixture creates branches of one role: a directory and, if the
 /// environment names one, the filesystem kind it must be on.
-fn branch_location(var: &str, default: Option<(Fs, &str)>) -> (Option<Fs>, PathBuf) {
+fn branch_location(var: &str, default: Option<(FsKind, &str)>) -> (Option<FsKind>, PathBuf) {
     match std::env::var(var) {
         Ok(value) => {
             let (kind, dir) = value
                 .split_once(':')
                 .unwrap_or_else(|| panic!("{var}=`{value}`: expected <kind>:<dir>"));
-            (Some(Fs::parse(kind)), PathBuf::from(dir))
+            (Some(FsKind::parse(kind)), PathBuf::from(dir))
         }
         Err(_) => match default {
             Some((fs, dir)) => (Some(fs), PathBuf::from(dir)),
@@ -79,13 +80,13 @@ fn branch_location(var: &str, default: Option<(Fs, &str)>) -> (Option<Fs>, PathB
     }
 }
 
-fn branch_dir(var: &str, default: Option<(Fs, &str)>, prefix: &str) -> (TempDir, Fs) {
+fn create_branch(var: &str, default: Option<(FsKind, &str)>, prefix: &str) -> (TempDir, FsKind) {
     let (expected, dir) = branch_location(var, default);
     let branch = tempfile::Builder::new()
         .prefix(prefix)
         .tempdir_in(&dir)
         .unwrap_or_else(|e| panic!("create a branch in {}: {e}", dir.display()));
-    let fs = Fs::of(branch.path());
+    let fs = FsKind::of(branch.path());
     if let Some(expected) = expected {
         assert_eq!(fs, expected, "{} is not on {expected:?}", dir.display());
     }
@@ -94,6 +95,12 @@ fn branch_dir(var: &str, default: Option<(Fs, &str)>, prefix: &str) -> (TempDir,
 
 fn privileged() -> bool {
     std::env::var_os(PRIVILEGED).is_some_and(|v| v == "1")
+}
+
+/// Notes on stderr that the calling test is skipping its checks; the test
+/// then returns early. CI shows the note (`--show-output`).
+pub fn skip(reason: &str) {
+    eprintln!("skipped: {reason}");
 }
 
 /// Tests that set thresholds from measured free space share the cache
@@ -107,20 +114,20 @@ pub fn free_space_lock() -> MutexGuard<'static, ()> {
 pub struct Fixture {
     pub cache_branch: TempDir,
     pub backing_branch: TempDir,
-    cache_branch_fs: Fs,
-    backing_branch_fs: Fs,
+    pub cache_branch_fs: FsKind,
+    pub backing_branch_fs: FsKind,
     scratch: TempDir,
 }
 
 impl Fixture {
     pub fn new() -> Self {
-        let (cache_branch, cache_branch_fs) = branch_dir(
+        let (cache_branch, cache_branch_fs) = create_branch(
             CACHE_BRANCH_FS,
-            Some((Fs::Tmpfs, "/dev/shm")),
+            Some((FsKind::Tmpfs, "/dev/shm")),
             "cachy-cache-",
         );
         let (backing_branch, backing_branch_fs) =
-            branch_dir(BACKING_BRANCH_FS, None, "cachy-backing-");
+            create_branch(BACKING_BRANCH_FS, None, "cachy-backing-");
         assert_ne!(
             device(cache_branch.path()),
             device(backing_branch.path()),
@@ -134,14 +141,6 @@ impl Fixture {
             backing_branch_fs,
             scratch,
         }
-    }
-
-    pub fn cache_branch_fs(&self) -> Fs {
-        self.cache_branch_fs
-    }
-
-    pub fn backing_branch_fs(&self) -> Fs {
-        self.backing_branch_fs
     }
 
     pub fn on_cache_branch(&self, rel: &str) -> PathBuf {
@@ -189,7 +188,7 @@ impl Fixture {
         match CachePool::mount(self.cache_branch.path(), self.backing_branch.path()) {
             Ok(pool) => Some(pool),
             Err(e) if !privileged() => {
-                eprintln!("skipped: no cache pool: {e}");
+                skip(&format!("no cache pool: {e}"));
                 None
             }
             Err(e) => panic!("no cache pool: {e}"),
@@ -216,9 +215,9 @@ impl Fixture {
 /// A mergerfs cache pool with the cache branch first and
 /// `category.create=ff`, so new files land on the cache branch. mergerfs's
 /// default `minfreespace` (4G) would fail every create on small test
-/// filesystems with ENOSPC, so the pool sets 1M.
+/// filesystems with ENOSPC, so the cache pool sets 1M.
 ///
-/// Like a production pool, it is mounted by root (through passwordless sudo)
+/// Like a production cache pool, it is mounted by root (through passwordless sudo)
 /// with `allow_other`; it is unmounted on drop.
 pub struct CachePool {
     mountpoint: TempDir,
@@ -232,21 +231,21 @@ impl CachePool {
             .map_err(|e| e.to_string())?;
         let branches = format!("{}:{}", cache_branch.display(), backing_branch.display());
         sudo(&[
-            "mergerfs".as_ref(),
-            "-o".as_ref(),
-            "category.create=ff,minfreespace=1M,allow_other,fsname=cachy-test-pool".as_ref(),
-            branches.as_ref(),
+            OsStr::new("mergerfs"),
+            OsStr::new("-o"),
+            OsStr::new("category.create=ff,minfreespace=1M,allow_other,fsname=cachy-test-pool"),
+            OsStr::new(&branches),
             mountpoint.path().as_os_str(),
         ])?;
         Ok(CachePool { mountpoint })
     }
 
-    /// The path of `rel` as applications see it, through the pool.
+    /// The path of `rel` as applications see it, through the cache pool.
     pub fn path(&self, rel: &str) -> PathBuf {
         self.mountpoint.path().join(rel)
     }
 
-    /// Creates a file through the pool with the given content and mtime
+    /// Creates a file through the cache pool with the given content and mtime
     /// (seconds since the epoch).
     pub fn file(&self, rel: &str, content: &[u8], mtime: i64) {
         write_file(&self.path(rel), content, mtime);
@@ -255,16 +254,18 @@ impl CachePool {
 
 impl Drop for CachePool {
     fn drop(&mut self) {
-        if let Err(e) = sudo(&["umount".as_ref(), self.mountpoint.path().as_os_str()]) {
-            // Leave the mountpoint behind rather than delete through the pool.
+        if let Err(e) = sudo(&[OsStr::new("umount"), self.mountpoint.path().as_os_str()]) {
+            // Leave the mountpoint behind rather than delete through the cache
+            // pool.
             eprintln!("cannot unmount the cache pool: {e}");
             self.mountpoint.disable_cleanup(true);
         }
     }
 }
 
-/// Runs a command as root through passwordless sudo.
-fn sudo(args: &[&std::ffi::OsStr]) -> Result<(), String> {
+/// Runs a command as root through passwordless sudo, which the privileged tier
+/// has.
+pub fn sudo(args: &[&OsStr]) -> Result<(), String> {
     let out = Command::new("sudo")
         .arg("-n")
         .args(args)
@@ -279,6 +280,18 @@ fn sudo(args: &[&std::ffi::OsStr]) -> Result<(), String> {
             String::from_utf8_lossy(&out.stderr).trim()
         ))
     }
+}
+
+/// The ZFS dataset that holds `path`, for commands such as
+/// `sudo zfs snapshot <dataset>@<name>`.
+pub fn zfs_dataset(path: &Path) -> String {
+    let out = Command::new("findmnt")
+        .args(["--noheadings", "--output", "SOURCE", "--target"])
+        .arg(path)
+        .output()
+        .expect("spawn findmnt");
+    assert!(out.status.success(), "findmnt {}", path.display());
+    String::from_utf8(out.stdout).unwrap().trim().to_owned()
 }
 
 pub fn cachy(args: &[&str]) -> Output {

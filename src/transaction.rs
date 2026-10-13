@@ -9,11 +9,13 @@
 //! A writer that opens the source in between is not stopped, so a move
 //! catches it only at the next scan, by its open or by the change to the
 //! source; one that opens the source after the last scan, through a lookup
-//! from before the retire, writes to a deleted file. A hardlink group moves as one inode: it is
-//! copied once, published under its first name and linked under the others,
-//! and all its names are retired together under the one lease, which any
-//! open through any name breaks. A symlink cannot be opened, so it is never
-//! in use; it is recreated with its link text verbatim.
+//! from before the retire, writes to a deleted file.
+//!
+//! A hardlink group moves as one inode: it is copied once, published under
+//! its first name and linked under the others, and all its names are retired
+//! together, under the one lease if the guard takes one, which any open
+//! through any name breaks. A symlink cannot be opened, so it is never in
+//! use; it is recreated with its link text verbatim.
 //!
 //! Each staging directory mirrors relpaths (`<root>/.cachy-staging/<relpath>`),
 //! so anything left in it after a crash names the move it belongs to.
@@ -165,8 +167,8 @@ impl fmt::Display for Hash {
 /// Why a move unit was skipped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Skip {
-    /// Another process had it open in a way that conflicts with the lease, or
-    /// opened it so during the move.
+    /// The in-use guard found another process with it open so that it is in
+    /// use, before or during the move.
     InUse,
     /// It was changed, replaced or renamed during the move.
     Changed,
@@ -205,14 +207,15 @@ pub struct Copying {
 
 /// What keeps a move away from move units that are in use.
 pub struct Guard {
-    pub in_use: InUse,
+    /// How a move tells that its move unit is in use.
+    pub in_use: InUseGuard,
     /// Move units that changed more recently than this are never moved.
     pub minimum_age: Duration,
 }
 
 /// How a move tells that its move unit is in use.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum InUse {
+pub enum InUseGuard {
     /// By a lease held on the source for the whole move: any open that
     /// conflicts with it, before or during the move, makes the move unit in
     /// use.
@@ -223,6 +226,16 @@ pub enum InUse {
     Proc { writers_only: bool },
     /// Never: nothing guards move units in use.
     Off,
+}
+
+impl InUseGuard {
+    /// The lease the guard takes, if it takes one.
+    pub fn lease(self) -> Option<Lease> {
+        match self {
+            InUseGuard::Lease(lease) => Some(lease),
+            InUseGuard::Proc { .. } | InUseGuard::Off => None,
+        }
+    }
 }
 
 /// Why a move stopped short: a clean skip, or a failure.
@@ -1395,7 +1408,7 @@ struct Source<'a> {
     dirs: Vec<OwnedFd>,
     /// The source, opened through its first name.
     file: OwnedFd,
-    in_use: InUse,
+    in_use: InUseGuard,
     /// The source as it was when the lease was taken (or the move started).
     identity: Identity,
     /// Its metadata then, before the copy read it and changed its atime.
@@ -1459,7 +1472,7 @@ impl<'a> Source<'a> {
         let (parent, name) = split(&rels[0]);
         let dir = open_dirs(fs, &cache_branch.fd, parent).context("open source directory")?;
         let file = fs.open_read(dir.as_fd(), name).context("open source")?;
-        if let InUse::Lease(lease) = guard.in_use {
+        if let InUseGuard::Lease(lease) = guard.in_use {
             match fs.set_lease(file.as_fd(), lease) {
                 Ok(()) => {}
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
@@ -1470,7 +1483,6 @@ impl<'a> Source<'a> {
         }
         let stat = fs.fstat(file.as_fd()).context("fstat source")?;
         let identity = Identity::of(&stat);
-        scan_for_opens(guard.in_use, &identity)?;
         if identity.is_younger_than(guard.minimum_age) {
             return Err(Abort::Skip(Skip::TooYoung));
         }
@@ -1478,6 +1490,8 @@ impl<'a> Source<'a> {
         if stat.st_nlink != rels.len() as u64 {
             return Err(Abort::Skip(Skip::Changed));
         }
+        // After the cheaper checks: it reads every process's descriptors.
+        scan_for_opens(guard.in_use, &identity)?;
         let mut dirs = vec![dir];
         for rel in &rels[1..] {
             let (parent, name) = split(rel);
@@ -1539,7 +1553,7 @@ impl<'a> Source<'a> {
     /// the lease, if the guard holds one. The opener stays blocked until the
     /// source is closed. Cheap enough to call before every chunk of a copy.
     fn check_lease(&self) -> Result<(), Abort> {
-        let InUse::Lease(held) = self.in_use else {
+        let InUseGuard::Lease(held) = self.in_use else {
             return Ok(());
         };
         let lease = self.fs.lease(self.file.as_fd()).context("query lease")?;
@@ -1559,8 +1573,8 @@ impl<'a> Source<'a> {
 
 /// Skips the move as in use if the guard scans `/proc` for opens and finds
 /// one of the source as `identity` describes it that makes it in use.
-fn scan_for_opens(in_use: InUse, identity: &Identity) -> Result<(), Abort> {
-    let InUse::Proc { writers_only } = in_use else {
+fn scan_for_opens(in_use: InUseGuard, identity: &Identity) -> Result<(), Abort> {
+    let InUseGuard::Proc { writers_only } = in_use else {
         return Ok(());
     };
     let opens = proc_scan::scan((identity.dev, identity.ino), false)

@@ -16,10 +16,9 @@
 //! A missing lease, `/proc` scan or rename refuses the run, as does a lease
 //! failure whenever the configuration has not chosen another guard. A `/proc`
 //! scan that cannot read some processes' descriptors only warns: it does not
-//! see their opens. Hole reporting that cannot be
-//! trusted only makes moves copy every byte, with a warning, as does an
-//! OpenZFS module under the cache branch with the bug that reports data as
-//! holes. A filesystem without room for the scratch files is not probed, with
+//! see their opens. Hole reporting that cannot be trusted only makes moves
+//! copy every byte, with a warning, as does an OpenZFS module under the cache
+//! branch with the bug that reports data as holes. A filesystem without room for the scratch files is not probed, with
 //! a warning: refusing would keep a full cache branch full, and a missing
 //! capability then fails each move that needs it instead.
 //!
@@ -43,7 +42,7 @@ use anyhow::{Context, Result, bail};
 use crate::fsops::{FsOps, Lease};
 use crate::layout::BackingBranch;
 use crate::proc_scan;
-use crate::transaction::{Branch, InUse, STAGING, STAGING_MODE};
+use crate::transaction::{Branch, InUseGuard, STAGING, STAGING_MODE};
 
 /// What the names of scratch files start with.
 const SCRATCH_PREFIX: &str = ".cachy-probe-";
@@ -107,7 +106,7 @@ const PROC_SCAN: Capability = Capability {
 /// cachy must refuse to run.
 pub fn probe(
     fs: &dyn FsOps,
-    in_use: InUse,
+    in_use: InUseGuard,
     cache_branch: &Branch,
     backing_branches: &[BackingBranch],
 ) -> Result<Capabilities> {
@@ -119,7 +118,7 @@ pub fn probe(
     };
     let backing_checks = Checks {
         role: "backing branch",
-        in_use: InUse::Off,
+        in_use: InUseGuard::Off,
         holes: false,
         exchange: true,
     };
@@ -149,7 +148,7 @@ pub fn probe(
                 }
                 if findings.hidden_processes > 0 {
                     eprintln!(
-                        "cachy: warning: cannot read the open descriptors of {} processes, so open_file_guard: proc moves files that only they have open; run cachy as root, or with CAP_SYS_PTRACE",
+                        "cachy: warning: cannot read the open descriptors of {} processes (not permitted, or a descriptor cannot be statted), so open_file_guard: proc moves files that only they have open; run cachy as root, or with CAP_SYS_PTRACE",
                         findings.hidden_processes
                     );
                 }
@@ -199,7 +198,7 @@ struct Checks {
     role: &'static str,
     /// Check what this in-use guard needs: take and release its lease, or
     /// scan `/proc` for opens.
-    in_use: InUse,
+    in_use: InUseGuard,
     /// Check that data after a hole shows as data.
     holes: bool,
     /// Swap two files with an exchange rename.
@@ -319,7 +318,7 @@ fn check(fs: &dyn FsOps, dir: &OwnedFd, checks: &Checks) -> Result<Findings> {
     if checks.holes {
         findings.unreliable_holes = check_holes(fs, &file)?;
     }
-    if let InUse::Proc { .. } = checks.in_use {
+    if let InUseGuard::Proc { .. } = checks.in_use {
         match check_proc_scan(fs, dir, &a, &file) {
             Ok(hidden) => findings.hidden_processes = hidden,
             Err(e) => findings.lacks(&PROC_SCAN, e)?,
@@ -328,7 +327,7 @@ fn check(fs: &dyn FsOps, dir: &OwnedFd, checks: &Checks) -> Result<Findings> {
     // A read lease conflicts with any open for writing, even cachy's own.
     drop(file);
 
-    if let InUse::Lease(lease) = checks.in_use {
+    if let InUseGuard::Lease(lease) = checks.in_use {
         let file = fs.open_read(dir.as_fd(), &a).context("open scratch file")?;
         if let Err(e) = take_and_release(fs, &file, lease) {
             let capability = match lease {

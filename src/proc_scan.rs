@@ -9,10 +9,13 @@
 //!
 //! The scan does not see:
 //!
-//! - processes whose descriptors cachy may not read: those of another user,
-//!   unless cachy runs as root or with `CAP_SYS_PTRACE`. It counts them
-//!   instead.
+//! - processes whose descriptors cachy cannot read: those of another user,
+//!   unless cachy runs as root or with `CAP_SYS_PTRACE`, and those with a
+//!   descriptor that cannot be statted, such as one on a dead FUSE mount. It
+//!   counts them instead, so that one such process does not stop every move.
 //! - processes outside cachy's PID namespace, which `/proc` does not list.
+//! - a thread that unshared its descriptor table (`unshare(CLONE_FILES)`),
+//!   whose descriptors only `/proc/<pid>/task/<tid>/fd` lists.
 //! - a shared memory mapping whose descriptor has been closed.
 //!
 //! Descriptors opened with `O_PATH` name a file without opening it for
@@ -21,7 +24,7 @@
 use std::fs;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use rustix::fs::{AtFlags, CWD, StatxFlags};
 
@@ -57,14 +60,15 @@ pub fn scan(file: (u64, u64), own: bool) -> io::Result<Opens> {
         match scan_process(&Path::new(PROC).join(pid.to_string()), file, &mut opens) {
             Ok(()) => {}
             Err(e) if gone(&e) => {}
-            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => opens.hidden += 1,
-            Err(e) => return Err(io::Error::new(e.kind(), format!("process {pid}: {e}"))),
+            Err(_) => opens.hidden += 1,
         }
     }
     Ok(opens)
 }
 
-/// Adds the opens of `file` by the process at `/proc/<pid>` to `opens`.
+/// Adds the opens of `file` by the process at `/proc/<pid>` to `opens`. A
+/// descriptor of the file whose fdinfo cannot be understood counts as open
+/// for writing.
 fn scan_process(process: &Path, file: (u64, u64), opens: &mut Opens) -> io::Result<()> {
     for entry in fs::read_dir(process.join("fd"))? {
         let fd = entry?.file_name();
@@ -80,23 +84,18 @@ fn scan_process(process: &Path, file: (u64, u64), opens: &mut Opens) -> io::Resu
             Err(e) => return Err(e),
         };
         match access(&info, file.1) {
-            Some(Access::Write) => opens.writing = true,
+            Some(Access::Write) | None => opens.writing = true,
             Some(Access::Read) => opens.reading = true,
             Some(Access::None) => {}
-            None => {
-                return Err(io::Error::other(format!(
-                    "unrecognised {}",
-                    PathBuf::from("fdinfo").join(&fd).display()
-                )));
-            }
         }
     }
     Ok(())
 }
 
 /// The device and inode of the file that the descriptor link `link` names,
-/// or `None` if the descriptor has been closed. Asks the filesystem nothing,
-/// so a file on an unreachable network filesystem cannot hang the scan.
+/// or `None` if the descriptor has been closed. Takes the attributes the
+/// kernel has cached (`AT_STATX_DONT_SYNC`) rather than ask a network
+/// filesystem's server for fresh ones.
 fn identity(link: &Path) -> io::Result<Option<(u64, u64)>> {
     match rustix::fs::statx(CWD, link, AtFlags::STATX_DONT_SYNC, StatxFlags::INO) {
         Ok(stat) => Ok(Some((

@@ -56,7 +56,7 @@ One transaction that relocates a single move unit from the cache branch to one b
 _Avoid_: copy, transfer, migration
 
 **In use**:
-A move unit is in use while any process has it open for writing (or open at all, if the user configured a write lease); in-use move units are never moved, and a move unit that becomes in use mid-move aborts that move.
+A move unit is in use while any process has it open for writing (or open at all, if the user configured a write lease); the in-use guard keeps in-use move units from being moved, and aborts the move of one that becomes in use mid-move.
 _Avoid_: busy, locked, open (by default, a file open only for reading is not in use)
 
 **In-use guard**:

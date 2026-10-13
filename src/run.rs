@@ -19,8 +19,8 @@ use crate::probe::probe;
 use crate::recovery::recover;
 use crate::scan::{Entry, Kind, scan};
 use crate::transaction::{
-    Branch, Copying, Fate, Guard, InUse, MoveOutcome, Moved, Mover, RETIRING_POLL, STAGING, Skip,
-    would_skip,
+    Branch, Copying, Fate, Guard, InUseGuard, MoveOutcome, Moved, Mover, RETIRING_POLL, STAGING,
+    Skip, would_skip,
 };
 
 pub struct Outcome {
@@ -127,11 +127,13 @@ pub fn run(
         warn_of_leftovers(&cache_branch, &backing_branches);
         0
     } else {
-        let lease = match guard.in_use {
-            InUse::Lease(lease) => Some(lease),
-            InUse::Proc { .. } | InUse::Off => None,
-        };
-        recover(fs, &cache_branch, &backing_branches, lease, allowed_losses)
+        recover(
+            fs,
+            &cache_branch,
+            &backing_branches,
+            guard.in_use.lease(),
+            allowed_losses,
+        )
     };
     let mut outcome = Outcome {
         failed: 0,
@@ -302,20 +304,20 @@ pub fn run(
 
 /// How moves tell that a move unit is in use, as the configuration sets it.
 /// Warns on every run without a guard.
-fn in_use(config: &Config) -> InUse {
+fn in_use(config: &Config) -> InUseGuard {
     let writers_only = match config.lease_type {
         LeaseType::Read => true,
         LeaseType::Write => false,
     };
     match config.open_file_guard {
-        OpenFileGuard::Lease if writers_only => InUse::Lease(Lease::Read),
-        OpenFileGuard::Lease => InUse::Lease(Lease::Write),
-        OpenFileGuard::Proc => InUse::Proc { writers_only },
+        OpenFileGuard::Lease if writers_only => InUseGuard::Lease(Lease::Read),
+        OpenFileGuard::Lease => InUseGuard::Lease(Lease::Write),
+        OpenFileGuard::Proc => InUseGuard::Proc { writers_only },
         OpenFileGuard::Off => {
             eprintln!(
                 "cachy: warning: open_file_guard is off: NOTHING GUARDS FILES IN USE; files are moved while applications have them open, and a write to one during its move can be lost"
             );
-            InUse::Off
+            InUseGuard::Off
         }
     }
 }

@@ -460,7 +460,9 @@ impl<'a> Mover<'a> {
             Ok((published, hash))
         });
         drop(temp);
-        if published.is_err() {
+        if let Err(abort) = &published
+            && staged_is_own(abort)
+        {
             let _ = fs.unlink(staged_parent.as_fd(), name);
         }
         remove_empty_dirs(fs, &backing_staging, parent);
@@ -561,8 +563,10 @@ impl<'a> Mover<'a> {
             .link(first.dir.as_fd(), first.name, staged_parent.as_fd(), name)
             .with_context(|| format!("publish {}", rel.display()))
             .and_then(|()| replace(fs, &staged_parent, dest_parent, name, stale));
-        if replaced.is_err() {
-            let _ = fs.unlink(staged_parent.as_fd(), name);
+        if let Err(e) = &replaced {
+            if e.downcast_ref::<Unswapped>().is_none() {
+                let _ = fs.unlink(staged_parent.as_fd(), name);
+            }
             unpublish_inode(fs, dest_parent, name, &published.identity);
             published.refresh(fs);
         }
@@ -612,7 +616,9 @@ impl<'a> Mover<'a> {
                     here,
                 )?)
             });
-        if published.is_err() {
+        if let Err(abort) = &published
+            && staged_is_own(abort)
+        {
             let _ = fs.unlink(staged_parent.as_fd(), name);
         }
         remove_empty_dirs(fs, &backing_staging, parent);
@@ -948,17 +954,7 @@ fn publish<'a>(
 ) -> Result<Published<'a>> {
     let placed = match stale {
         Some(stale) => replace(fs, staged_parent, &dest_parent, name, stale),
-        None => fs
-            .rename_noreplace(staged_parent.as_fd(), name, dest_parent.as_fd(), name)
-            .context("publish")
-            .and_then(|()| {
-                fs.fsync(dest_parent.as_fd())
-                    .context("fsync destination directory")
-            })
-            .and_then(|()| {
-                fs.fsync(staged_parent.as_fd())
-                    .context("fsync staging directory on the backing branch")
-            }),
+        None => rename_into_place(fs, staged_parent, &dest_parent, name),
     };
     // After the rename, which may have changed the copy's ctime.
     let identity = placed.and_then(|()| {
@@ -980,8 +976,10 @@ fn publish<'a>(
 /// came out is not the stale copy as found, it is swapped back in and the
 /// move fails: a move overwrites nothing but a stale copy it has inspected.
 ///
-/// Until the stale copy is deleted, it waits in the staging directory under
-/// the temp file's name, where recovery deletes it after a crash.
+/// Until the stale copy is removed, it waits in the staging directory under
+/// the temp file's name, where recovery deletes it after a crash. If what
+/// came out cannot be swapped back, it stays there too, and the error is
+/// [`Unswapped`]: it is not the move's to delete.
 fn replace(
     fs: &dyn FsOps,
     staged_parent: &OwnedFd,
@@ -996,15 +994,51 @@ fn replace(
         .context("stat replaced stale copy");
     if !out.as_ref().is_ok_and(|out| stale.is(out)) {
         fs.rename_exchange(staged_parent.as_fd(), name, dest_parent.as_fd(), name)
-            .context("publish: swap back what is not the stale copy")?;
+            .context(Unswapped)?;
         return Err(out.err().unwrap_or_else(|| stale.changed()));
     }
     fs.fsync(dest_parent.as_fd())
         .context("fsync destination directory")?;
     fs.unlink(staged_parent.as_fd(), name)
-        .context("delete replaced stale copy")?;
+        .context("remove replaced stale copy")?;
     fs.fsync(staged_parent.as_fd())
         .context("fsync staging directory on the backing branch")
+}
+
+/// Renames the staged `<staged_parent>/<name>` to `<dest_parent>/<name>`,
+/// never replacing an existing file, and makes the rename durable.
+fn rename_into_place(
+    fs: &dyn FsOps,
+    staged_parent: &OwnedFd,
+    dest_parent: &OwnedFd,
+    name: &Path,
+) -> Result<()> {
+    fs.rename_noreplace(staged_parent.as_fd(), name, dest_parent.as_fd(), name)
+        .context("publish")?;
+    fs.fsync(dest_parent.as_fd())
+        .context("fsync destination directory")?;
+    fs.fsync(staged_parent.as_fd())
+        .context("fsync staging directory on the backing branch")
+}
+
+/// A failed [`replace`] that left under the temp file's name a file that is
+/// not the stale copy it inspected.
+#[derive(Debug)]
+struct Unswapped;
+
+impl fmt::Display for Unswapped {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str("publish: cannot swap back what is not the stale copy")
+    }
+}
+
+/// Whether the staged name of a move that stopped with `abort` holds nothing
+/// but the move's own temp file, which it may then delete.
+fn staged_is_own(abort: &Abort) -> bool {
+    match abort {
+        Abort::Skip(_) => true,
+        Abort::Fail(e) => e.downcast_ref::<Unswapped>().is_none(),
+    }
 }
 
 /// Removes the stale copies `elsewhere`, on branches other than the one moved
@@ -1096,17 +1130,7 @@ fn publish_symlink<'a>(
         // durable. Its owner and timestamps may not be: on ZFS, the
         // directory's fsync need not commit the symlink's own changes (see
         // ADR 0002).
-        None => fs
-            .rename_noreplace(staged_parent.as_fd(), name, dest_parent.as_fd(), name)
-            .context("publish")
-            .and_then(|()| {
-                fs.fsync(dest_parent.as_fd())
-                    .context("fsync destination directory")
-            })
-            .and_then(|()| {
-                fs.fsync(staged_parent.as_fd())
-                    .context("fsync staging directory on the backing branch")
-            }),
+        None => rename_into_place(fs, staged_parent, &dest_parent, name),
     };
     let identity = placed.and_then(|()| {
         Ok(Identity::of(

@@ -95,13 +95,13 @@ impl<'a> Placement<'a> {
                 rels.iter().find(|rel| branch.has(rel)).map(|rel| (i, rel))
             })
             .collect();
-        if let Some(&(frozen, rel)) = holders
+        if let Some(&(no_new_files, rel)) = holders
             .iter()
             .find(|&&(i, _)| !self.branches[i].takes_new_files())
         {
             return Err(Unplaced::StaleCopy {
                 rel: rel.clone(),
-                branch: self.branches[frozen].branch.path.clone(),
+                branch: self.branches[no_new_files].branch.path.clone(),
             });
         }
         let (eligible_holders, eligible): (Vec<_>, Vec<_>) = eligible

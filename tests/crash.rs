@@ -738,6 +738,53 @@ mod fault_injection {
         }
     }
 
+    /// A move that cannot check what its swap took out, and then cannot swap
+    /// it back, leaves it in the staging directory instead of deleting a file
+    /// it never inspected.
+    #[test]
+    fn file_that_cannot_be_swapped_back_is_not_deleted_by_the_move() {
+        let rel = "dir/file.bin";
+        let setup = || {
+            let fx = Fixture::new();
+            fx.cache_branch_file(rel, b"on the cache branch", 2_000);
+            fx.backing_branch_file(rel, b"stale", 1_000);
+            fx
+        };
+        let fx = setup();
+        let mut command = with_short_retire_wait(&fx, &fx.move_everything_config());
+        let out = common::output(command.env("CACHY_FAULT_TRACE", "1")).unwrap();
+        let err = assert_exit(&out, 0);
+        let (swap, _) = *common::traced_operations(&err)
+            .iter()
+            .find(|(_, op)| *op == "(rename_exchange)")
+            .expect("no swap traced");
+
+        let fx = setup();
+        // The check after the swap, then the swap back.
+        let faults = format!("eio@{},eio@{}", swap + 1, swap + 2);
+        let (out, reached) = run_with_faults(
+            with_short_retire_wait(&fx, &fx.move_everything_config()),
+            &faults,
+        );
+
+        let err = common::stderr(&out);
+        assert!(reached, "stderr:\n{err}");
+        assert_eq!(out.status.code(), Some(2), "stderr:\n{err}");
+        assert!(
+            err.contains("cannot swap back what is not the stale copy"),
+            "stderr:\n{err}"
+        );
+        assert_eq!(
+            fs::read(fx.on_cache_branch(rel)).unwrap(),
+            b"on the cache branch"
+        );
+        assert_eq!(
+            fs::read(fx.staged_on_backing_branch(rel)).unwrap(),
+            b"stale",
+            "stderr:\n{err}"
+        );
+    }
+
     /// Recovery itself can crash at any step; the run after that finishes it.
     #[test]
     fn crash_at_every_operation_of_recovery_is_recovered_by_the_next_run() {

@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 use proptest::prelude::*;
 use proptest::test_runner::{Config, FileFailurePersistence, TestCaseError};
 
-use common::{Fixture, STAGING, assert_exit, set_xattr, xattrs};
+use common::{Fixture, FsKind, STAGING, assert_exit, set_xattr, xattrs};
 
 const KIB: u64 = 1 << 10;
 const MIB: u64 = 1 << 20;
@@ -523,24 +523,31 @@ fn run_case(units: &[Unit], patterns: &[Pattern], goal: Goal) -> Result<(), Test
     let fx = Fixture::new();
     let created = create(&fx, units, patterns);
 
-    let (mut config, target) = match goal {
-        Goal::Drain => (fx.move_everything_config(), None),
+    // In target mode: the target, and what each unit takes up on the cache
+    // branch, measured as cachy measures it, after a sync.
+    let (mut config, target, allocations) = match goal {
+        Goal::Drain => (fx.move_everything_config(), None, Vec::new()),
         Goal::Target(permille) => {
             let free = fx.cache_branch_free();
-            let eligible: u64 = created
+            let allocations: Vec<u64> = created
                 .iter()
-                .filter(|u| !u.excluded)
                 .map(|u| {
                     allocated(
                         &fs::symlink_metadata(path_on(fx.cache_branch.path(), &u.names[0]))
                             .unwrap(),
                     )
                 })
+                .collect();
+            let eligible: u64 = created
+                .iter()
+                .zip(&allocations)
+                .filter(|(u, _)| !u.excluded)
+                .map(|(_, a)| a)
                 .sum();
             let threshold = free + 1;
             let target = threshold + 1 + eligible * permille / 1000;
             let config = fx.config(&threshold.to_string(), &target.to_string());
-            (config, Some(target))
+            (config, Some((free, target)), allocations)
         }
     };
     if !patterns.is_empty() {
@@ -562,7 +569,8 @@ fn run_case(units: &[Unit], patterns: &[Pattern], goal: Goal) -> Result<(), Test
     let mut expected_cache = BTreeSet::new();
     let mut expected_backing = BTreeSet::new();
     let mut eligible_left = Vec::new();
-    for unit in &created {
+    let mut moved_bytes = 0;
+    for (i, unit) in created.iter().enumerate() {
         let where_first = (
             on_cache.contains(&unit.names[0]),
             on_backing.contains(&unit.names[0]),
@@ -591,6 +599,9 @@ fn run_case(units: &[Unit], patterns: &[Pattern], goal: Goal) -> Result<(), Test
         if !moved && !unit.excluded {
             eligible_left.push(show(&unit.names[0]));
         }
+        if moved {
+            moved_bytes += allocations.get(i).copied().unwrap_or(0);
+        }
         let (branch, expected) = if moved {
             (fx.backing_branch.path(), &mut expected_backing)
         } else {
@@ -607,9 +618,16 @@ fn run_case(units: &[Unit], patterns: &[Pattern], goal: Goal) -> Result<(), Test
 
     if !eligible_left.is_empty() {
         let free = fx.cache_branch_free();
+        // ZFS shows freed space only some transaction groups after the
+        // frees (#13), so there the moved units' space must cover what the
+        // target asked for.
+        let reached = target.is_some_and(|(free_before, target)| {
+            free >= target
+                || (fx.cache_branch_fs == FsKind::Zfs && free_before + moved_bytes >= target)
+        });
         prop_assert!(
-            target.is_some_and(|target| free >= target),
-            "eligible move units are left on the cache branch: {eligible_left:?}, with {free} bytes free and target {target:?}\nstderr:\n{err}"
+            reached,
+            "eligible move units are left on the cache branch: {eligible_left:?}, with {free} bytes free, {moved_bytes} bytes moved and (free before, target) {target:?}\nstderr:\n{err}"
         );
     }
     Ok(())

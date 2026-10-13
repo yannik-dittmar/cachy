@@ -11,7 +11,7 @@ use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
-use common::{Fixture, TmpfsBranch, assert_exit, free_space_lock};
+use common::{Fixture, TmpfsBranch, assert_exit};
 
 const MIB: usize = 1 << 20;
 
@@ -29,7 +29,6 @@ fn spec(path: &Path, suffix: &str) -> String {
 
 #[test]
 fn read_only_and_no_create_branches_are_never_written() {
-    let _lock = free_space_lock();
     let fx = Fixture::new();
     let read_only = fx.extra_backing_branch();
     let no_create = fx.extra_backing_branch();
@@ -59,7 +58,6 @@ fn read_only_and_no_create_branches_are_never_written() {
 
 #[test]
 fn branch_that_would_fall_below_its_minfreespace_is_never_written() {
-    let _lock = free_space_lock();
     let fx = Fixture::new();
     let full = fx.extra_backing_branch();
     fs::create_dir_all(full.path().join("media")).unwrap();
@@ -77,7 +75,6 @@ fn branch_that_would_fall_below_its_minfreespace_is_never_written() {
 
 #[test]
 fn move_unit_is_skipped_when_no_branch_has_room() {
-    let _lock = free_space_lock();
     let fx = Fixture::new();
     fx.cache_branch_file("a.bin", b"a", 1_000);
     let config = fx.layout_config(&layout(&[spec(fx.backing_branch.path(), "=RW,1000T")]));
@@ -94,7 +91,6 @@ fn move_unit_is_skipped_when_no_branch_has_room() {
 
 #[test]
 fn dry_run_reports_a_move_unit_without_room_as_skipped() {
-    let _lock = free_space_lock();
     let fx = Fixture::new();
     fx.cache_branch_file("a.bin", b"a", 1_000);
     let config = fx.layout_config(&layout(&[spec(fx.backing_branch.path(), "=RW,1000T")]));
@@ -113,7 +109,6 @@ fn dry_run_reports_a_move_unit_without_room_as_skipped() {
 
 #[test]
 fn move_unit_lands_on_the_branch_that_has_its_parent_directory() {
-    let _lock = free_space_lock();
     let fx = Fixture::new();
     let other = fx.extra_backing_branch();
     fs::create_dir_all(other.path().join("media/show")).unwrap();
@@ -136,7 +131,6 @@ fn move_unit_lands_on_the_branch_that_has_its_parent_directory() {
 
 #[test]
 fn move_units_in_a_directory_that_a_run_creates_stay_together() {
-    let _lock = free_space_lock();
     let fx = Fixture::new();
     let other = fx.extra_backing_branch();
     let content = vec![7; MIB];
@@ -165,7 +159,6 @@ fn move_units_in_a_directory_that_a_run_creates_stay_together() {
 
 #[test]
 fn hardlink_group_lands_on_one_branch_chosen_by_its_first_name() {
-    let _lock = free_space_lock();
     let fx = Fixture::new();
     let other = fx.extra_backing_branch();
     fs::create_dir_all(other.path().join("a")).unwrap();
@@ -186,7 +179,6 @@ fn hardlink_group_lands_on_one_branch_chosen_by_its_first_name() {
 
 #[test]
 fn move_unit_lands_on_its_parents_branch_if_it_has_room_and_on_the_most_free_otherwise() {
-    let _lock = free_space_lock();
     let fx = Fixture::new();
     let (Some(small), Some(large)) = (TmpfsBranch::mount("4M"), TmpfsBranch::mount("32M")) else {
         return;
@@ -209,7 +201,6 @@ fn move_unit_lands_on_its_parents_branch_if_it_has_room_and_on_the_most_free_oth
 
 #[test]
 fn move_unit_with_a_stale_copy_lands_on_the_branch_that_holds_it() {
-    let _lock = free_space_lock();
     let fx = Fixture::new();
     let holder = fx.extra_backing_branch();
     fs::create_dir_all(fx.on_backing_branch("media")).unwrap();
@@ -229,7 +220,6 @@ fn move_unit_with_a_stale_copy_lands_on_the_branch_that_holds_it() {
 
 #[test]
 fn move_unit_with_a_stale_copy_on_a_branch_it_cannot_move_to_fails() {
-    let _lock = free_space_lock();
     let fx = Fixture::new();
     let no_create = fx.extra_backing_branch();
     common::write_file(&no_create.path().join("media/a.bin"), b"old", 1_000);
@@ -258,7 +248,6 @@ fn move_unit_with_a_stale_copy_on_a_branch_it_cannot_move_to_fails() {
 
 #[test]
 fn space_of_a_move_unit_that_does_not_move_is_given_back() {
-    let _lock = free_space_lock();
     let fx = Fixture::new();
     let Some(small) = TmpfsBranch::mount("4M") else {
         return;
@@ -285,7 +274,6 @@ fn space_of_a_move_unit_that_does_not_move_is_given_back() {
 fn branches_take_one_move_at_a_time_and_move_in_parallel() {
     use std::time::Duration;
 
-    let _lock = free_space_lock();
     let fx = Fixture::new();
     let other = fx.extra_backing_branch();
     fs::create_dir(fx.on_backing_branch("a")).unwrap();

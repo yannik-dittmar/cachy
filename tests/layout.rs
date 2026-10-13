@@ -12,7 +12,7 @@ mod common;
 
 use std::fs;
 
-use common::{FakeCachePool, Fixture, assert_exit, free_space_lock};
+use common::{FakeCachePool, Fixture, assert_exit};
 
 const MOVEONENOSPC_WARNING: &str = "moveonenospc";
 const MINFREESPACE_WARNING: &str = "below the cache pool's minfreespace";
@@ -23,7 +23,6 @@ fn branch(path: &std::path::Path, spec: &str) -> String {
 
 #[test]
 fn backing_branches_and_their_modes_are_discovered_from_the_cache_pool() {
-    let _lock = free_space_lock();
     let fx = Fixture::new();
     let no_create = fx.extra_backing_branch();
     let pool = FakeCachePool::new(
@@ -83,7 +82,6 @@ fn cache_pool_whose_first_branch_is_not_the_cache_branch_is_refused() {
 
 #[test]
 fn explicit_backing_branches_are_used_when_the_runtime_interface_is_unavailable() {
-    let _lock = free_space_lock();
     let fx = Fixture::new();
     // A directory without a `.mergerfs` file, as a cache pool mounted with
     // `xattr=nosys` or not mounted at all looks.
@@ -121,7 +119,6 @@ fn unavailable_runtime_interface_without_backing_branches_is_refused() {
 
 #[test]
 fn discovered_layout_takes_precedence_over_explicit_backing_branches() {
-    let _lock = free_space_lock();
     let fx = Fixture::new();
     let listed = fx.extra_backing_branch();
     let pool = FakeCachePool::new(
@@ -243,7 +240,6 @@ fn malformed_runtime_interface_values_are_refused() {
 
 #[test]
 fn real_cache_pool_layout_is_discovered_with_its_modes() {
-    let _lock = free_space_lock();
     let fx = Fixture::new();
     let no_create = fx.extra_backing_branch();
     let Some(pool) = fx.cache_pool_with(

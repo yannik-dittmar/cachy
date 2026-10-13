@@ -372,3 +372,39 @@ fn frees_that_show_late_cause_no_warning() {
     assert!(err.contains("3 moved"), "stderr:\n{err}");
     assert!(!err.contains("warning"), "stderr:\n{err}");
 }
+
+/// Frees can show a part at a time, as on ZFS, where a large file is freed
+/// over several transaction groups; a run waits for the rest while the
+/// target is not reached, rather than warn once half of the space shows.
+#[test]
+fn frees_that_show_a_part_at_a_time_cause_no_warning() {
+    let _lock = free_space_lock();
+    let fx = Fixture::new();
+    populate(&fx);
+    let mut readers: Vec<fs::File> = FILES[..3]
+        .iter()
+        .map(|(rel, _)| fs::File::open(fx.on_cache_branch(rel)).unwrap())
+        .collect();
+    let free = fx.cache_branch_free();
+    let config = fx.config(
+        &(free + 1).to_string(),
+        &(free + 2 * MIB + MIB / 2).to_string(),
+    );
+
+    let child = spawn(&mut fx.command_waiting_for_frees(&config)).unwrap();
+    for (rel, _) in &FILES[..3] {
+        while fx.on_cache_branch(rel).exists() || fx.staged_on_cache_branch(rel).exists() {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    // Two of the three frees show: more than half the moved bytes, but not
+    // the target. The run measures free space several times meanwhile.
+    let last = readers.pop().unwrap();
+    drop(readers);
+    std::thread::sleep(Duration::from_millis(500));
+    drop(last);
+    let err = assert_exit(&child.wait_with_output().unwrap(), 0);
+
+    assert!(err.contains("3 moved"), "stderr:\n{err}");
+    assert!(!err.contains("warning"), "stderr:\n{err}");
+}

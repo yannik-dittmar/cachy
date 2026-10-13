@@ -7,6 +7,7 @@ mod layout;
 mod metadata;
 mod placement;
 mod probe;
+mod proc_scan;
 mod recovery;
 mod run;
 mod scan;

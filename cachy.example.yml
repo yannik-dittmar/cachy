@@ -60,7 +60,20 @@ minimum_age: 15m
 # minimum age. `cachy run --max-age <duration>` overrides it. Default: none.
 # max_age: 7d
 
-# What makes a file in use, so that it is not moved:
+# How cachy tells that a file is in use, so that it is not moved:
+#   lease - a kernel file lease, held for the whole move (default)
+#   proc  - scans of every process's open descriptors in /proc, for cache
+#           branches without leases. A writer that opens a file mid-move is
+#           not made to wait, and is noticed only by the next scan. Run cachy
+#           as root (or with CAP_SYS_PTRACE) in the host's PID namespace, or
+#           it cannot see every process.
+#   off   - no guard at all: files in use are moved too, and a write during a
+#           move can be lost. Every run warns.
+# cachy uses proc or off only when set here: if leases are missing, it refuses
+# to run until you choose one.
+open_file_guard: lease
+
+# What makes a file in use, for the lease and proc guards:
 #   read  - it is open for writing (default)
 #   write - it is open at all, even for reading only
 lease_type: read

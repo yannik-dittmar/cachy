@@ -36,6 +36,8 @@ pub struct Config {
     #[serde(default, deserialize_with = "optional_duration")]
     pub max_age: Option<Duration>,
     #[serde(default)]
+    pub open_file_guard: OpenFileGuard,
+    #[serde(default)]
     pub lease_type: LeaseType,
     /// Kinds of metadata that a move may lose, with a warning, when the
     /// backing branch cannot store them. Any other loss fails the move.
@@ -149,8 +151,36 @@ pub enum MetadataKind {
     Acls,
 }
 
+/// What tells cachy that a move unit is in use. Leases unless set explicitly:
+/// the others are for platforms without them, and guard less.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum OpenFileGuard {
+    /// A kernel lease of the [`LeaseType`], held on the move unit for the
+    /// whole move.
+    #[default]
+    Lease,
+    /// Scans of other processes' open descriptors in `/proc`, at the steps of
+    /// a move where a lease would be checked last. What makes a move unit in
+    /// use follows the [`LeaseType`].
+    Proc,
+    /// No guard: move units in use are moved too.
+    Off,
+}
+
+impl std::fmt::Display for OpenFileGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str(match self {
+            OpenFileGuard::Lease => "lease",
+            OpenFileGuard::Proc => "proc",
+            OpenFileGuard::Off => "off",
+        })
+    }
+}
+
 /// The kernel lease cachy holds on a move unit while moving it, which decides
-/// what makes the move unit in use.
+/// what makes the move unit in use; the `proc` guard counts the opens that
+/// would conflict with it.
 #[derive(Clone, Copy, Debug, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LeaseType {

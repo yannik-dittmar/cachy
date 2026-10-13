@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 
-use crate::config::{Config, LeaseType, Order};
+use crate::config::{Config, LeaseType, OpenFileGuard, Order};
 use crate::fsops::{FsOps, FsStat, Lease};
 use crate::layout::{self, BackingBranch};
 use crate::metadata::AllowedLosses;
@@ -19,8 +19,8 @@ use crate::probe::probe;
 use crate::recovery::recover;
 use crate::scan::{Entry, Kind, scan};
 use crate::transaction::{
-    Branch, Copying, Fate, Guard, MoveOutcome, Moved, Mover, RETIRING_POLL, STAGING, Skip,
-    would_skip,
+    Branch, Copying, Fate, Guard, InUseGuard, MoveOutcome, Moved, Mover, RETIRING_POLL, STAGING,
+    Skip, would_skip,
 };
 
 pub struct Outcome {
@@ -34,6 +34,8 @@ pub struct Outcome {
     pub undated_dirs: usize,
     /// The run stopped early on an error outside any move.
     pub stopped: bool,
+    /// The in-use guard that the run's moves used.
+    pub open_file_guard: OpenFileGuard,
 }
 
 impl Outcome {
@@ -108,17 +110,14 @@ pub fn run(
 
     ignore_lease_break_signal();
     let guard = Guard {
-        lease: match config.lease_type {
-            LeaseType::Read => Lease::Read,
-            LeaseType::Write => Lease::Write,
-        },
+        in_use: in_use(config),
         minimum_age: config.minimum_age,
     };
     // Measured before cachy writes anything, the probe's scratch files
     // included: ZFS shows their frees only once their transaction group syncs,
     // so a check after them would find less free space than applications left.
     let free_before = stat_fs(fs, &cache_branch);
-    let capabilities = probe(probe_fs, guard.lease, &cache_branch, &backing_branches)?;
+    let capabilities = probe(probe_fs, guard.in_use, &cache_branch, &backing_branches)?;
     let copying = Copying {
         verify: config.verify,
         dense: capabilities.dense_copies,
@@ -132,7 +131,7 @@ pub fn run(
             fs,
             &cache_branch,
             &backing_branches,
-            guard.lease,
+            guard.in_use.lease(),
             allowed_losses,
         )
     };
@@ -141,6 +140,7 @@ pub fn run(
         unresolved,
         undated_dirs: 0,
         stopped: false,
+        open_file_guard: config.open_file_guard,
     };
     let free_before = match free_before {
         Ok(stat) => stat.free,
@@ -218,7 +218,15 @@ pub fn run(
     };
     let mut placement = Placement::new(&backing_branches);
     if options.dry_run {
-        outcome.failed = dry_run(fs, &cache_branch, &guard, &entries, stop, &mut placement);
+        outcome.failed = dry_run(
+            fs,
+            &cache_branch,
+            &guard,
+            outcome.open_file_guard,
+            &entries,
+            stop,
+            &mut placement,
+        );
         return Ok(outcome);
     }
 
@@ -286,9 +294,32 @@ pub fn run(
         skipped,
         failed,
     } = tally;
-    eprintln!("cachy: run finished: {moved} moved, {skipped} skipped, {failed} failed");
+    eprintln!(
+        "cachy: run finished: {moved} moved, {skipped} skipped, {failed} failed; in-use guard: {}",
+        outcome.open_file_guard
+    );
     outcome.failed = failed;
     Ok(outcome)
+}
+
+/// How moves tell that a move unit is in use, as the configuration sets it.
+/// Warns on every run without a guard.
+fn in_use(config: &Config) -> InUseGuard {
+    let writers_only = match config.lease_type {
+        LeaseType::Read => true,
+        LeaseType::Write => false,
+    };
+    match config.open_file_guard {
+        OpenFileGuard::Lease if writers_only => InUseGuard::Lease(Lease::Read),
+        OpenFileGuard::Lease => InUseGuard::Lease(Lease::Write),
+        OpenFileGuard::Proc => InUseGuard::Proc { writers_only },
+        OpenFileGuard::Off => {
+            eprintln!(
+                "cachy: warning: open_file_guard is off: NOTHING GUARDS FILES IN USE; files are moved while applications have them open, and a write to one during its move can be lost"
+            );
+            InUseGuard::Off
+        }
+    }
 }
 
 /// How many move units the dispatcher places ahead of the moves that have
@@ -657,11 +688,13 @@ impl Stop {
 
 /// Prints the byte budget, then the move units that a run would move, in
 /// order, and every skip with its reason, until the run would stop. Returns
-/// the number of move units that could not be checked.
+/// the number of move units that could not be checked. The last line names
+/// `open_file_guard`, the configured in-use guard.
 fn dry_run(
     fs: &dyn FsOps,
     cache_branch: &Branch,
     guard: &Guard,
+    open_file_guard: OpenFileGuard,
     entries: &[Entry],
     stop: Stop,
     placement: &mut Placement,
@@ -703,7 +736,7 @@ fn dry_run(
         }
     }
     eprintln!(
-        "cachy: dry run finished: {moves} would move ({planned} bytes), {skips} would skip, {failed} failed"
+        "cachy: dry run finished: {moves} would move ({planned} bytes), {skips} would skip, {failed} failed; in-use guard: {open_file_guard}"
     );
     failed
 }

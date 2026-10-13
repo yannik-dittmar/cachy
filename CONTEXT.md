@@ -56,8 +56,12 @@ One transaction that relocates a single move unit from the cache branch to one b
 _Avoid_: copy, transfer, migration
 
 **In use**:
-A move unit is in use while any process has it open for writing (or open at all, if the user configured a write lease); in-use move units are never moved, and a move unit that becomes in use mid-move aborts that move.
+A move unit is in use while any process has it open for writing (or open at all, if the user configured a write lease); the in-use guard keeps in-use move units from being moved, and aborts the move of one that becomes in use mid-move.
 _Avoid_: busy, locked, open (by default, a file open only for reading is not in use)
+
+**In-use guard**:
+How cachy tells that a move unit is in use: a lease held for the whole move (the default), or, only if the user explicitly chooses it, a scan of `/proc` for other processes' opens when a move starts, right before it publishes and before the retired source is deleted, or no guard at all. A scan notices a move unit that becomes in use mid-move only at the next scan.
+_Avoid_: lock, open-file check
 
 **Stale copy**:
 A file on a backing branch at the same relative path as a file on the cache branch, hidden from applications by the cache branch's copy; a move replaces it, keeps it if it is identical, or removes it if it is on a branch the move does not go to. A move never replaces or removes one that is newer than the cache branch's copy, or that is on a branch that takes no new files.
@@ -79,7 +83,7 @@ A temp file or retired source (a regular file or a symlink) that an unfinished m
 _Avoid_: orphan
 
 **Capability probe**:
-The first step of every invocation of cachy, which tries on scratch files in each staging directory what cachy's guarantees depend on (leases, no-replace and exchange renames, hole reporting), and refuses to run if a filesystem lacks a lease or rename, or cannot be probed for any reason but a lack of space.
+The first step of every invocation of cachy, which tries on scratch files in each staging directory what cachy's guarantees depend on (the in-use guard's lease or `/proc` scan, no-replace and exchange renames, hole reporting), and refuses to run if a filesystem lacks one of these but hole reporting, or cannot be probed for any reason but a lack of space.
 _Avoid_: self-test, startup check
 
 **Recovery**:

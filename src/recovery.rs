@@ -9,7 +9,10 @@
 //!   it is identical to its published counterpart and not in use. Otherwise
 //!   it is renamed back to its relpath on the cache branch, which never
 //!   replaces a file. A crash releases the lease that kept openers away from
-//!   it, so recovery takes a lease of its own before deciding. A retired
+//!   it, so recovery takes a lease of its own before deciding. Without a
+//!   lease (with `open_file_guard: proc` or `off`), recovery cannot rule out
+//!   a writer that has the retired source open, so it always renames it
+//!   back; the next move of it adopts the identical published copy. A retired
 //!   name of a hardlink group is resolved on its own: once deleted, the
 //!   group's names left on the cache branch move as a smaller group, which
 //!   adopts the published copy.
@@ -40,13 +43,14 @@ use crate::transaction::{
 /// Resolves the leftovers in the staging directories of the cache branch and
 /// of the backing branches that take new files, then removes the staging
 /// directories once empty.
-/// A retired source counts as in use if another open conflicts with `lease`.
+/// A retired source counts as in use if another open conflicts with `lease`,
+/// and always without one.
 /// Returns how many leftovers could not be resolved; they stay where they are.
 pub fn recover(
     fs: &dyn FsOps,
     cache_branch: &Branch,
     backing_branches: &[BackingBranch],
-    lease: Lease,
+    lease: Option<Lease>,
     allowed_losses: AllowedLosses,
 ) -> usize {
     let mut recovery = Recovery {
@@ -89,7 +93,7 @@ struct Recovery<'a> {
     fs: &'a dyn FsOps,
     cache_branch: &'a Branch,
     backing_branches: &'a [BackingBranch],
-    lease: Lease,
+    lease: Option<Lease>,
     allowed_losses: AllowedLosses,
     unresolved: usize,
 }
@@ -171,17 +175,20 @@ impl Recovery<'_> {
     }
 
     /// Deletes the retired source `rel` (in `staged_dir`) if its published
-    /// counterpart is identical and it is not in use, and renames it back to
-    /// the cache branch otherwise.
+    /// counterpart is identical and a lease shows it is not in use, and
+    /// renames it back to the cache branch otherwise.
     fn resolve_retired_source(&self, staged_dir: &OwnedFd, rel: &Path) -> Result<&'static str> {
         let fs = self.fs;
         let (parent, name) = split(rel);
+        let Some(lease) = self.lease else {
+            return self.delete_or_rename_back(staged_dir, rel, false);
+        };
         // Anything short of proof that the retired source is redundant keeps
         // it, which renaming it back always does. The lease is held until the
         // retired source is deleted or back in place.
         let retired = fs.open_read(staged_dir.as_fd(), name);
         let redundant = retired.as_ref().is_ok_and(|retired| {
-            fs.set_lease(retired.as_fd(), self.lease).is_ok()
+            fs.set_lease(retired.as_fd(), lease).is_ok()
                 && self.backing_branches.iter().any(|backing| {
                     open_dirs(fs, &backing.branch.fd, parent)
                         .and_then(|dir| fs.open_read(dir.as_fd(), name))
@@ -189,7 +196,7 @@ impl Recovery<'_> {
                         .unwrap_or(false)
                 })
                 // A conflicting open since the lease was taken.
-                && fs.lease(retired.as_fd()).is_ok_and(|lease| lease == self.lease)
+                && fs.lease(retired.as_fd()).is_ok_and(|held| held == lease)
         });
         self.delete_or_rename_back(staged_dir, rel, redundant)
     }

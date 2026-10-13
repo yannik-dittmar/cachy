@@ -25,12 +25,19 @@ fail() {
   exit 1
 }
 
-# The messages of the latest invocation of cachy.service at priority $1 or
-# more urgent.
+# Marks the end of the journal, before a start of cachy.service.
+# (_SYSTEMD_INVOCATION_ID cannot select an invocation: journald can miss it on
+# the lines of a process that exits quickly.)
+mark() {
+  sudo journalctl --sync
+  since=$(sudo journalctl --lines=1 --output=export | sed -n 's/^__CURSOR=//p')
+}
+
+# The messages of cachy.service since the last mark, at priority $1 or more
+# urgent.
 journal() {
   sudo journalctl --sync
-  sudo journalctl --output=cat --priority="$1" \
-    _SYSTEMD_INVOCATION_ID="$(systemctl show --property=InvocationID --value cachy.service)"
+  sudo journalctl --output=cat --priority="$1" --unit=cachy.service --after-cursor="$since"
 }
 
 exit_status() {
@@ -83,6 +90,7 @@ echo one | sudo tee "$cache/one.txt" >/dev/null
 echo two | sudo tee "$cache/a/b/two.txt" >/dev/null
 sudo head -c 1M /dev/urandom | sudo tee "$cache/a/three.bin" >/dev/null
 before=$(checksums "$cache")
+mark
 sudo systemctl start cachy.service
 [ "$(exit_status)" = 0 ] || fail "exit status $(exit_status), not 0"
 [ "$(checksums "$backing")" = "$before" ] || fail "backing branch holds $(checksums "$backing")"
@@ -105,6 +113,7 @@ before=$(checksums "$cache")
 sudo mkdir -p "$dropin"
 printf '[Service]\nCPUQuota=1%%\n' | sudo tee "$dropin/slow.conf" >/dev/null
 sudo systemctl daemon-reload
+mark
 sudo systemctl start --no-block cachy.service
 copying=
 for _ in $(seq 600); do
@@ -137,6 +146,7 @@ done
 
 echo "--- a refusal fails the unit"
 echo 'treshold: 5G' | sudo tee -a /etc/cachy/cachy.yml >/dev/null
+mark
 if sudo systemctl start cachy.service; then
   fail "systemctl start succeeded with an invalid config"
 fi

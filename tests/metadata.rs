@@ -224,8 +224,10 @@ fn created_directories_take_the_cache_directory_metadata() {
     set_mode(&a, 0o750);
     set_mode(&b, 0o2711);
     set_times(&b, 3_000, 2_000);
+    // Kept, to compare the created directories with.
+    let config = fx.move_everything_config() + "keep_empty_dirs: true\n";
 
-    assert_exit(&fx.run(&fx.move_everything_config()), 0);
+    assert_exit(&fx.run(&config), 0);
 
     for rel in ["a", "a/b"] {
         let (cache_dir, created) = (fx.on_cache_branch(rel), fx.on_backing_branch(rel));

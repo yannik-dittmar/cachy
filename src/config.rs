@@ -13,6 +13,10 @@ use crate::layout::BranchSpec;
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub cache_branch: PathBuf,
+    /// Where cachy keeps the instance lock of each cache branch, and nothing
+    /// else.
+    #[serde(default = "default_state_dir")]
+    pub state_dir: PathBuf,
     /// The cache pool's mount point, whose mergerfs runtime interface lists
     /// the backing branches.
     #[serde(default)]
@@ -49,6 +53,10 @@ pub struct Config {
     /// root, for files and directories that stay on the cache branch.
     #[serde(default, deserialize_with = "exclusions")]
     pub exclude: Exclusions,
+    /// Keep the cache-branch directories that a run empties, rather than
+    /// remove them.
+    #[serde(default)]
+    pub keep_empty_dirs: bool,
 }
 
 /// An amount of free space on the cache branch: a byte size, or a percentage
@@ -208,6 +216,10 @@ fn branch_specs<'de, D: serde::Deserializer<'de>>(
 fn exclusions<'de, D: serde::Deserializer<'de>>(de: D) -> Result<Exclusions, D::Error> {
     let patterns = Vec::<String>::deserialize(de)?;
     Exclusions::new(&patterns).map_err(|e| serde::de::Error::custom(format!("exclude: {e}")))
+}
+
+fn default_state_dir() -> PathBuf {
+    PathBuf::from("/var/lib/cachy")
 }
 
 fn default_minimum_age() -> Duration {

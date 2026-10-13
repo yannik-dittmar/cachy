@@ -135,6 +135,13 @@ Repeated checks performed while the backing disks are awake.
 A hold on a scheduled check until the backing disks are awake, given up after a time limit.
 _Avoid_: using "trigger" for something that only delays a check
 
+**Instance lock**:
+A lock on the cache branch, kept in the state directory, that every invocation of cachy takes before it writes anything, so that only one run at a time drains a cache branch; an invocation that finds it held refuses to run.
+_Avoid_: lockfile, pidfile
+
+**State directory**:
+The directory, `/var/lib/cachy` by default, that holds the instance lock of each cache branch and nothing else; unlike a staging directory, it is never on a branch.
+
 **Run hook**:
 A user-configured command that cachy executes after each run, handing it the run summary.
 _Avoid_: notification, callback

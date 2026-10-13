@@ -52,6 +52,7 @@ use crate::metadata::{self, AllowedLosses};
 use crate::placement::Unplaced;
 use crate::proc_scan;
 use crate::scan::Kind;
+use crate::stop;
 
 /// Name of the staging directory at the root of each filesystem cachy writes to.
 pub const STAGING: &str = ".cachy-staging";
@@ -180,6 +181,8 @@ pub enum Skip {
     PartlyExcluded,
     /// No backing branch that takes new files has room for it.
     NoRoom,
+    /// cachy was asked to stop before the move could publish it.
+    Stopping,
 }
 
 impl fmt::Display for Skip {
@@ -191,6 +194,7 @@ impl fmt::Display for Skip {
             Skip::SpecialFile => "special file",
             Skip::PartlyExcluded => "hardlink group partly excluded",
             Skip::NoRoom => "no backing branch has room",
+            Skip::Stopping => "cachy is stopping",
         })
     }
 }
@@ -253,7 +257,8 @@ impl From<anyhow::Error> for Abort {
 /// Runs moves to one backing branch, one after another. A move's last step,
 /// the wait before a retired source is unlinked, overlaps with the moves
 /// after it: such moves stay in a queue of retiring moves, which is serviced
-/// between moves and between the chunks of every copy.
+/// between moves and between the chunks of every copy. Once a stop is
+/// requested, moves that have not published abort, and new ones are skipped.
 pub struct Mover<'a> {
     fs: &'a dyn FsOps,
     cache_branch: &'a Branch,
@@ -316,7 +321,8 @@ impl<'a> Mover<'a> {
     /// Moves the move unit of the given kind at `rels` (its names, as the
     /// scanner lists them) from the cache branch to the backing branch, unless
     /// the guard finds it in use; skips it if it is a special file or a partly
-    /// excluded hardlink group. The outcome is reported by
+    /// excluded hardlink group, or if a stop was requested. The outcome is
+    /// reported by
     /// [`Mover::finished`], possibly only after later moves have started.
     ///
     /// A skipped move, or one that fails before publish, leaves the source
@@ -324,6 +330,7 @@ impl<'a> Mover<'a> {
     pub fn start(&mut self, rels: &'a [PathBuf], kind: Kind) {
         self.service();
         let finished = match kind {
+            _ if stop::requested() => Some(Err(Abort::Skip(Skip::Stopping))),
             Kind::Regular => {
                 while self.retiring.len() >= MAX_RETIRING {
                     thread::sleep(RETIRING_POLL);
@@ -741,6 +748,7 @@ impl<'a> Mover<'a> {
         while offset < size {
             self.service();
             source.check_lease()?;
+            check_stop()?;
             let len = (size - offset).min(COPY_BUF as u64) as usize;
             let n = read_full_at(fs, &source.file, &mut ours[..len], offset)
                 .context("compare: read source")?;
@@ -831,6 +839,7 @@ impl<'a> Mover<'a> {
             while offset < hole {
                 self.service();
                 src.check_lease()?;
+                check_stop()?;
                 let len = (hole - offset).min(COPY_BUF as u64) as usize;
                 let n = fs
                     .read_at(src.file.as_fd(), &mut buf[..len], offset)
@@ -872,6 +881,7 @@ impl<'a> Mover<'a> {
         loop {
             self.service();
             src.check_lease()?;
+            check_stop()?;
             let n = fs
                 .read_at(temp.as_fd(), &mut buf, offset)
                 .context("read back: read temp file")?;
@@ -1087,6 +1097,16 @@ impl fmt::Display for Unswapped {
 
 /// Whether the staged name of a move that stopped with `abort` holds nothing
 /// but the move's own temp file, which it may then delete.
+/// Aborts a move that is copying, comparing or reading back once a stop is
+/// requested.
+fn check_stop() -> Result<(), Abort> {
+    if stop::requested() {
+        Err(Abort::Skip(Skip::Stopping))
+    } else {
+        Ok(())
+    }
+}
+
 fn staged_is_own(abort: &Abort) -> bool {
     match abort {
         Abort::Skip(_) => true,

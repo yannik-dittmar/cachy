@@ -78,7 +78,7 @@ pub struct MovedUnit {
 #[derive(Serialize)]
 pub struct SkippedUnit {
     paths: Vec<String>,
-    reason: &'static str,
+    reason: Skip,
 }
 
 #[derive(Serialize)]
@@ -90,7 +90,7 @@ pub struct FailedUnit {
 #[derive(Serialize)]
 pub struct StaleCopy {
     path: String,
-    fate: &'static str,
+    fate: Fate,
 }
 
 impl Summary {
@@ -154,7 +154,7 @@ impl SkippedUnit {
     pub fn new(rels: &[impl AsRef<Path>], reason: Skip) -> SkippedUnit {
         SkippedUnit {
             paths: texts(rels),
-            reason: reason.code(),
+            reason,
         }
     }
 }
@@ -172,11 +172,7 @@ impl StaleCopy {
     pub fn new(path: &Path, fate: Fate) -> StaleCopy {
         StaleCopy {
             path: text(path),
-            fate: match fate {
-                Fate::Kept => "kept",
-                Fate::Replaced => "replaced",
-                Fate::Removed => "removed",
-            },
+            fate,
         }
     }
 }

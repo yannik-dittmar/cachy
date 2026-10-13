@@ -63,7 +63,7 @@ impl Outcome {
         started: Instant,
         moving: Duration,
     ) -> Outcome {
-        if options.dry_run || !(ran || !self.succeeded()) {
+        if options.dry_run || (!ran && self.succeeded()) {
             return self;
         }
         summary.stopped = self.stopped;
@@ -185,25 +185,26 @@ pub fn run(
         open_file_guard: config.open_file_guard,
         summary: None,
     };
-    let unran = |outcome: Outcome, summary| {
+    // For an invocation that ends before it runs.
+    let without_run = |outcome: Outcome, summary| {
         outcome.summarise(summary, options, false, started, Duration::ZERO)
     };
     if stopping(&mut outcome) {
-        return Ok(unran(outcome, summary));
+        return Ok(without_run(outcome, summary));
     }
     let free_before = match free_before {
         Ok(stat) => stat.free,
         Err(e) => {
             log::error!("run stopped: {e:#}");
             outcome.stopped = true;
-            return Ok(unran(outcome, summary));
+            return Ok(without_run(outcome, summary));
         }
     };
     summary.free_before = Some(free_before);
     let below_threshold = free_before < threshold;
     if !options.drain && !below_threshold && config.max_age.is_none() {
         no_work(free_before, threshold, options);
-        return Ok(unran(outcome, summary));
+        return Ok(without_run(outcome, summary));
     }
 
     let order = match config.order {
@@ -229,11 +230,11 @@ pub fn run(
                 cache_branch.path.display()
             );
             outcome.stopped = true;
-            return Ok(unran(outcome, summary));
+            return Ok(without_run(outcome, summary));
         }
     };
     if stopping(&mut outcome) {
-        return Ok(unran(outcome, summary));
+        return Ok(without_run(outcome, summary));
     }
     // Move units past the max age first, each part still in order.
     let (mut entries, rest): (Vec<_>, Vec<_>) = entries.into_iter().partition(|entry| {
@@ -262,7 +263,7 @@ pub fn run(
         Some(0)
     } else {
         no_work(free_before, threshold, options);
-        return Ok(unran(outcome, summary));
+        return Ok(without_run(outcome, summary));
     };
     summary.byte_budget = budget;
 

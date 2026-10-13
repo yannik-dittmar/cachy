@@ -89,7 +89,9 @@ fn every_moved_file_reports_the_hash_of_its_source() {
         ("empty", "99aa06d3014798d86001c324468d497f"),
     ] {
         assert!(
-            err.contains(&format!("cachy: info: moved {rel} to {branch} (xxh3 {hash})")),
+            err.contains(&format!(
+                "cachy: info: moved {rel} to {branch} (xxh3 {hash})"
+            )),
             "no hash for {rel}; stderr:\n{err}"
         );
     }

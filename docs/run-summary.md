@@ -46,12 +46,12 @@ A check that finds no work is not a run, so it produces none, unless the invocat
 | --- | --- | --- |
 | `schema_version` | integer | The version of this schema: `1`. |
 | `cachy_version` | string | The version of cachy that ran, as `cachy --version` prints it. |
-| `reason` | string | Why the run started: `manual` (`cachy run`, whose check found work) or `drain` (`cachy run --drain`). Later versions add `schedule` and `wake_trigger`. |
+| `reason` | string | How cachy was invoked: `manual` (`cachy run`) or `drain` (`cachy run --drain`). Later versions add `schedule` and `wake_trigger`. |
 | `outcome` | string | How the run ended: `moved` (nothing failed, and at least one move unit moved), `nothing_moved` (nothing failed, and nothing moved) or `failed` (cachy exits with code 2). The run hook's `on` filter selects runs by this value. |
 | `cache_branch` | string | The cache branch's path. |
 | `free_before` | integer or null | The cache branch's free space, in bytes, when the run started; `null` if it could not be measured. |
 | `free_after` | integer or null | The cache branch's free space, in bytes, when the run ended, after waiting for frees to show; `null` if the run did not get as far as moving, or the space could not be measured. |
-| `byte_budget` | integer or null | How many bytes the run set out to free; `null` for a drain, which has no budget, and for a run that stopped before setting one. `0` when only move units past the max age are due. |
+| `byte_budget` | integer or null | How many bytes the run set out to free; `null` for a drain, which has no budget, and when the invocation ended before a run set one, such as a failed invocation whose check found no work. `0` when only move units past the max age are due. |
 | `moved` | array | The move units that moved, in the order their moves finished. |
 | `moved[].paths` | array of strings | The move unit's paths, relative to the cache branch: one, or each name of a hardlink group. |
 | `moved[].branch` | string | The backing branch that it moved to. |
@@ -64,9 +64,9 @@ A check that finds no work is not a run, so it produces none, unless the invocat
 | `failed[].error` | string | Why the move failed, as cachy logs it. |
 | `stale_copies` | array | The stale copies that moves dealt with. That includes those replaced or removed by a move that was then skipped or failed, which cannot bring them back. |
 | `stale_copies[].path` | string | The stale copy's path on its backing branch. |
-| `stale_copies[].fate` | string | `replaced` (the moved copy took its place), `removed` (it was on another backing branch, and removed from there) or `kept` (it was identical, so it became the moved copy). |
+| `stale_copies[].fate` | string | `replaced` (the moved copy took its place; if that move was then skipped or failed, the moved copy is gone too, and so is the stale copy's content), `removed` (it was on another backing branch, and removed from there) or `kept` (it was identical, so it became the moved copy). |
 | `moved_bytes` | integer | The sizes of the moved move units, added up. |
-| `duration_seconds` | number | How long the run took, from the start of the invocation (the capability probe and recovery included) to the end of the run. |
+| `duration_seconds` | number | How long the run took, from when cachy opened the cache branch (the capability probe and recovery included) to the end of the run, before the hook. |
 | `throughput_bytes_per_second` | number | `moved_bytes` divided by the time spent moving, which leaves out the steps before the first move and after the last; `0` if nothing moved. |
 | `stopped` | boolean | The run stopped early: cachy was asked to stop (`SIGTERM`, `SIGINT`), or an error outside any move stopped it. |
 | `unresolved_leftovers` | integer | How many leftovers of unfinished moves recovery could not resolve. |

@@ -43,6 +43,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
+use serde::Serialize;
 use xxhash_rust::xxh3::{Xxh3, xxh3_128};
 
 use crate::config::Verify;
@@ -152,8 +153,10 @@ pub struct Finished<'a> {
     pub stale_copies: Vec<(PathBuf, Fate)>,
 }
 
-/// What a move did with a stale copy of its move unit.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// What a move did with a stale copy of its move unit. Serialized as the run
+/// summary's code for it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Fate {
     /// It was identical to the source, so it became the published copy.
     Kept,
@@ -174,8 +177,9 @@ impl fmt::Display for Hash {
     }
 }
 
-/// Why a move unit was skipped.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Why a move unit was skipped. Serialized as the run summary's reason code.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Skip {
     /// The in-use guard found another process with it open so that it is in
     /// use, before or during the move.
@@ -192,21 +196,6 @@ pub enum Skip {
     NoRoom,
     /// cachy was asked to stop before the move could publish it.
     Stopping,
-}
-
-impl Skip {
-    /// The reason code that the run summary gives for the skip.
-    pub fn code(self) -> &'static str {
-        match self {
-            Skip::InUse => "in_use",
-            Skip::Changed => "changed",
-            Skip::TooYoung => "too_young",
-            Skip::SpecialFile => "special_file",
-            Skip::PartlyExcluded => "partly_excluded",
-            Skip::NoRoom => "no_room",
-            Skip::Stopping => "stopping",
-        }
-    }
 }
 
 impl fmt::Display for Skip {

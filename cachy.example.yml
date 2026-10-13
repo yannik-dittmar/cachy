@@ -137,12 +137,14 @@ keep_empty_dirs: false
 #   # Executed by /bin/sh -c, with the hook's output going where cachy's goes.
 #   command: /usr/local/bin/notify-cachy
 #   # Only after runs with these outcomes:
-#   #   moved         - nothing failed, and at least one file moved
+#   #   moved         - nothing failed, and at least one move unit (a file,
+#   #                   hardlink group or symlink) moved
 #   #   nothing_moved - nothing failed, and nothing moved
 #   #   failed        - something failed, or the run stopped early (exit 2)
 #   # Default: all three.
 #   on: [moved, failed]
-#   # Killed, with every process it started, if it takes longer. A hook that
-#   # fails or is killed is logged, but never changes cachy's exit code.
+#   # Killed, with every process it started, if it takes longer, or if cachy
+#   # is asked to stop (SIGTERM, SIGINT). A hook that fails or is killed is
+#   # logged, but never changes cachy's exit code.
 #   # Default: 60s.
 #   timeout: 60s

@@ -12,13 +12,14 @@ use anyhow::{Context, Result, anyhow};
 
 use crate::config::RunHook;
 use crate::log;
+use crate::stop;
 use crate::summary::Summary;
 
 const POLL: Duration = Duration::from_millis(20);
 
 /// Executes `hook` with `summary` on its stdin, unless its `on` filter
 /// excludes the run's outcome, and waits for it to exit, or kills it once its
-/// timeout is over.
+/// timeout is over or cachy is asked to stop.
 pub fn call(hook: &RunHook, summary: &Summary) {
     if !hook.on.contains(&summary.outcome) {
         return;
@@ -58,36 +59,51 @@ fn execute(hook: &RunHook, summary: &Summary) -> Result<()> {
         // A hook may exit without reading its stdin.
         let _ = stdin.write_all(json.as_bytes());
     });
-    let status = wait(&mut child, hook.timeout)?;
-    match status {
-        Some(status) if status.success() => Ok(()),
-        Some(status) => Err(anyhow!("`{}` {}", hook.command, describe(status))),
-        None => Err(anyhow!(
+    match wait(&mut child, hook.timeout)? {
+        Ended::Exited(status) if status.success() => Ok(()),
+        Ended::Exited(status) => Err(anyhow!("`{}` {}", hook.command, describe(status))),
+        Ended::TimedOut => Err(anyhow!(
             "`{}` was killed after its timeout of {:?}",
             hook.command,
             hook.timeout
         )),
+        Ended::Stopped => Err(anyhow!(
+            "`{}` was killed: cachy was asked to stop",
+            hook.command
+        )),
     }
 }
 
-/// The exit status of `child`, or `None` if it did not exit within `timeout`
-/// and was killed, with its process group.
-fn wait(child: &mut Child, timeout: Duration) -> Result<Option<ExitStatus>> {
+/// How a run hook ended.
+enum Ended {
+    Exited(ExitStatus),
+    /// It was killed once its timeout was over.
+    TimedOut,
+    /// It was killed because cachy was asked to stop.
+    Stopped,
+}
+
+/// Waits for `child` to exit, killing it, with its process group, once
+/// `timeout` is over or a stop is requested.
+fn wait(child: &mut Child, timeout: Duration) -> Result<Ended> {
     let deadline = Instant::now() + timeout;
-    loop {
+    let ended = loop {
         if let Some(status) = child.try_wait().context("wait for the run hook")? {
-            return Ok(Some(status));
+            return Ok(Ended::Exited(status));
+        }
+        if stop::requested() {
+            break Ended::Stopped;
         }
         if Instant::now() >= deadline {
-            break;
+            break Ended::TimedOut;
         }
         thread::sleep(POLL);
-    }
+    };
     // SAFETY: kill(2) touches no memory. The group exists: its leader is our
     // child, which has not been reaped.
     unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL) };
     child.wait().context("wait for the killed run hook")?;
-    Ok(None)
+    Ok(ended)
 }
 
 fn describe(status: ExitStatus) -> String {

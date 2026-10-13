@@ -134,3 +134,35 @@ fn hook_timeout_must_be_above_zero() {
 
     assert!(err.contains("run_hook: timeout"), "stderr:\n{err}");
 }
+
+/// systemd stops cachy with `SIGTERM`, and kills it if it does not exit in
+/// time, which would leave the hook running on its own.
+#[test]
+fn stop_request_kills_a_running_hook() {
+    let fx = Fixture::new();
+    let marks = Marks::new();
+    fx.cache_branch_file("a.txt", b"a", 1_000);
+    let started = marks.path("started");
+    let config = fx.move_everything_config()
+        + &hook(&format!("touch '{}'; sleep 60", started.display()), "");
+    let child = fx.spawn(&config);
+
+    common::wait_for(&started);
+    let start = Instant::now();
+    rustix::process::kill_process(
+        rustix::process::Pid::from_child(&child),
+        rustix::process::Signal::TERM,
+    )
+    .unwrap();
+
+    let err = assert_exit(&child.wait_with_output().unwrap(), 0);
+    assert!(
+        start.elapsed() < Duration::from_secs(30),
+        "{:?}",
+        start.elapsed()
+    );
+    assert!(
+        err.contains("run hook failed:") && err.contains("was killed: cachy was asked to stop"),
+        "stderr:\n{err}"
+    );
+}

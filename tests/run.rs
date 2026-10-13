@@ -5,7 +5,8 @@ use std::fs;
 use std::time::{Duration, Instant};
 
 use common::{
-    Fixture, FsKind, assert_exit, free_space_lock, root_available, skip, sudo, zfs_dataset,
+    Fixture, FsKind, assert_exit, free_space_lock, output, root_available, skip, spawn, sudo,
+    zfs_dataset,
 };
 
 const MIB: u64 = 1 << 20;
@@ -65,7 +66,10 @@ fn run_moves_oldest_files_until_free_space_reaches_target() {
         &(free + 2 * MIB + MIB / 2).to_string(),
     );
 
-    let err = assert_exit(&fx.run(&config), 0);
+    let err = assert_exit(
+        &output(&mut fx.command_waiting_for_frees(&config)).unwrap(),
+        0,
+    );
 
     for i in 0..3 {
         assert_moved(&fx, i);
@@ -354,7 +358,7 @@ fn frees_that_show_late_cause_no_warning() {
         &(free + 2 * MIB + MIB / 2).to_string(),
     );
 
-    let child = fx.spawn(&config);
+    let child = spawn(&mut fx.command_waiting_for_frees(&config)).unwrap();
     for (rel, _) in &FILES[..3] {
         while fx.on_cache_branch(rel).exists() || fx.staged_on_cache_branch(rel).exists() {
             std::thread::sleep(Duration::from_millis(10));

@@ -32,6 +32,8 @@ use tempfile::TempDir;
 const CACHE_BRANCH_FS: &str = "CACHY_TEST_CACHE_BRANCH_FS";
 const BACKING_BRANCH_FS: &str = "CACHY_TEST_BACKING_BRANCH_FS";
 const PRIVILEGED: &str = "CACHY_TEST_PRIVILEGED";
+/// Sets how long a fault-injection build of cachy waits for freed space.
+const FREED_WAIT: &str = "CACHY_FREED_WAIT_MS";
 
 /// The staging directory at the root of each branch.
 pub const STAGING: &str = ".cachy-staging";
@@ -313,7 +315,21 @@ impl Fixture {
 
     /// `cachy run --config <file>` with the given config file content, for a
     /// test to adjust before running it.
+    ///
+    /// A fault-injection build does not wait for freed space to show at the
+    /// end of the run: on ZFS, the frees of files that a test has just
+    /// written never show, because the files never reached the disk, and
+    /// every run would wait in vain. [`Fixture::command_waiting_for_frees`]
+    /// keeps the wait.
     pub fn command(&self, config: &str) -> Command {
+        let mut command = self.command_waiting_for_frees(config);
+        command.env(FREED_WAIT, "0");
+        command
+    }
+
+    /// Like [`Fixture::command`], but the run waits for freed space to show
+    /// before it warns that something holds it, as a normal build does.
+    pub fn command_waiting_for_frees(&self, config: &str) -> Command {
         let path = self.scratch.path().join("cachy.yml");
         fs::write(&path, config).unwrap();
         let mut command = Command::new(env!("CARGO_BIN_EXE_cachy"));

@@ -113,12 +113,11 @@ mod fault_injection {
         (out, reached)
     }
 
-    /// `cachy run` with a retire wait, and a wait for freed space, short
-    /// enough that hundreds of runs do not add up to minutes.
+    /// `cachy run` with a retire wait short enough that hundreds of runs do
+    /// not add up to minutes.
     fn with_short_retire_wait(fx: &Fixture, config: &str) -> Command {
         let mut command = fx.command(config);
         command.env("CACHY_RETIRE_WAIT_MS", "0");
-        command.env("CACHY_FREED_WAIT_MS", "0");
         command
     }
 

@@ -198,3 +198,26 @@ fn link_added_while_the_group_waits_in_its_retire_rolls_the_move_back() {
     }
     fx.assert_no_staging_directories();
 }
+
+#[test]
+fn dry_run_lists_a_group_once_and_a_partly_excluded_group_as_a_skip() {
+    let fx = Fixture::new();
+    fx.cache_branch_hardlinks(&["media/b.mkv", "media/a.mkv"], b"episode", 1_000);
+    fx.cache_branch_hardlinks(&["appdata/seed.mkv", "seeding/x.mkv"], b"seed", 2_000);
+    let config = fx.move_everything_config() + "exclude:\n  - /appdata/\n";
+
+    let out = common::output(fx.command(&config).arg("--dry-run")).unwrap();
+
+    assert_exit(&out, 0);
+    let planned = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(
+        planned.lines().skip(1).collect::<Vec<_>>(),
+        [
+            "would move media/a.mkv, media/b.mkv",
+            "would skip seeding/x.mkv: hardlink group partly excluded",
+        ],
+        "stdout:\n{planned}"
+    );
+    assert!(fx.on_cache_branch("media/a.mkv").exists());
+    fx.assert_no_staging_directories();
+}

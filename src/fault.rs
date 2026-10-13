@@ -17,8 +17,9 @@
 //! `cachy: trace: operation <n> (<name>)`, so that a test can find the
 //! number of the operation it wants to inject a fault at.
 //!
-//! `CACHY_RETIRE_WAIT_MS=<ms>` shortens the retire wait, so that tests that
-//! run cachy hundreds of times do not wait a second each time.
+//! `CACHY_RETIRE_WAIT_MS=<ms>` shortens the retire wait, and
+//! `CACHY_FREED_WAIT_MS=<ms>` the wait for freed space at the end of a run, so
+//! that tests that run cachy hundreds of times do not wait each time.
 
 use std::cell::Cell;
 use std::ffi::{OsStr, OsString};
@@ -32,22 +33,31 @@ use anyhow::{Context, Result, bail};
 
 use rustix::fs::Timespec;
 
-use crate::fsops::{FsOps, Lease, RealFs, Stat};
+use crate::fsops::{FsOps, FsStat, Lease, RealFs, Stat};
 
 const FAULT: &str = "CACHY_FAULT";
 const TRACE: &str = "CACHY_FAULT_TRACE";
 const RETIRE_WAIT: &str = "CACHY_RETIRE_WAIT_MS";
+const FREED_WAIT: &str = "CACHY_FREED_WAIT_MS";
 
 /// The retire wait set by `CACHY_RETIRE_WAIT_MS`, if any.
 pub fn retire_wait() -> Option<Duration> {
     static WAIT: OnceLock<Option<Duration>> = OnceLock::new();
-    *WAIT.get_or_init(|| {
-        let ms = std::env::var(RETIRE_WAIT).ok()?;
-        let ms = ms
-            .parse()
-            .unwrap_or_else(|_| panic!("{RETIRE_WAIT}=`{ms}`: expected milliseconds"));
-        Some(Duration::from_millis(ms))
-    })
+    *WAIT.get_or_init(|| wait_from_env(RETIRE_WAIT))
+}
+
+/// The wait for freed space set by `CACHY_FREED_WAIT_MS`, if any.
+pub fn freed_wait() -> Option<Duration> {
+    static WAIT: OnceLock<Option<Duration>> = OnceLock::new();
+    *WAIT.get_or_init(|| wait_from_env(FREED_WAIT))
+}
+
+fn wait_from_env(var: &str) -> Option<Duration> {
+    let ms = std::env::var(var).ok()?;
+    let ms = ms
+        .parse()
+        .unwrap_or_else(|_| panic!("{var}=`{ms}`: expected milliseconds"));
+    Some(Duration::from_millis(ms))
 }
 
 #[derive(Clone, Copy)]
@@ -263,9 +273,9 @@ impl FsOps for FaultyFs {
         RealFs.list_dir(dir)
     }
 
-    fn free_space(&self, fd: BorrowedFd) -> io::Result<u64> {
-        self.count_op("free_space")?;
-        RealFs.free_space(fd)
+    fn stat_fs(&self, fd: BorrowedFd) -> io::Result<FsStat> {
+        self.count_op("stat_fs")?;
+        RealFs.stat_fs(fd)
     }
 
     fn set_lease(&self, fd: BorrowedFd, lease: Lease) -> io::Result<()> {

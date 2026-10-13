@@ -10,9 +10,21 @@ backing_branches:
   - /mnt/storage
 
 # A run starts when the cache branch's free space falls below the threshold,
-# and moves files until free space reaches the target.
+# and moves files until free space reaches the target. Either may also be a
+# percentage of the cache branch's size, such as 10% or 12.5%. At its start,
+# a run fixes how many bytes it moves: the target minus the free space then.
+# It stops once its moves add up to that, even if the filesystem has not yet
+# shown all of the space as free, so delayed frees and snapshots cannot make
+# it move everything.
 threshold: 100G
 target: 200G
+
+# Which files a run moves first:
+#   atime - least recently accessed first (default)
+#   mtime - least recently modified first
+# Ties go to the older mtime, then to the path in byte order. On a cache branch
+# mounted noatime, cachy orders by mtime instead, with a warning.
+order: atime
 
 # Files changed more recently than this are never moved. Default: 15m.
 minimum_age: 15m

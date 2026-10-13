@@ -166,3 +166,37 @@ fn example_config_is_valid() {
 
     assert_exit(&fx.run(&config), 0);
 }
+
+#[test]
+fn malformed_or_out_of_range_percentage_is_refused() {
+    for percent in ["101%", "100.5%", "1e3%", "5.%", "-1%", "0.0000000000001%"] {
+        let fx = Fixture::new();
+
+        let err = assert_exit(&fx.run(&fx.config("10%", percent)), 1);
+
+        assert!(err.contains("target"), "stderr:\n{err}");
+        assert!(err.contains(&format!("`{percent}`")), "stderr:\n{err}");
+    }
+}
+
+#[test]
+fn percentage_target_not_above_percentage_threshold_is_refused() {
+    for (threshold, target) in [("20%", "10%"), ("10%", "10.000%"), ("12.5%", "12.49%")] {
+        let fx = Fixture::new();
+
+        let err = assert_exit(&fx.run(&fx.config(threshold, target)), 1);
+
+        assert!(err.contains("above the threshold"), "stderr:\n{err}");
+    }
+}
+
+#[test]
+fn percentage_threshold_above_a_byte_target_on_this_filesystem_is_refused() {
+    let fx = Fixture::new();
+
+    let err = assert_exit(&fx.run(&fx.config("100%", "1K")), 1);
+
+    assert!(err.contains("above the threshold"), "stderr:\n{err}");
+    assert!(err.contains("100%"), "stderr:\n{err}");
+    assert!(Fixture::tree(fx.backing_branch.path()).is_empty());
+}

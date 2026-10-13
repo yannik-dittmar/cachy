@@ -156,6 +156,8 @@ pub struct Mover<'a> {
     created_dirs: Vec<PathBuf>,
     retiring: VecDeque<Retiring<'a>>,
     finished: Vec<(&'a [PathBuf], Result<MoveOutcome>)>,
+    /// Space on the cache branch that moved move units took up.
+    moved_bytes: u64,
 }
 
 /// A move whose source is retired but not yet unlinked.
@@ -188,6 +190,7 @@ impl<'a> Mover<'a> {
             created_dirs: Vec::new(),
             retiring: VecDeque::new(),
             finished: Vec::new(),
+            moved_bytes: 0,
         }
     }
 
@@ -221,10 +224,12 @@ impl<'a> Mover<'a> {
         }
     }
 
-    /// Space on the cache branch that retiring moves free once their sources
-    /// are unlinked.
-    pub fn retiring_bytes(&self) -> u64 {
-        self.retiring.iter().map(|r| r.source.allocated).sum()
+    /// Space on the cache branch (`st_blocks`) that the moves so far free:
+    /// the move units already moved, and those still retiring. A retiring
+    /// move that is rolled back drops out.
+    pub fn allocated_bytes(&self) -> u64 {
+        let retiring: u64 = self.retiring.iter().map(|r| r.source.allocated).sum();
+        self.moved_bytes + retiring
     }
 
     /// Waits until every retiring move has finished.
@@ -274,7 +279,14 @@ impl<'a> Mover<'a> {
                 Err(abort) => Some(retiring.roll_back(self.fs).and_then(|()| Err(abort))),
                 Ok(()) if retiring.retired_at.elapsed() >= retire_wait() => {
                     match retiring.source.check_links() {
-                        Ok(()) => Some(retiring.unlink(self.fs).map(|()| hash)),
+                        Ok(()) => {
+                            let allocated = retiring.source.allocated;
+                            let unlinked = retiring.unlink(self.fs);
+                            if unlinked.is_ok() {
+                                self.moved_bytes += allocated;
+                            }
+                            Some(unlinked.map(|()| hash))
+                        }
                         Err(abort) => Some(retiring.roll_back(self.fs).and_then(|()| Err(abort))),
                     }
                 }
@@ -445,7 +457,9 @@ impl<'a> Mover<'a> {
 
         let published = published?;
         let hash = Hash(xxh3_128(source.target.as_encoded_bytes()));
+        let allocated = source.stat.st_blocks.max(0) as u64 * 512;
         source.retire(published)?;
+        self.moved_bytes += allocated;
         Ok(hash)
     }
 
@@ -557,6 +571,29 @@ impl<'a> Mover<'a> {
             )));
         }
         Ok(())
+    }
+}
+
+/// Why a move of the move unit of the given kind at `rels` would skip it if
+/// it started now, or `None` if it would move it. Leaves the files as they
+/// are: it only takes the guard's lease, and releases it.
+pub fn would_skip(
+    fs: &dyn FsOps,
+    cache_branch: &Branch,
+    guard: &Guard,
+    rels: &[PathBuf],
+    kind: Kind,
+) -> Result<Option<Skip>> {
+    let checked = match kind {
+        Kind::Regular => Source::open(fs, cache_branch, rels, guard).map(drop),
+        Kind::Symlink => Link::open(fs, cache_branch, &rels[0], guard).map(drop),
+        Kind::Special => Err(Abort::Skip(Skip::SpecialFile)),
+        Kind::PartlyExcluded => Err(Abort::Skip(Skip::PartlyExcluded)),
+    };
+    match checked {
+        Ok(()) => Ok(None),
+        Err(Abort::Skip(skip)) => Ok(Some(skip)),
+        Err(Abort::Fail(e)) => Err(e),
     }
 }
 

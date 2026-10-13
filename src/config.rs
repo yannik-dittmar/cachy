@@ -7,12 +7,20 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 use crate::exclude::Exclusions;
+use crate::layout::BranchSpec;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub cache_branch: PathBuf,
-    pub backing_branches: Vec<PathBuf>,
+    /// The cache pool's mount point, whose mergerfs runtime interface lists
+    /// the backing branches.
+    #[serde(default)]
+    pub cache_pool: Option<PathBuf>,
+    /// The backing branches, in mergerfs's branch syntax, for when there is no
+    /// cache pool or its runtime interface is unavailable.
+    #[serde(default, deserialize_with = "branch_specs")]
+    pub backing_branches: Option<Vec<BranchSpec>>,
     #[serde(deserialize_with = "free_space")]
     pub threshold: FreeSpace,
     #[serde(deserialize_with = "free_space")]
@@ -154,6 +162,18 @@ pub enum LeaseType {
     Write,
 }
 
+fn branch_specs<'de, D: serde::Deserializer<'de>>(
+    de: D,
+) -> Result<Option<Vec<BranchSpec>>, D::Error> {
+    let specs = Vec::<String>::deserialize(de)?;
+    specs
+        .iter()
+        .map(|spec| BranchSpec::parse(spec.as_bytes()))
+        .collect::<Result<_, _>>()
+        .map(Some)
+        .map_err(|e| serde::de::Error::custom(format!("backing_branches: {e}")))
+}
+
 fn exclusions<'de, D: serde::Deserializer<'de>>(de: D) -> Result<Exclusions, D::Error> {
     let patterns = Vec::<String>::deserialize(de)?;
     Exclusions::new(&patterns).map_err(|e| serde::de::Error::custom(format!("exclude: {e}")))
@@ -172,11 +192,16 @@ impl Config {
 
     fn parse(text: &str) -> Result<Config> {
         let config: Config = serde_yaml_ng::from_str(text)?;
-        if config.backing_branches.len() != 1 {
-            bail!(
-                "backing_branches must list exactly one backing branch (found {})",
-                config.backing_branches.len()
-            );
+        match &config.backing_branches {
+            None if config.cache_pool.is_none() => {
+                bail!(
+                    "set cache_pool, backing_branches or both, so cachy finds the backing branches"
+                )
+            }
+            Some(specs) if specs.is_empty() => {
+                bail!("backing_branches must list at least one backing branch")
+            }
+            _ => {}
         }
         if config.target.above(config.threshold) == Some(false) {
             bail!(
@@ -303,7 +328,7 @@ pub fn parse_duration(s: &str) -> Option<Duration> {
     parse_with_unit(s, UNITS, None).map(Duration::from_secs)
 }
 
-fn parse_byte_size(s: &str) -> Option<u64> {
+pub fn parse_byte_size(s: &str) -> Option<u64> {
     const UNITS: &[(u8, u64)] = &[
         (b'K', 1 << 10),
         (b'M', 1 << 20),

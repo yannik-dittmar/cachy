@@ -5,9 +5,31 @@
 # The fast branch that cachy drains: the first branch of the cache pool.
 cache_branch: /mnt/cache
 
-# The slow branch that receives moved files. Exactly one, for now.
+# The cache pool: the mergerfs mount over the cache branch and the backing
+# branches. cachy reads its branches, with their modes and minfreespace, from
+# mergerfs's runtime interface (<cache pool>/.mergerfs), and refuses to run
+# unless the cache branch is its first branch. It also warns if the cache
+# pool's moveonenospc can move files back onto the cache branch, or if the
+# threshold is below the cache branch's minfreespace.
+cache_pool: /mnt/pool
+
+# The slow branches that receive moved files, for when the cache pool's
+# runtime interface is unavailable (xattr=nosys) or no cache_pool is set. A
+# single filesystem is a backing pool with one branch. Each entry uses
+# mergerfs's branch syntax: <path>[=<mode>[,<minfreespace>]], where the mode is
+#   RW - takes moved files (default)
+#   RO - read-only: never written to
+#   NC - no-create: never receives moved files
+# and minfreespace (default 0) is free space that a move must leave on the
+# branch. With a readable cache pool, this list is ignored.
 backing_branches:
   - /mnt/storage
+
+# Each file moves to one backing branch that takes new files, keeps its
+# minfreespace free and has room for the whole file (all links of a hardlink
+# group go together). Of those, cachy prefers a branch that already has the
+# file's directory, then the one with the most free space. Each branch takes
+# one move at a time; different branches move in parallel.
 
 # A run starts when the cache branch's free space falls below the threshold,
 # and moves files until free space reaches the target. Either may also be a

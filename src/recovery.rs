@@ -3,7 +3,7 @@
 //!
 //! Recovery lists only the staging directories, never the rest of a branch,
 //! and deletes nothing outside them. Each leftover is resolved against its
-//! published counterpart, the file at the same relpath on the backing branch:
+//! published counterpart, the file at the same relpath on a backing branch:
 //!
 //! - A retired source (in the cache branch's staging directory) is deleted if
 //!   it is identical to its published counterpart and not in use. Otherwise
@@ -18,7 +18,9 @@
 //!   symlink open, so it takes no lease.
 //! - A temp file (in a backing branch's staging directory) is deleted. A move
 //!   retires its source only once the copy is published, so a temp file is
-//!   never the only copy of anything.
+//!   never the only copy of anything. Recovery never writes to a branch that
+//!   takes no new files (`RO` or `NC`), so leftovers there stay, with a
+//!   warning, until the branch takes new files again.
 
 use std::io;
 use std::os::fd::{AsFd, OwnedFd};
@@ -27,32 +29,47 @@ use std::path::Path;
 use anyhow::{Context, Result};
 
 use crate::fsops::{FsOps, Lease};
+use crate::layout::BackingBranch;
 use crate::metadata::AllowedLosses;
 use crate::transaction::{
     Branch, STAGING, identical, identical_symlinks, make_dirs_like, open_dirs, split,
 };
 
 /// Resolves the leftovers in the staging directories of the cache branch and
-/// the backing branch, then removes the staging directories once empty.
+/// of the backing branches that take new files, then removes the staging
+/// directories once empty.
 /// A retired source counts as in use if another open conflicts with `lease`.
 /// Returns how many leftovers could not be resolved; they stay where they are.
 pub fn recover(
     fs: &dyn FsOps,
     cache_branch: &Branch,
-    backing_branch: &Branch,
+    backing_branches: &[BackingBranch],
     lease: Lease,
     allowed_losses: AllowedLosses,
 ) -> usize {
     let mut recovery = Recovery {
         fs,
         cache_branch,
-        backing_branch,
+        backing_branches,
         lease,
         allowed_losses,
         unresolved: 0,
     };
     recovery.resolve_staging_directory(cache_branch, Leftover::RetiredSource);
-    recovery.resolve_staging_directory(backing_branch, Leftover::TempFile);
+    for backing in backing_branches {
+        if backing.takes_new_files() {
+            recovery.resolve_staging_directory(&backing.branch, Leftover::TempFile);
+        } else {
+            // cachy never writes to it, not even to recover.
+            let staging = backing.branch.path.join(STAGING);
+            if staging.symlink_metadata().is_ok() {
+                eprintln!(
+                    "cachy: warning: {} holds leftovers of an unfinished move, which recovery leaves alone while the branch takes no new files",
+                    staging.display()
+                );
+            }
+        }
+    }
     recovery.unresolved
 }
 
@@ -69,7 +86,7 @@ enum Leftover {
 struct Recovery<'a> {
     fs: &'a dyn FsOps,
     cache_branch: &'a Branch,
-    backing_branch: &'a Branch,
+    backing_branches: &'a [BackingBranch],
     lease: Lease,
     allowed_losses: AllowedLosses,
     unresolved: usize,
@@ -163,10 +180,12 @@ impl Recovery<'_> {
         let retired = fs.open_read(staged_dir.as_fd(), name);
         let redundant = retired.as_ref().is_ok_and(|retired| {
             fs.set_lease(retired.as_fd(), self.lease).is_ok()
-                && open_dirs(fs, &self.backing_branch.fd, parent)
-                    .and_then(|dir| fs.open_read(dir.as_fd(), name))
-                    .and_then(|published| identical(fs, retired, &published))
-                    .unwrap_or(false)
+                && self.backing_branches.iter().any(|backing| {
+                    open_dirs(fs, &backing.branch.fd, parent)
+                        .and_then(|dir| fs.open_read(dir.as_fd(), name))
+                        .and_then(|published| identical(fs, retired, &published))
+                        .unwrap_or(false)
+                })
                 // A conflicting open since the lease was taken.
                 && fs.lease(retired.as_fd()).is_ok_and(|lease| lease == self.lease)
         });
@@ -178,9 +197,11 @@ impl Recovery<'_> {
     /// branch otherwise.
     fn resolve_retired_symlink(&self, staged_dir: &OwnedFd, rel: &Path) -> Result<&'static str> {
         let (parent, name) = split(rel);
-        let redundant = open_dirs(self.fs, &self.backing_branch.fd, parent)
-            .and_then(|dir| identical_symlinks(self.fs, staged_dir, name, &dir, name))
-            .unwrap_or(false);
+        let redundant = self.backing_branches.iter().any(|backing| {
+            open_dirs(self.fs, &backing.branch.fd, parent)
+                .and_then(|dir| identical_symlinks(self.fs, staged_dir, name, &dir, name))
+                .unwrap_or(false)
+        });
         self.delete_or_rename_back(staged_dir, rel, redundant)
     }
 
@@ -202,12 +223,19 @@ impl Recovery<'_> {
             return Ok("deleted, identical to its published copy");
         }
         // A directory recreated on the cache branch takes the metadata of its
-        // counterpart on the backing branch, if there is one.
+        // counterpart on a backing branch, if there is one: on the first
+        // backing branch that has the parent directory. Looked up outside the
+        // port, like placement.
+        let template = self
+            .backing_branches
+            .iter()
+            .find(|backing| backing.branch.has_dir(parent))
+            .unwrap_or(&self.backing_branches[0]);
         let dest = make_dirs_like(
             fs,
             self.cache_branch,
             parent,
-            &self.backing_branch.fd,
+            &template.branch.fd,
             self.allowed_losses,
             &mut Vec::new(),
         )

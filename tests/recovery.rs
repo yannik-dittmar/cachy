@@ -294,3 +294,95 @@ fn recreated_cache_directory_takes_the_backing_directory_metadata() {
     assert_eq!(common::xattrs(&recreated), common::xattrs(&backing_dir));
     fx.assert_no_staging_directories();
 }
+
+/// A config for `fx` with the given backing branches (in mergerfs's branch
+/// syntax), under which the check finds no work, so cachy only recovers.
+fn no_work_layout_config(fx: &Fixture, branches: &[String]) -> String {
+    let mut layout = "backing_branches:\n".to_owned();
+    for branch in branches {
+        layout += &format!("  - {branch}\n");
+    }
+    fx.layout_config(&layout)
+        .replace("threshold: 1T\ntarget: 2T", "threshold: 0\ntarget: 1")
+}
+
+#[test]
+fn retired_source_identical_to_its_published_copy_on_another_branch_is_deleted() {
+    let fx = Fixture::new();
+    let other = fx.extra_backing_branch();
+    fx.staged_cache_branch_file("dir/file.bin", b"content", 1_000);
+    common::write_file(&other.path().join("dir/file.bin"), b"content", 1_000);
+    let config = no_work_layout_config(
+        &fx,
+        &[
+            fx.backing_branch.path().display().to_string(),
+            format!("{}=NC", other.path().display()),
+        ],
+    );
+
+    assert_exit(&fx.run(&config), 0);
+
+    assert!(!fx.on_cache_branch("dir/file.bin").exists());
+    assert_eq!(
+        fs::read(other.path().join("dir/file.bin")).unwrap(),
+        b"content"
+    );
+    fx.assert_no_staging_directories();
+}
+
+#[test]
+fn renamed_back_retired_source_gets_directories_like_the_branch_that_has_them() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fx = Fixture::new();
+    let other = fx.extra_backing_branch();
+    fx.staged_cache_branch_file("dir/file.bin", b"content", 1_000);
+    fs::create_dir(other.path().join("dir")).unwrap();
+    fs::set_permissions(other.path().join("dir"), fs::Permissions::from_mode(0o750)).unwrap();
+    let config = no_work_layout_config(
+        &fx,
+        &[
+            fx.backing_branch.path().display().to_string(),
+            other.path().display().to_string(),
+        ],
+    );
+
+    assert_exit(&fx.run(&config), 0);
+
+    assert_eq!(
+        fs::read(fx.on_cache_branch("dir/file.bin")).unwrap(),
+        b"content"
+    );
+    let mode = fs::metadata(fx.on_cache_branch("dir")).unwrap().mode();
+    assert_eq!(mode & 0o7777, 0o750);
+}
+
+#[test]
+fn temp_files_on_branches_that_take_new_files_are_deleted_and_others_left_alone() {
+    let fx = Fixture::new();
+    let other = fx.extra_backing_branch();
+    let no_create = fx.extra_backing_branch();
+    fx.cache_branch_file("dir/file.bin", b"content", 1_000);
+    fx.staged_backing_branch_file("dir/file.bin", b"cont", 1_000);
+    let staged = |branch: &Path| branch.join(common::STAGING).join("dir/file.bin");
+    common::write_file(&staged(other.path()), b"co", 1_000);
+    common::write_file(&staged(no_create.path()), b"c", 1_000);
+    let config = no_work_layout_config(
+        &fx,
+        &[
+            fx.backing_branch.path().display().to_string(),
+            other.path().display().to_string(),
+            format!("{}=NC", no_create.path().display()),
+        ],
+    );
+
+    let err = assert_exit(&fx.run(&config), 0);
+
+    fx.assert_no_staging_directories();
+    assert!(!other.path().join(common::STAGING).exists());
+    assert_eq!(fs::read(staged(no_create.path())).unwrap(), b"c");
+    assert!(
+        err.contains("which recovery leaves alone while the branch takes no new files"),
+        "stderr:\n{err}"
+    );
+}

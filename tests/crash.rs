@@ -766,7 +766,10 @@ mod fault_injection {
 
             assert_eq!(out.status.code(), Some(2), "{op}; stderr:\n{err}");
             assert!(err.contains("metadata: "), "{op}; stderr:\n{err}");
-            if err.contains("cannot set the times of created directory dir: metadata") {
+            if err.contains(&format!(
+                "cannot set the times of created directory {}: metadata",
+                fx.on_backing_branch("dir").display()
+            )) {
                 // The move itself had finished; only the run fails.
                 assert_eq!(fs::read(fx.on_backing_branch(rel)).unwrap(), b"content");
                 assert!(!fx.on_cache_branch(rel).exists(), "{op}; stderr:\n{err}");

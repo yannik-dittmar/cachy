@@ -3,7 +3,9 @@ mod exclude;
 #[cfg(feature = "fault-injection")]
 mod fault;
 mod fsops;
+mod layout;
 mod metadata;
+mod placement;
 mod recovery;
 mod run;
 mod scan;

@@ -265,6 +265,21 @@ impl Fixture {
         self.config("1T", "2T")
     }
 
+    /// Like [`Fixture::move_everything_config`], but with the storage layout
+    /// given by `layout`: YAML lines that set `cache_pool`,
+    /// `backing_branches` or both, in place of the fixture's backing branch.
+    pub fn layout_config(&self, layout: &str) -> String {
+        format!(
+            "cache_branch: {}\n{layout}threshold: 1T\ntarget: 2T\nminimum_age: 0s\n",
+            self.cache_branch.path().display(),
+        )
+    }
+
+    /// Another backing branch, in the same directory as the fixture's.
+    pub fn extra_backing_branch(&self) -> TempDir {
+        create_branch(BACKING_BRANCH_FS, None, "cachy-backing-").0
+    }
+
     /// A config under which the check finds no work, so cachy only recovers.
     pub fn no_work_config(&self) -> String {
         self.config("0", "1")
@@ -274,7 +289,19 @@ impl Fixture {
     /// stderr) if mergerfs or passwordless sudo is unavailable outside the
     /// privileged tier.
     pub fn cache_pool(&self) -> Option<CachePool> {
-        match CachePool::mount(self.cache_branch.path(), self.backing_branch.path()) {
+        let branches = format!(
+            "{}:{}",
+            self.cache_branch.path().display(),
+            self.backing_branch.path().display()
+        );
+        self.cache_pool_with(&branches, "")
+    }
+
+    /// A cache pool over `branches`, in mergerfs's branch syntax, with the
+    /// extra mergerfs `options` (comma-separated, may be empty); `None` as for
+    /// [`Fixture::cache_pool`].
+    pub fn cache_pool_with(&self, branches: &str, options: &str) -> Option<CachePool> {
+        match CachePool::mount(branches, options) {
             Ok(pool) => Some(pool),
             Err(e) if !privileged() => {
                 skip(&format!("no cache pool: {e}"));
@@ -362,20 +389,28 @@ pub struct CachePool {
 }
 
 impl CachePool {
-    fn mount(cache_branch: &Path, backing_branch: &Path) -> Result<CachePool, String> {
+    fn mount(branches: &str, options: &str) -> Result<CachePool, String> {
         let mountpoint = tempfile::Builder::new()
             .prefix("cachy-pool-")
             .tempdir()
             .map_err(|e| e.to_string())?;
-        let branches = format!("{}:{}", cache_branch.display(), backing_branch.display());
+        let mut all_options =
+            "category.create=ff,minfreespace=1M,allow_other,fsname=cachy-test-pool".to_owned();
+        if !options.is_empty() {
+            all_options = format!("{all_options},{options}");
+        }
         sudo(&[
             OsStr::new("mergerfs"),
             OsStr::new("-o"),
-            OsStr::new("category.create=ff,minfreespace=1M,allow_other,fsname=cachy-test-pool"),
-            OsStr::new(&branches),
+            OsStr::new(&all_options),
+            OsStr::new(branches),
             mountpoint.path().as_os_str(),
         ])?;
         Ok(CachePool { mountpoint })
+    }
+
+    pub fn mountpoint(&self) -> &Path {
+        self.mountpoint.path()
     }
 
     /// The path of `rel` as applications see it, through the cache pool.
@@ -397,6 +432,97 @@ impl Drop for CachePool {
             // pool.
             eprintln!("cannot unmount the cache pool: {e}");
             self.mountpoint.disable_cleanup(true);
+        }
+    }
+}
+
+/// A directory that stands in for a cache pool: its `.mergerfs` file carries
+/// the `user.mergerfs.*` xattrs that mergerfs's runtime interface serves, so
+/// layout discovery can be tested without mergerfs.
+pub struct FakeCachePool {
+    dir: TempDir,
+}
+
+impl FakeCachePool {
+    /// A fake cache pool whose branches read as `branches`, in mergerfs's
+    /// format (`<path>=<mode>[,<minfreespace>]`, separated by `:`), with
+    /// `minfreespace` 1M (as small test filesystems need, like [`CachePool`])
+    /// and `moveonenospc` off.
+    pub fn new(branches: &str) -> FakeCachePool {
+        let pool = FakeCachePool {
+            dir: tempfile::tempdir().unwrap(),
+        };
+        fs::write(pool.dir.path().join(".mergerfs"), b"").unwrap();
+        pool.set("branches", branches);
+        pool.set("minfreespace", "1M");
+        pool.set("moveonenospc", "false");
+        pool
+    }
+
+    pub fn path(&self) -> &Path {
+        self.dir.path()
+    }
+
+    /// Sets the value that `user.mergerfs.<key>` reads as.
+    pub fn set(&self, key: &str, value: &str) {
+        set_xattr(
+            &self.dir.path().join(".mergerfs"),
+            &format!("user.mergerfs.{key}"),
+            value.as_bytes(),
+        )
+        .unwrap();
+    }
+}
+
+/// A backing branch on a tmpfs of its own, of a given size, so that tests can
+/// give branches different free space. Mounted through passwordless sudo,
+/// owned by the invoking user, and unmounted on drop.
+pub struct TmpfsBranch {
+    dir: TempDir,
+}
+
+impl TmpfsBranch {
+    /// A tmpfs branch of `size` (such as `4M`), or `None` (with a note on
+    /// stderr) if mounting is unavailable outside the privileged tier.
+    pub fn mount(size: &str) -> Option<TmpfsBranch> {
+        let dir = tempfile::Builder::new()
+            .prefix("cachy-tmpfs-")
+            .tempdir()
+            .unwrap();
+        let options = format!(
+            "size={size},uid={},gid={},mode=0755",
+            rustix::process::getuid().as_raw(),
+            rustix::process::getgid().as_raw()
+        );
+        let mounted = sudo(&[
+            OsStr::new("mount"),
+            OsStr::new("-t"),
+            OsStr::new("tmpfs"),
+            OsStr::new("-o"),
+            OsStr::new(&options),
+            OsStr::new("cachy-test-branch"),
+            dir.path().as_os_str(),
+        ]);
+        match mounted {
+            Ok(()) => Some(TmpfsBranch { dir }),
+            Err(e) if !privileged() => {
+                skip(&format!("no tmpfs branch: {e}"));
+                None
+            }
+            Err(e) => panic!("no tmpfs branch: {e}"),
+        }
+    }
+
+    pub fn path(&self) -> &Path {
+        self.dir.path()
+    }
+}
+
+impl Drop for TmpfsBranch {
+    fn drop(&mut self) {
+        if let Err(e) = sudo(&[OsStr::new("umount"), self.dir.path().as_os_str()]) {
+            eprintln!("cannot unmount the tmpfs branch: {e}");
+            self.dir.disable_cleanup(true);
         }
     }
 }
@@ -524,7 +650,7 @@ pub fn assert_exit(out: &Output, code: i32) -> String {
     err
 }
 
-fn write_file(path: &Path, content: &[u8], mtime: i64) {
+pub fn write_file(path: &Path, content: &[u8], mtime: i64) {
     let _writing = SPAWN.write().unwrap_or_else(|e| e.into_inner());
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(path, content).unwrap();

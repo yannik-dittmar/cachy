@@ -80,6 +80,7 @@ fn every_moved_file_reports_the_hash_of_its_source() {
     let sparse = sparse_file(&fx, "dir/disk.img");
 
     let err = assert_exit(&fx.run(&fx.move_everything_config()), 0);
+    let branch = fx.backing_branch.path().display();
 
     // XXH3-128 of each content, computed independently with the reference
     // C library (Python's `xxhash`).
@@ -88,13 +89,15 @@ fn every_moved_file_reports_the_hash_of_its_source() {
         ("empty", "99aa06d3014798d86001c324468d497f"),
     ] {
         assert!(
-            err.contains(&format!("cachy: moved {rel} (xxh3 {hash})")),
+            err.contains(&format!("cachy: moved {rel} to {branch} (xxh3 {hash})")),
             "no hash for {rel}; stderr:\n{err}"
         );
     }
     let sparse_hash = format!("{:032x}", xxhash_rust::xxh3::xxh3_128(&sparse));
     assert!(
-        err.contains(&format!("cachy: moved dir/disk.img (xxh3 {sparse_hash})")),
+        err.contains(&format!(
+            "cachy: moved dir/disk.img to {branch} (xxh3 {sparse_hash})"
+        )),
         "no hash for the sparse file; stderr:\n{err}"
     );
 }

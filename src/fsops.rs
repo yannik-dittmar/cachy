@@ -61,7 +61,7 @@ impl Lease {
     }
 }
 
-pub trait FsOps {
+pub trait FsOps: Sync {
     /// Opens the directory `path` relative to `dir`, without following a
     /// final symlink.
     fn open_dir(&self, dir: BorrowedFd, path: &Path) -> io::Result<OwnedFd>;

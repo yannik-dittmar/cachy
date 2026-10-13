@@ -1,8 +1,10 @@
 //! The run orchestrator: performs the check and, if it finds work, moves files
 //! until the run's byte budget is consumed.
 
+use std::collections::{HashMap, VecDeque};
 use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -10,10 +12,14 @@ use anyhow::{Context, Result, bail};
 
 use crate::config::{Config, LeaseType, Order};
 use crate::fsops::{FsOps, FsStat, Lease};
+use crate::layout::{self, BackingBranch};
 use crate::metadata::AllowedLosses;
+use crate::placement::{Placement, Unplaced};
 use crate::recovery::recover;
-use crate::scan::{Entry, scan};
-use crate::transaction::{Branch, Guard, MoveOutcome, Mover, STAGING, would_skip};
+use crate::scan::{Entry, Kind, scan};
+use crate::transaction::{
+    Branch, Guard, MoveOutcome, Mover, RETIRING_POLL, STAGING, Skip, would_skip,
+};
 
 pub struct Outcome {
     /// Number of moves that were attempted and failed; in a dry run, the
@@ -71,10 +77,6 @@ fn freed_wait() -> Duration {
 pub fn run(fs: &dyn FsOps, config: &Config, options: Options) -> Result<Outcome> {
     let cache_branch = Branch::open(&config.cache_branch)
         .with_context(|| format!("cannot open cache branch {}", config.cache_branch.display()))?;
-    let backing_root = &config.backing_branches[0];
-    let backing_branch = Branch::open(backing_root)
-        .with_context(|| format!("cannot open backing branch {}", backing_root.display()))?;
-
     let cache_fs = FsStat::of(cache_branch.fd.as_fd()).with_context(|| {
         format!(
             "cannot measure the size of cache branch {}",
@@ -91,6 +93,7 @@ pub fn run(fs: &dyn FsOps, config: &Config, options: Options) -> Result<Outcome>
             cache_fs.size
         );
     }
+    let backing_branches = layout::discover(config, &cache_branch, threshold)?;
 
     ignore_lease_break_signal();
     let guard = Guard {
@@ -102,13 +105,13 @@ pub fn run(fs: &dyn FsOps, config: &Config, options: Options) -> Result<Outcome>
     };
     let allowed_losses = AllowedLosses::of(&config.allow_metadata_loss);
     let unresolved = if options.dry_run {
-        warn_of_leftovers(&cache_branch, &backing_branch);
+        warn_of_leftovers(&cache_branch, &backing_branches);
         0
     } else {
         recover(
             fs,
             &cache_branch,
-            &backing_branch,
+            &backing_branches,
             guard.lease,
             allowed_losses,
         )
@@ -187,45 +190,42 @@ pub fn run(fs: &dyn FsOps, config: &Config, options: Options) -> Result<Outcome>
         past_max_age,
         budget,
     };
+    let mut placement = Placement::new(&backing_branches);
     if options.dry_run {
-        outcome.failed = dry_run(fs, &cache_branch, &guard, &entries, stop);
+        outcome.failed = dry_run(fs, &cache_branch, &guard, &entries, stop, &mut placement);
         return Ok(outcome);
     }
 
+    let movers = backing_branches
+        .iter()
+        .map(|backing| {
+            backing.takes_new_files().then(|| {
+                Mover::new(
+                    fs,
+                    &cache_branch,
+                    &backing.branch,
+                    &guard,
+                    allowed_losses,
+                    config.verify,
+                )
+            })
+        })
+        .collect();
     let mut tally = Tally::default();
-    let mut mover = Mover::new(
-        fs,
-        &cache_branch,
-        &backing_branch,
-        &guard,
-        allowed_losses,
-        config.verify,
-    );
-    for (i, entry) in entries.iter().enumerate() {
-        tally.record(mover.finished());
-        if stop.before(i, mover.allocated_bytes()) {
-            // A retiring move that is rolled back hands its bytes back.
-            mover.finish();
-            tally.record(mover.finished());
-            if stop.before(i, mover.allocated_bytes()) {
-                break;
-            }
-        }
-        mover.start(&entry.rels, entry.kind);
-    }
-    mover.finish();
-    tally.record(mover.finished());
-    let undated = mover.date_created_dirs();
-    for (rel, e) in &undated {
+    let (moved_bytes, undated) = move_units(movers, &entries, stop, &mut placement, &mut tally);
+    for (path, e) in &undated {
         eprintln!(
             "cachy: error: cannot set the times of created directory {}: {e:#}",
-            rel.display()
+            path.display()
         );
     }
     outcome.undated_dirs = undated.len();
-    let moved_bytes = mover.allocated_bytes();
 
-    for branch in [&cache_branch, &backing_branch] {
+    let written = backing_branches
+        .iter()
+        .filter(|backing| backing.takes_new_files())
+        .map(|backing| &backing.branch);
+    for branch in std::iter::once(&cache_branch).chain(written) {
         // Fails harmlessly if the staging directory is absent or not empty.
         let _ = fs.rmdir(branch.fd.as_fd(), Path::new(STAGING));
     }
@@ -254,6 +254,328 @@ pub fn run(fs: &dyn FsOps, config: &Config, options: Options) -> Result<Outcome>
     eprintln!("cachy: run finished: {moved} moved, {skipped} skipped, {failed} failed");
     outcome.failed = failed;
     Ok(outcome)
+}
+
+/// How many move units the dispatcher places ahead of the moves that have
+/// started, across all backing branches. Placing ahead lets a branch start
+/// its next move while another branch works through a run of move units;
+/// the limit keeps the free space that placement sees recent.
+const LOOKAHEAD: usize = 64;
+
+/// What a worker tells the dispatcher.
+enum Report<'a> {
+    /// The state of the worker for the backing branch `index`.
+    State {
+        index: usize,
+        /// The worker has started the next move unit in its queue.
+        started: bool,
+        /// [`Mover::allocated_bytes`].
+        allocated: u64,
+        /// [`Mover::retiring`].
+        retiring: bool,
+        finished: Vec<(&'a [PathBuf], Result<MoveOutcome>)>,
+        /// The sizes (`st_size`) of the finished move units that did not
+        /// move.
+        unmoved: u64,
+    },
+    /// The worker for the backing branch `index` has stopped: once its queue
+    /// has ended, or by panicking.
+    Exited { index: usize },
+}
+
+/// What the dispatcher knows of a worker.
+struct Worker<'a> {
+    /// The path of its backing branch.
+    path: PathBuf,
+    /// Where the dispatcher queues move units for it; `None` once the queue
+    /// has ended.
+    queue: Option<mpsc::Sender<&'a Entry>>,
+    /// The space (`st_blocks`) of each queued move unit that has not
+    /// started, in order.
+    queued: VecDeque<u64>,
+    allocated: u64,
+    retiring: bool,
+}
+
+/// Moves `entries`, in order, each to the backing branch that placement
+/// chooses, until the run stops by `stop`. Each backing branch that
+/// takes new files has a mover (`None` for the others), which runs on a
+/// worker thread of its own and works through a queue of move units: moves
+/// on one branch run one at a time, and moves on different branches in
+/// parallel. Returns the space the moves freed on the cache branch, and the
+/// directories created on backing branches whose times could not be set.
+fn move_units<'a>(
+    movers: Vec<Option<Mover<'a>>>,
+    entries: &'a [Entry],
+    stop: Stop,
+    placement: &mut Placement,
+    tally: &mut Tally,
+) -> (u64, Vec<(PathBuf, anyhow::Error)>) {
+    thread::scope(|scope| {
+        let (report_tx, reports) = mpsc::channel();
+        let mut handles = Vec::new();
+        let workers = movers
+            .into_iter()
+            .enumerate()
+            .map(|(index, mover)| {
+                let mover = mover?;
+                let (queue, units) = mpsc::channel();
+                let path = mover.backing_branch().to_owned();
+                let report_tx = report_tx.clone();
+                handles.push(scope.spawn(move || work(index, mover, units, report_tx)));
+                Some(Worker {
+                    path,
+                    queue: Some(queue),
+                    queued: VecDeque::new(),
+                    allocated: 0,
+                    retiring: false,
+                })
+            })
+            .collect();
+        drop(report_tx);
+
+        let mut dispatcher = Dispatcher {
+            workers,
+            placement,
+            tally,
+        };
+        let next = || reports.recv().expect("the workers are running");
+        'entries: for (i, entry) in entries.iter().enumerate() {
+            while let Ok(report) = reports.try_recv() {
+                dispatcher.apply(report);
+            }
+            // A retiring move that is rolled back hands its bytes back, so the
+            // budget is consumed only once no move is queued or retiring.
+            while stop.before(i, dispatcher.committed()) {
+                if dispatcher.settled() {
+                    break 'entries;
+                }
+                dispatcher.apply(next());
+            }
+            while dispatcher.queued() >= LOOKAHEAD {
+                dispatcher.apply(next());
+            }
+            let skip = match entry.kind {
+                Kind::Special => Some(Skip::SpecialFile),
+                Kind::PartlyExcluded => Some(Skip::PartlyExcluded),
+                Kind::Regular | Kind::Symlink => None,
+            };
+            if let Some(skip) = skip {
+                dispatcher.tally.skip(&entry.rels, skip);
+                continue;
+            }
+            let mut placed = dispatcher.placement.place(&entry.rels, entry.size);
+            if matches!(placed, Err(Unplaced::NoRoom)) && !dispatcher.settled() {
+                // Queued move units that do not move give their space back.
+                while !dispatcher.settled() {
+                    dispatcher.apply(next());
+                }
+                placed = dispatcher.placement.place(&entry.rels, entry.size);
+            }
+            match placed {
+                Ok(index) => dispatcher.queue(index, entry),
+                Err(Unplaced::NoRoom) => dispatcher.tally.skip(&entry.rels, Skip::NoRoom),
+                Err(unplaced) => dispatcher.tally.fail(&entry.rels, &unplaced),
+            }
+        }
+
+        // Ending the queues lets each worker finish its moves and exit.
+        for worker in dispatcher.workers.iter_mut().flatten() {
+            worker.queue = None;
+        }
+        for report in reports.iter() {
+            dispatcher.apply(report);
+        }
+        let moved = dispatcher.committed();
+        let undated = handles
+            .into_iter()
+            .flat_map(|handle| handle.join().expect("a panicked worker ends the run"))
+            .collect();
+        (moved, undated)
+    })
+}
+
+struct Dispatcher<'d, 'a, 'b> {
+    workers: Vec<Option<Worker<'a>>>,
+    placement: &'d mut Placement<'b>,
+    tally: &'d mut Tally,
+}
+
+impl<'a> Dispatcher<'_, 'a, '_> {
+    /// Queues `entry` for the worker of the backing branch `index`.
+    fn queue(&mut self, index: usize, entry: &'a Entry) {
+        let worker = self.workers[index]
+            .as_mut()
+            .expect("placement chooses only branches that take new files");
+        worker.queued.push_back(entry.allocated);
+        let queue = worker
+            .queue
+            .as_ref()
+            .expect("queues end after the last entry");
+        queue
+            .send(entry)
+            .expect("a worker runs until its queue ends");
+    }
+
+    fn apply(&mut self, report: Report<'_>) {
+        match report {
+            Report::State {
+                index,
+                started,
+                allocated,
+                retiring,
+                finished,
+                unmoved,
+            } => {
+                let worker = self.workers[index].as_mut().expect("a worker reports");
+                if started {
+                    worker.queued.pop_front();
+                }
+                worker.allocated = allocated;
+                worker.retiring = retiring;
+                self.tally.record(&worker.path, finished);
+                self.placement.release(index, unmoved);
+            }
+            Report::Exited { index } => {
+                let worker = self.workers[index].as_ref().expect("a worker reports");
+                // A worker stops early only by panicking; joining it passes
+                // the panic on.
+                assert!(
+                    worker.queue.is_none(),
+                    "the worker for backing branch {} stopped",
+                    worker.path.display()
+                );
+            }
+        }
+    }
+
+    /// Space on the cache branch that the moves so far free, counting the
+    /// queued move units in full.
+    fn committed(&self) -> u64 {
+        self.workers
+            .iter()
+            .flatten()
+            .map(|w| w.allocated + w.queued.iter().sum::<u64>())
+            .sum()
+    }
+
+    /// The number of queued move units that have not started.
+    fn queued(&self) -> usize {
+        self.workers.iter().flatten().map(|w| w.queued.len()).sum()
+    }
+
+    /// No move unit is queued and no move is retiring.
+    fn settled(&self) -> bool {
+        self.workers
+            .iter()
+            .flatten()
+            .all(|w| w.queued.is_empty() && !w.retiring)
+    }
+}
+
+/// Runs the moves of the move units that the dispatcher queues for `mover`,
+/// the mover for the backing branch `index`, until the queue ends and every
+/// retiring move has finished, reporting each change of its state. Returns
+/// the directories created on the branch whose times could not be set.
+fn work<'a>(
+    index: usize,
+    mut mover: Mover<'a>,
+    units: mpsc::Receiver<&'a Entry>,
+    reports: mpsc::Sender<Report<'a>>,
+) -> Vec<(PathBuf, anyhow::Error)> {
+    struct Exit<'a> {
+        index: usize,
+        reports: mpsc::Sender<Report<'a>>,
+    }
+    impl Drop for Exit<'_> {
+        fn drop(&mut self) {
+            let _ = self.reports.send(Report::Exited { index: self.index });
+        }
+    }
+    let _exit = Exit {
+        index,
+        reports: reports.clone(),
+    };
+    let mut reporter = Reporter {
+        index,
+        reports,
+        sizes: HashMap::new(),
+        last: (0, false),
+    };
+    loop {
+        let unit = if mover.retiring() {
+            units.recv_timeout(RETIRING_POLL)
+        } else {
+            units
+                .recv()
+                .map_err(|_| mpsc::RecvTimeoutError::Disconnected)
+        };
+        match unit {
+            Ok(entry) => {
+                reporter.sizes.insert(entry.rels.as_ptr(), entry.size);
+                mover.start(&entry.rels, entry.kind);
+                reporter.report(&mut mover, true);
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                mover.service();
+                reporter.report(&mut mover, false);
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    mover.finish();
+    reporter.report(&mut mover, false);
+    let path = mover.backing_branch().to_owned();
+    mover
+        .date_created_dirs()
+        .into_iter()
+        .map(|(rel, e)| (path.join(rel), e))
+        .collect()
+}
+
+/// Reports a worker's state to the dispatcher.
+struct Reporter<'a> {
+    index: usize,
+    reports: mpsc::Sender<Report<'a>>,
+    /// The size of each started move unit that has not finished, by the
+    /// address of its names.
+    sizes: HashMap<*const PathBuf, u64>,
+    /// [`Mover::allocated_bytes`] and [`Mover::retiring`] as last reported.
+    last: (u64, bool),
+}
+
+impl<'a> Reporter<'a> {
+    /// Reports the state of `mover`, if it `started` a move unit or changed
+    /// since the last report.
+    fn report(&mut self, mover: &mut Mover<'a>, started: bool) {
+        let finished = mover.finished();
+        let state = (mover.allocated_bytes(), mover.retiring());
+        if !started && finished.is_empty() && state == self.last {
+            return;
+        }
+        self.last = state;
+        let unmoved = finished
+            .iter()
+            .map(|(rels, outcome)| {
+                let size = self
+                    .sizes
+                    .remove(&rels.as_ptr())
+                    .expect("a finished move unit has started");
+                match outcome {
+                    Ok(MoveOutcome::Moved(_)) => 0,
+                    _ => size,
+                }
+            })
+            .sum();
+        let _ = self.reports.send(Report::State {
+            index: self.index,
+            started,
+            allocated: state.0,
+            retiring: state.1,
+            finished,
+            unmoved,
+        });
+    }
 }
 
 /// Free space once it has grown by enough of `moved_bytes` since
@@ -307,6 +629,7 @@ fn dry_run(
     guard: &Guard,
     entries: &[Entry],
     stop: Stop,
+    placement: &mut Placement,
 ) -> usize {
     match stop.budget {
         Some(budget) => println!("byte budget: {budget} bytes"),
@@ -318,7 +641,17 @@ fn dry_run(
             break;
         }
         let rel = names(&entry.rels);
-        match would_skip(fs, cache_branch, guard, &entry.rels, entry.kind) {
+        let checked = would_skip(fs, cache_branch, guard, &entry.rels, entry.kind)
+            .map_err(|e| e.context("cannot check"))
+            .and_then(|skip| match skip {
+                Some(skip) => Ok(Some(skip)),
+                None => match placement.place(&entry.rels, entry.size) {
+                    Ok(_) => Ok(None),
+                    Err(Unplaced::NoRoom) => Ok(Some(Skip::NoRoom)),
+                    Err(unplaced) => Err(anyhow::anyhow!("{unplaced}").context("would fail")),
+                },
+            });
+        match checked {
             Ok(None) => {
                 println!("would move {rel}");
                 planned += entry.allocated;
@@ -329,7 +662,7 @@ fn dry_run(
                 skips += 1;
             }
             Err(e) => {
-                eprintln!("cachy: error: cannot check {rel}: {e:#}");
+                eprintln!("cachy: error: {rel}: {e:#}");
                 failed += 1;
             }
         }
@@ -342,8 +675,9 @@ fn dry_run(
 
 /// A dry run does not recover, so it notes the staging directories that the
 /// next run's recovery will resolve.
-fn warn_of_leftovers(cache_branch: &Branch, backing_branch: &Branch) {
-    for branch in [cache_branch, backing_branch] {
+fn warn_of_leftovers(cache_branch: &Branch, backing_branches: &[BackingBranch]) {
+    let backing = backing_branches.iter().map(|backing| &backing.branch);
+    for branch in std::iter::once(cache_branch).chain(backing) {
         let staging = branch.path.join(STAGING);
         if staging.symlink_metadata().is_ok() {
             eprintln!(
@@ -363,13 +697,14 @@ struct Tally {
 }
 
 impl Tally {
-    fn record(&mut self, finished: Vec<(&[PathBuf], Result<MoveOutcome>)>) {
+    /// Records the outcomes of moves to the backing branch at `branch`.
+    fn record(&mut self, branch: &Path, finished: Vec<(&[PathBuf], Result<MoveOutcome>)>) {
         for (rels, outcome) in finished {
             let rel = names(rels);
             match outcome {
                 Ok(MoveOutcome::Moved(hash)) => {
                     self.moved += 1;
-                    eprintln!("cachy: moved {rel} (xxh3 {hash})");
+                    eprintln!("cachy: moved {rel} to {} (xxh3 {hash})", branch.display());
                 }
                 Ok(MoveOutcome::Skipped(reason)) => {
                     self.skipped += 1;
@@ -381,6 +716,18 @@ impl Tally {
                 }
             }
         }
+    }
+
+    /// Records a move unit whose move failed before it started.
+    fn fail(&mut self, rels: &[PathBuf], e: &dyn std::fmt::Display) {
+        self.failed += 1;
+        eprintln!("cachy: error: move of {} failed: {e}", names(rels));
+    }
+
+    /// Records a move unit that was skipped without a move.
+    fn skip(&mut self, rels: &[PathBuf], reason: Skip) {
+        self.skipped += 1;
+        eprintln!("cachy: skipped {}: {reason}", names(rels));
     }
 }
 

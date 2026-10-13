@@ -20,13 +20,15 @@
 //! `CACHY_RETIRE_WAIT_MS=<ms>` shortens the retire wait, and
 //! `CACHY_FREED_WAIT_MS=<ms>` the wait for freed space at the end of a run, so
 //! that tests that run cachy hundreds of times do not wait each time.
+//! `CACHY_WRITE_DELAY_MS=<ms>` makes every write wait first, so that a test
+//! can watch moves while they copy.
 
-use std::cell::Cell;
 use std::ffi::{OsStr, OsString};
 use std::io;
 use std::os::fd::{BorrowedFd, OwnedFd};
 use std::path::Path;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -39,6 +41,7 @@ const FAULT: &str = "CACHY_FAULT";
 const TRACE: &str = "CACHY_FAULT_TRACE";
 const RETIRE_WAIT: &str = "CACHY_RETIRE_WAIT_MS";
 const FREED_WAIT: &str = "CACHY_FREED_WAIT_MS";
+const WRITE_DELAY: &str = "CACHY_WRITE_DELAY_MS";
 
 /// The retire wait set by `CACHY_RETIRE_WAIT_MS`, if any.
 pub fn retire_wait() -> Option<Duration> {
@@ -77,9 +80,12 @@ enum CorruptWrite {
 pub struct FaultyFs {
     /// The faults, each with the number of the operation it replaces.
     faults: Vec<(Fault, u64)>,
-    /// Operations performed so far.
-    count: Cell<u64>,
+    /// Operations performed so far, by all threads. With moves on more than
+    /// one backing branch at once, the numbers depend on timing.
+    count: AtomicU64,
     trace: bool,
+    /// How long each write waits before it starts.
+    write_delay: Option<Duration>,
 }
 
 impl FaultyFs {
@@ -95,16 +101,16 @@ impl FaultyFs {
         };
         Ok(FaultyFs {
             faults,
-            count: Cell::new(0),
+            count: AtomicU64::new(0),
             trace: std::env::var_os(TRACE).is_some_and(|v| v == "1"),
+            write_delay: wait_from_env(WRITE_DELAY),
         })
     }
 
     /// Counts the operation `name`, and injects the fault meant for it, if
     /// any. A `corrupt` fault is left to the operation.
     fn count_op(&self, name: &str) -> io::Result<CorruptWrite> {
-        let n = self.count.get() + 1;
-        self.count.set(n);
+        let n = self.count.fetch_add(1, Ordering::Relaxed) + 1;
         if self.trace {
             eprintln!("cachy: trace: operation {n} ({name})");
         }
@@ -201,6 +207,9 @@ impl FsOps for FaultyFs {
     }
 
     fn write_at(&self, fd: BorrowedFd, buf: &[u8], offset: u64) -> io::Result<usize> {
+        if let Some(delay) = self.write_delay {
+            std::thread::sleep(delay);
+        }
         if self.count_op("write_at")? == CorruptWrite::Yes {
             let mut corrupted = buf.to_vec();
             if let Some(first) = corrupted.first_mut() {

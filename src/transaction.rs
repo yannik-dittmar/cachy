@@ -40,7 +40,7 @@ const RETIRE_WAIT: Duration = Duration::from_secs(1);
 /// which keeps cachy well below the usual limit of 1024.
 const MAX_RETIRING: usize = 128;
 /// How often retiring moves are serviced while nothing else is running.
-const RETIRING_POLL: Duration = Duration::from_millis(10);
+pub const RETIRING_POLL: Duration = Duration::from_millis(10);
 const COPY_BUF: usize = 1 << 20;
 pub const DIR_MODE: u32 = 0o755;
 const STAGING_MODE: u32 = 0o700;
@@ -71,6 +71,35 @@ impl Branch {
             path: path.to_owned(),
             fd: dir.into(),
         })
+    }
+
+    /// Whether `self` and `other` are the same directory.
+    pub fn same_dir(&self, other: &Branch) -> io::Result<bool> {
+        let a = rustix::fs::fstat(&self.fd)?;
+        let b = rustix::fs::fstat(&other.fd)?;
+        Ok((a.st_dev, a.st_ino) == (b.st_dev, b.st_ino))
+    }
+
+    /// Whether `rel` is a directory on the branch. Looked up outside the
+    /// port, like every check that changes nothing.
+    pub fn has_dir(&self, rel: &Path) -> bool {
+        self.lstat(rel)
+            .is_some_and(|stat| stat.st_mode & libc::S_IFMT == libc::S_IFDIR)
+    }
+
+    /// Whether anything exists at `rel` on the branch, looked up outside the
+    /// port.
+    pub fn has(&self, rel: &Path) -> bool {
+        self.lstat(rel).is_some()
+    }
+
+    fn lstat(&self, rel: &Path) -> Option<Stat> {
+        let rel = if rel.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            rel
+        };
+        rustix::fs::statat(&self.fd, rel, rustix::fs::AtFlags::SYMLINK_NOFOLLOW).ok()
     }
 }
 
@@ -106,6 +135,8 @@ pub enum Skip {
     SpecialFile,
     /// It is a hardlink group with names that the walk did not find.
     PartlyExcluded,
+    /// No backing branch that takes new files has room for it.
+    NoRoom,
 }
 
 impl fmt::Display for Skip {
@@ -116,6 +147,7 @@ impl fmt::Display for Skip {
             Skip::TooYoung => "too young",
             Skip::SpecialFile => "special file",
             Skip::PartlyExcluded => "hardlink group partly excluded",
+            Skip::NoRoom => "no backing branch has room",
         })
     }
 }
@@ -141,10 +173,10 @@ impl From<anyhow::Error> for Abort {
     }
 }
 
-/// Runs moves one after another. A move's last step, the wait before a
-/// retired source is unlinked, overlaps with the moves after it: such moves
-/// stay in a queue of retiring moves, which is serviced between moves and
-/// between the chunks of every copy.
+/// Runs moves to one backing branch, one after another. A move's last step,
+/// the wait before a retired source is unlinked, overlaps with the moves
+/// after it: such moves stay in a queue of retiring moves, which is serviced
+/// between moves and between the chunks of every copy.
 pub struct Mover<'a> {
     fs: &'a dyn FsOps,
     cache_branch: &'a Branch,
@@ -232,6 +264,11 @@ impl<'a> Mover<'a> {
         self.moved_bytes + retiring
     }
 
+    /// Whether any move is still retiring.
+    pub fn retiring(&self) -> bool {
+        !self.retiring.is_empty()
+    }
+
     /// Waits until every retiring move has finished.
     pub fn finish(&mut self) {
         self.service();
@@ -263,6 +300,11 @@ impl<'a> Mover<'a> {
         failed
     }
 
+    /// The path of the backing branch that this mover moves to.
+    pub fn backing_branch(&self) -> &Path {
+        &self.backing_branch.path
+    }
+
     /// The outcomes of the moves that finished since the last call.
     pub fn finished(&mut self) -> Vec<(&'a [PathBuf], Result<MoveOutcome>)> {
         std::mem::take(&mut self.finished)
@@ -271,8 +313,8 @@ impl<'a> Mover<'a> {
     /// Finishes retiring moves: one whose lease broke is rolled back at once,
     /// because the opener that broke it stays blocked until then; one whose
     /// wait is over has its source unlinked, unless a link to it was added
-    /// meanwhile, which would keep it on the cache branch.
-    fn service(&mut self) {
+    /// meanwhile, which would keep it on the cache branch. Never waits.
+    pub fn service(&mut self) {
         for retiring in std::mem::take(&mut self.retiring) {
             let (rels, hash) = (retiring.source.rels, retiring.hash);
             let finished = match retiring.source.check_lease() {

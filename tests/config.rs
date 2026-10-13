@@ -63,15 +63,47 @@ fn target_below_threshold_is_refused() {
 }
 
 #[test]
-fn more_than_one_backing_branch_is_refused() {
+fn config_without_cache_pool_or_backing_branches_is_refused() {
     let fx = Fixture::new();
-    let config = fx
-        .config("1G", "2G")
-        .replace("backing_branches:\n", "backing_branches:\n  - /mnt/other\n");
+
+    let err = assert_exit(&fx.run(&fx.layout_config("")), 1);
+
+    assert!(err.contains("cache_pool"), "stderr:\n{err}");
+    assert!(err.contains("backing_branches"), "stderr:\n{err}");
+}
+
+#[test]
+fn malformed_backing_branch_is_refused() {
+    for (suffix, expected) in [
+        ("=rw", "mode"),
+        ("=XX", "mode"),
+        ("=RW,lots", "minfreespace"),
+        ("=RW,4G,1G", "minfreespace"),
+        ("=", "mode"),
+    ] {
+        let fx = Fixture::new();
+        let spec = format!("{}{suffix}", fx.backing_branch.path().display());
+        let config = fx.layout_config(&format!("backing_branches:\n  - {spec}\n"));
+
+        let err = assert_exit(&fx.run(&config), 1);
+
+        assert!(err.contains("backing_branches"), "{spec}; stderr:\n{err}");
+        assert!(err.contains(expected), "{spec}; stderr:\n{err}");
+        assert!(err.contains(&format!("`{spec}`")), "{spec}; stderr:\n{err}");
+    }
+}
+
+#[test]
+fn backing_branch_that_is_the_cache_branch_is_refused() {
+    let fx = Fixture::new();
+    let config = fx.layout_config(&format!(
+        "backing_branches:\n  - {}\n",
+        fx.cache_branch.path().display()
+    ));
 
     let err = assert_exit(&fx.run(&config), 1);
 
-    assert!(err.contains("backing_branches"), "stderr:\n{err}");
+    assert!(err.contains("is the cache branch"), "stderr:\n{err}");
 }
 
 #[test]

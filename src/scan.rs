@@ -26,6 +26,10 @@ pub struct Entry {
     /// Space it takes up on the cache branch (`st_blocks`), in bytes; a
     /// hardlink group's once.
     pub allocated: u64,
+    /// Its size (`st_size`), the space that placement reserves for a copy of
+    /// it on a backing branch; a hardlink group's once. Block rounding and
+    /// metadata can make the copy take up a little more, and holes less.
+    pub size: u64,
     atime: (i64, u64),
     mtime: (i64, u64),
     /// Its last change: the later of its mtime and ctime.
@@ -84,6 +88,7 @@ struct Found {
     rel: PathBuf,
     kind: Kind,
     allocated: u64,
+    size: u64,
     atime: (i64, u64),
     mtime: (i64, u64),
     changed: (i64, u64),
@@ -112,6 +117,7 @@ fn group(found: Vec<Found>, order: Order) -> Vec<Entry> {
                         rels,
                         kind: Kind::Regular,
                         allocated: f.allocated,
+                        size: f.size,
                         atime: f.atime,
                         mtime: f.mtime,
                         changed: f.changed,
@@ -125,6 +131,7 @@ fn group(found: Vec<Found>, order: Order) -> Vec<Entry> {
                 rels: vec![f.rel],
                 kind: f.kind,
                 allocated: f.allocated,
+                size: f.size,
                 atime: f.atime,
                 mtime: f.mtime,
                 changed: f.changed,
@@ -221,6 +228,7 @@ impl Found {
             rel,
             kind,
             allocated: stat.st_blocks as u64 * 512,
+            size: stat.st_size as u64,
             atime: (stat.st_atime, stat.st_atime_nsec),
             mtime,
             changed: mtime.max(ctime),
@@ -251,6 +259,7 @@ mod tests {
             rel: PathBuf::from(rel),
             kind: Kind::Regular,
             allocated: 0,
+            size: 0,
             atime: (1_000, 0),
             mtime: (1_000, 0),
             changed: (1_000, 0),
@@ -265,6 +274,7 @@ mod tests {
             rels: rels.iter().map(PathBuf::from).collect(),
             kind,
             allocated: 0,
+            size: 0,
             atime: (1_000, 0),
             mtime: (1_000, 0),
             changed: (1_000, 0),

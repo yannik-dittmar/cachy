@@ -244,15 +244,15 @@ fn pattern() -> impl Strategy<Value = Pattern> {
 /// How much the run is asked to free.
 #[derive(Clone, Copy, Debug)]
 enum Goal {
-    /// Everything eligible.
-    Everything,
+    /// Every eligible move unit, as `--drain` would.
+    Drain,
     /// A target this many thousandths of the eligible move units' space
     /// above free space; above 1000, unreachable.
     Target(u64),
 }
 
 fn goal() -> impl Strategy<Value = Goal> {
-    prop_oneof![Just(Goal::Everything), (0..1_200u64).prop_map(Goal::Target)]
+    prop_oneof![Just(Goal::Drain), (0..1_200u64).prop_map(Goal::Target)]
 }
 
 fn excluded(patterns: &[Pattern], path: &RelPath) -> bool {
@@ -280,6 +280,7 @@ struct Created {
     symlink: bool,
     sparse: bool,
     excluded: bool,
+    times: Times,
     before: fs::Metadata,
     xattrs: BTreeMap<String, Vec<u8>>,
 }
@@ -352,6 +353,7 @@ fn create(fx: &Fixture, units: &[Unit], patterns: &[Pattern]) -> Vec<Created> {
                     content: body.content(),
                     symlink: false,
                     sparse: matches!(body, Body::Sparse { .. }),
+                    times: *times,
                     before: fs::symlink_metadata(&file).unwrap(),
                     xattrs: xattrs(&file),
                 });
@@ -374,6 +376,7 @@ fn create(fx: &Fixture, units: &[Unit], patterns: &[Pattern]) -> Vec<Created> {
                     symlink: true,
                     sparse: false,
                     excluded: excluded(patterns, path),
+                    times: *times,
                     before: fs::symlink_metadata(&link).unwrap(),
                     xattrs: BTreeMap::new(),
                 });
@@ -482,6 +485,12 @@ fn check_unit(unit: &Created, branch: &Path, moved: bool) -> Result<(), TestCase
         what
     );
     prop_assert_eq!(
+        (after.atime(), after.atime_nsec()),
+        (unit.times.atime.0, i64::from(unit.times.atime.1)),
+        "{}: atime",
+        what
+    );
+    prop_assert_eq!(
         (after.mtime(), after.mtime_nsec()),
         (before.mtime(), before.mtime_nsec()),
         "{}: mtime",
@@ -515,7 +524,7 @@ fn run_case(units: &[Unit], patterns: &[Pattern], goal: Goal) -> Result<(), Test
     let created = create(&fx, units, patterns);
 
     let (mut config, target) = match goal {
-        Goal::Everything => (fx.move_everything_config(), None),
+        Goal::Drain => (fx.move_everything_config(), None),
         Goal::Target(permille) => {
             let free = fx.cache_branch_free();
             let eligible: u64 = created
@@ -592,8 +601,8 @@ fn run_case(units: &[Unit], patterns: &[Pattern], goal: Goal) -> Result<(), Test
     }
     // Every name is on the branch its unit is on, and nothing else is on
     // either branch: no strays, and no staging directory.
-    prop_assert_eq!(on_cache, expected_cache, "files on the cache branch");
-    prop_assert_eq!(on_backing, expected_backing, "files on the backing branch");
+    prop_assert_eq!(on_cache, expected_cache, "names on the cache branch");
+    prop_assert_eq!(on_backing, expected_backing, "names on the backing branch");
     fx.assert_no_staging_directories();
 
     if !eligible_left.is_empty() {

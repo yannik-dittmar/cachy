@@ -3,13 +3,18 @@
 //! order. Symlinks are never followed.
 
 use std::collections::BTreeMap;
-use std::fs;
-use std::os::unix::fs::{FileTypeExt, MetadataExt};
+use std::ffi::OsStr;
+use std::io;
+use std::os::fd::{AsFd, BorrowedFd};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use rustix::fs::FileType;
 
 use crate::config::Order;
 use crate::exclude::Exclusions;
-use crate::transaction::STAGING;
+use crate::fsops::{FsOps, Stat};
+use crate::transaction::{Branch, STAGING, time_since};
 
 /// What the walk found: a move unit, or files that a run skips.
 #[derive(Debug, PartialEq, Eq)]
@@ -21,8 +26,19 @@ pub struct Entry {
     /// Space it takes up on the cache branch (`st_blocks`), in bytes; a
     /// hardlink group's once.
     pub allocated: u64,
-    atime: (i64, i64),
-    mtime: (i64, i64),
+    atime: (i64, u64),
+    mtime: (i64, u64),
+    /// Its last change: the later of its mtime and ctime.
+    changed: (i64, u64),
+}
+
+impl Entry {
+    /// Whether it is a move unit that has not changed for longer than
+    /// `max_age`.
+    pub fn is_past(&self, max_age: Duration) -> bool {
+        matches!(self.kind, Kind::Regular | Kind::Symlink)
+            && time_since(self.changed).is_some_and(|age| age > max_age)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -40,20 +56,26 @@ pub enum Kind {
     Special,
 }
 
-/// Regular files, hardlink groups, symlinks and special files under `root`
-/// that `exclusions` leave, oldest first by `order`, then by mtime, then by
-/// relpath. The walk prunes excluded directories, the staging directory and
-/// directories on other filesystems. Directories that cannot be read are
-/// skipped with a warning.
-pub fn scan(root: &Path, exclusions: &Exclusions, order: Order) -> std::io::Result<Vec<Entry>> {
-    let dev = fs::metadata(root)?.dev();
+/// Regular files, hardlink groups, symlinks and special files on the cache
+/// branch that `exclusions` leave, oldest first by `order`, then by mtime,
+/// then by relpath. The walk prunes excluded directories, the staging
+/// directory and directories on other filesystems. Directories that cannot be
+/// read are skipped with a warning.
+pub fn scan(
+    fs: &dyn FsOps,
+    cache_branch: &Branch,
+    exclusions: &Exclusions,
+    order: Order,
+) -> io::Result<Vec<Entry>> {
+    let dev = fs.fstat(cache_branch.fd.as_fd())?.st_dev;
     let mut found = Vec::new();
     let walk = Walk {
-        root,
+        fs,
+        root: &cache_branch.path,
         dev,
         exclusions,
     };
-    walk.dir(Path::new(""), &mut found);
+    walk.dir(cache_branch.fd.as_fd(), Path::new(""), &mut found);
     Ok(group(found, order))
 }
 
@@ -62,8 +84,9 @@ struct Found {
     rel: PathBuf,
     kind: Kind,
     allocated: u64,
-    atime: (i64, i64),
-    mtime: (i64, i64),
+    atime: (i64, u64),
+    mtime: (i64, u64),
+    changed: (i64, u64),
     /// `st_dev` and `st_ino`, which identify its inode.
     dev: u64,
     ino: u64,
@@ -91,6 +114,7 @@ fn group(found: Vec<Found>, order: Order) -> Vec<Entry> {
                         allocated: f.allocated,
                         atime: f.atime,
                         mtime: f.mtime,
+                        changed: f.changed,
                     },
                     f.nlink,
                 )
@@ -103,6 +127,7 @@ fn group(found: Vec<Found>, order: Order) -> Vec<Entry> {
                 allocated: f.allocated,
                 atime: f.atime,
                 mtime: f.mtime,
+                changed: f.changed,
             });
         }
     }
@@ -127,83 +152,90 @@ fn group(found: Vec<Found>, order: Order) -> Vec<Entry> {
 }
 
 struct Walk<'a> {
+    fs: &'a dyn FsOps,
     root: &'a Path,
     dev: u64,
     exclusions: &'a Exclusions,
 }
 
 impl Walk<'_> {
-    fn dir(&self, rel_dir: &Path, found: &mut Vec<Found>) {
-        let root = self.root;
-        let entries = match fs::read_dir(root.join(rel_dir)) {
-            Ok(entries) => entries,
+    /// Walks the directory `dir`, at `rel_dir` relative to the root.
+    fn dir(&self, dir: BorrowedFd, rel_dir: &Path, found: &mut Vec<Found>) {
+        let names = match self.fs.list_dir(dir) {
+            Ok(names) => names,
             Err(e) => {
-                eprintln!(
-                    "cachy: warning: skipping {}: {e}",
-                    root.join(rel_dir).display()
-                );
+                self.warn(rel_dir, e);
                 return;
             }
         };
-        for entry in entries {
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(e) => {
-                    eprintln!(
-                        "cachy: warning: skipping entry in {}: {e}",
-                        root.join(rel_dir).display()
-                    );
-                    continue;
-                }
-            };
-            let rel = rel_dir.join(entry.file_name());
+        for name in names {
+            let rel = rel_dir.join(&name);
             if rel.as_os_str() == STAGING {
                 continue;
             }
-            let meta = match entry.metadata() {
-                Ok(meta) => meta,
+            let stat = match self.fs.stat_at(dir, Path::new(&name)) {
+                Ok(stat) => stat,
                 Err(e) => {
-                    eprintln!(
-                        "cachy: warning: skipping {}: {e}",
-                        root.join(&rel).display()
-                    );
+                    self.warn(&rel, e);
                     continue;
                 }
             };
-            if self.exclusions.excludes(&rel, meta.is_dir()) {
+            let file_type = FileType::from_raw_mode(stat.st_mode);
+            let is_dir = file_type == FileType::Directory;
+            if self.exclusions.excludes(&rel, is_dir) {
                 continue;
             }
-            if meta.is_dir() && meta.dev() == self.dev {
-                self.dir(&rel, found);
-            } else if let Some(kind) = kind(meta.file_type()) {
-                found.push(Found {
-                    rel,
-                    kind,
-                    allocated: meta.blocks() * 512,
-                    atime: (meta.atime(), meta.atime_nsec()),
-                    mtime: (meta.mtime(), meta.mtime_nsec()),
-                    dev: meta.dev(),
-                    ino: meta.ino(),
-                    nlink: meta.nlink(),
-                });
+            if is_dir {
+                if stat.st_dev == self.dev {
+                    self.subdir(dir, &name, &rel, found);
+                }
+            } else if let Some(kind) = kind(file_type) {
+                found.push(Found::new(rel, kind, &stat));
             }
+        }
+    }
+
+    fn subdir(&self, dir: BorrowedFd, name: &OsStr, rel: &Path, found: &mut Vec<Found>) {
+        match self.fs.open_dir(dir, Path::new(name)) {
+            Ok(subdir) => self.dir(subdir.as_fd(), rel, found),
+            Err(e) => self.warn(rel, e),
+        }
+    }
+
+    fn warn(&self, rel: &Path, e: io::Error) {
+        eprintln!(
+            "cachy: warning: skipping {}: {e}",
+            self.root.join(rel).display()
+        );
+    }
+}
+
+impl Found {
+    fn new(rel: PathBuf, kind: Kind, stat: &Stat) -> Found {
+        let mtime = (stat.st_mtime, stat.st_mtime_nsec);
+        let ctime = (stat.st_ctime, stat.st_ctime_nsec);
+        Found {
+            rel,
+            kind,
+            allocated: stat.st_blocks as u64 * 512,
+            atime: (stat.st_atime, stat.st_atime_nsec),
+            mtime,
+            changed: mtime.max(ctime),
+            dev: stat.st_dev,
+            ino: stat.st_ino,
+            nlink: stat.st_nlink,
         }
     }
 }
 
-fn kind(file_type: fs::FileType) -> Option<Kind> {
-    if file_type.is_file() {
-        Some(Kind::Regular)
-    } else if file_type.is_symlink() {
-        Some(Kind::Symlink)
-    } else if file_type.is_fifo()
-        || file_type.is_socket()
-        || file_type.is_block_device()
-        || file_type.is_char_device()
-    {
-        Some(Kind::Special)
-    } else {
-        None
+fn kind(file_type: FileType) -> Option<Kind> {
+    match file_type {
+        FileType::RegularFile => Some(Kind::Regular),
+        FileType::Symlink => Some(Kind::Symlink),
+        FileType::Fifo | FileType::Socket | FileType::BlockDevice | FileType::CharacterDevice => {
+            Some(Kind::Special)
+        }
+        _ => None,
     }
 }
 
@@ -218,6 +250,7 @@ mod tests {
             allocated: 0,
             atime: (1_000, 0),
             mtime: (1_000, 0),
+            changed: (1_000, 0),
             dev,
             ino,
             nlink,
@@ -231,6 +264,7 @@ mod tests {
             allocated: 0,
             atime: (1_000, 0),
             mtime: (1_000, 0),
+            changed: (1_000, 0),
         }
     }
 

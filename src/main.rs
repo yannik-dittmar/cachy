@@ -11,7 +11,9 @@ mod transaction;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::Duration;
 
+use anyhow::Context;
 use clap::{Parser, Subcommand};
 
 use config::Config;
@@ -43,7 +45,15 @@ enum Command {
         /// Skip the check and move every eligible move unit.
         #[arg(long)]
         drain: bool,
+        /// Override the configured max age, such as `7d`.
+        #[arg(long, value_parser = max_age)]
+        max_age: Option<Duration>,
     },
+}
+
+fn max_age(s: &str) -> Result<Duration, String> {
+    config::parse_duration(s)
+        .ok_or_else(|| format!("expected a whole number with an s, m, h or d suffix, not `{s}`"))
 }
 
 /// The filesystem operations a run performs.
@@ -77,8 +87,17 @@ fn main() -> ExitCode {
             config,
             dry_run,
             drain,
+            max_age,
         } => {
-            match Config::load(&config).and_then(|c| run(&fs()?, &c, Options { dry_run, drain })) {
+            let config = Config::load(&config).and_then(|mut config| {
+                if let Some(max_age) = max_age {
+                    config
+                        .override_max_age(max_age)
+                        .context("invalid --max-age")?;
+                }
+                Ok(config)
+            });
+            match config.and_then(|c| run(&fs()?, &c, Options { dry_run, drain })) {
                 Ok(outcome) if outcome.succeeded() => ExitCode::SUCCESS,
                 Ok(_) => ExitCode::from(EXIT_MOVE_FAILED),
                 Err(e) => {

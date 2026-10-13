@@ -22,6 +22,10 @@ pub struct Config {
     pub order: Order,
     #[serde(default = "default_minimum_age", deserialize_with = "duration")]
     pub minimum_age: Duration,
+    /// Move units unchanged for longer than this count as work for any check,
+    /// whatever the free space. Always above the minimum age.
+    #[serde(default, deserialize_with = "optional_duration")]
+    pub max_age: Option<Duration>,
     #[serde(default)]
     pub lease_type: LeaseType,
     /// Kinds of metadata that a move may lose, with a warning, when the
@@ -181,7 +185,27 @@ impl Config {
                 config.threshold
             );
         }
+        config.check_max_age()?;
         Ok(config)
+    }
+
+    /// Replaces the configured max age, such as with one given on the command
+    /// line.
+    pub fn override_max_age(&mut self, max_age: Duration) -> Result<()> {
+        self.max_age = Some(max_age);
+        self.check_max_age()
+    }
+
+    fn check_max_age(&self) -> Result<()> {
+        if let Some(max_age) = self.max_age
+            && max_age <= self.minimum_age
+        {
+            bail!(
+                "max_age ({max_age:?}) must be above the minimum age ({:?})",
+                self.minimum_age
+            );
+        }
+        Ok(())
     }
 }
 
@@ -266,7 +290,15 @@ fn duration<'de, D: serde::Deserializer<'de>>(de: D) -> Result<Duration, D::Erro
     de.deserialize_str(DurationVisitor)
 }
 
-fn parse_duration(s: &str) -> Option<Duration> {
+fn optional_duration<'de, D: serde::Deserializer<'de>>(
+    de: D,
+) -> Result<Option<Duration>, D::Error> {
+    duration(de).map(Some)
+}
+
+/// Parses a duration such as `15m`: an integer with an `s`, `m`, `h` or `d`
+/// suffix.
+pub fn parse_duration(s: &str) -> Option<Duration> {
     const UNITS: &[(u8, u64)] = &[(b's', 1), (b'm', 60), (b'h', 60 * 60), (b'd', 24 * 60 * 60)];
     parse_with_unit(s, UNITS, None).map(Duration::from_secs)
 }

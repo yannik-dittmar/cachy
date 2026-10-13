@@ -141,6 +141,12 @@ ci/test-filesystem-pairs.sh /tmp/cachy-fs
 
 `tests/common/mod.rs` documents the environment variables that select the filesystems.
 
+CI also installs the static binary with the shipped systemd units and runs it as `cachy.service`: a run, `systemctl stop` in the middle of a copy, a refusal, and the priorities that the journal records. The script needs systemd, cgroup v2 and passwordless sudo, and replaces any installed cachy and `/etc/cachy/cachy.yml`, so run it only on a disposable machine:
+
+```sh
+ci/test-systemd-service.sh target/x86_64-unknown-linux-musl/release/cachy /tmp/cachy-service
+```
+
 The crash tests kill cachy, or fail a syscall, at every filesystem operation of a run, and check that the next run recovers without losing anything. They need a test-only build of cachy with fault injection; in a normal build they are skipped:
 
 ```sh

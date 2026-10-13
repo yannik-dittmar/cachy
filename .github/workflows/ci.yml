@@ -29,7 +29,7 @@ jobs:
       - run: cargo test --locked --features fault-injection -- --show-output
 
   # The statically linked binary that the README's Installation section points
-  # to, tested as it ships, with the systemd units checked against it.
+  # to, tested as it ships, and run as cachy.service with the shipped units.
   static:
     name: static binary (x86_64 musl)
     runs-on: ubuntu-latest
@@ -48,10 +48,9 @@ jobs:
           file "$bin"
           file "$bin" | grep -Eq 'static(-pie)? linked'
           "$bin" --version
-      - name: Verify the systemd units
-        run: |
-          sudo install -m 755 "target/$TARGET/release/cachy" /usr/local/bin/cachy
-          systemd-analyze verify packaging/systemd/cachy.service packaging/systemd/cachy.timer
+      # Hosted runners boot systemd with cgroup v2 and allow passwordless sudo.
+      - name: Run it as cachy.service
+        run: ci/test-systemd-service.sh "target/$TARGET/release/cachy" "$RUNNER_TEMP/cachy-service"
       - uses: actions/upload-artifact@v4
         with:
           name: cachy-${{ env.TARGET }}

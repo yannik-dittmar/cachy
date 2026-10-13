@@ -3,9 +3,11 @@
 //! gets only its owner, group and timestamps: Linux gives every symlink mode
 //! 777.
 //!
-//! The steps run in an order where none undoes an earlier one: a chown clears
-//! setuid, setgid and file capabilities, so the mode and the xattrs follow it;
-//! the timestamps come last.
+//! The steps run in an order where none undoes an earlier one, and none is
+//! denied by an earlier one: a chown clears setuid, setgid and file
+//! capabilities, so the xattrs and the mode follow it; setting user xattrs
+//! needs write permission, which a read-only mode would deny, so the mode
+//! follows the xattrs; the timestamps come last.
 
 use std::ffi::{OsStr, OsString};
 use std::fmt;
@@ -72,7 +74,7 @@ impl fmt::Display for Kind {
 }
 
 /// Copies everything but the timestamps from `src`, whose metadata is
-/// `stat`, to `dst`: owner and group, then mode, then xattrs and ACLs. `dst`
+/// `stat`, to `dst`: owner and group, then xattrs and ACLs, then mode. `dst`
 /// loses any ACL it inherited that `src` lacks. `what` names `dst` in
 /// warnings about allowed losses.
 pub fn copy_attributes(
@@ -85,7 +87,6 @@ pub fn copy_attributes(
 ) -> Result<()> {
     fs.set_owner(dst, stat.st_uid, stat.st_gid)
         .context("chown")?;
-    fs.set_mode(dst, stat.st_mode & 0o7777).context("chmod")?;
     let names = list_xattrs(fs, src).context("list xattrs")?;
     for name in &names {
         let copied = fs
@@ -106,7 +107,9 @@ pub fn copy_attributes(
             Err(e) => lose(&name, e, allowed, what)?,
         }
     }
-    Ok(())
+    // An access ACL sets the mode's group bits to its mask; `src`'s mode
+    // agrees with its own ACL, so the chmod keeps the copied ACL intact.
+    fs.set_mode(dst, stat.st_mode & 0o7777).context("chmod")
 }
 
 /// Copies the atime and mtime of `stat` to `dst`.

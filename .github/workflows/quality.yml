@@ -1,0 +1,93 @@
+# Quality reports: test coverage and mutation testing. They inform reviews
+# and never fail the build: each step that produces a report succeeds
+# whatever the report says, and the jobs may fail without failing the run.
+name: Quality reports
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # Every mutant takes a run of the test suite, so main is tested in full
+  # once a week rather than on each push.
+  schedule:
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Coverage of the whole test suite, in the normal and the fault-injection
+  # build, as a job summary, an HTML report and an lcov file.
+  coverage:
+    name: coverage report
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup update stable && rustup default stable
+      - run: rustup component add llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+      # Failing tests fail the CI workflow; here they only leave lines
+      # uncovered.
+      - run: cargo llvm-cov --locked --no-report --ignore-run-fail
+      - run: cargo llvm-cov --locked --features fault-injection --no-report --ignore-run-fail
+      - name: Report
+        run: |
+          cargo llvm-cov report --html
+          cargo llvm-cov report --lcov --output-path target/llvm-cov/lcov.info
+          {
+            echo '## Coverage'
+            echo '```'
+            cargo llvm-cov report --summary-only
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: |
+            target/llvm-cov/html
+            target/llvm-cov/lcov.info
+
+  # Mutation testing of the move transaction, recovery and exclusions: which
+  # changes to them the test suite misses. A pull request tests the mutants
+  # in its own diff; the weekly run (or a manual one) tests all of them, in
+  # shards.
+  mutants:
+    name: mutation report (shard ${{ matrix.shard }})
+    if: github.event_name != 'push'
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(github.event_name == 'pull_request' && '[0]' || '[0, 1, 2, 3, 4, 5, 6, 7]') }}
+    env:
+      SHARDS: ${{ github.event_name == 'pull_request' && 1 || 8 }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - run: rustup update stable && rustup default stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-mutants
+      - name: Test mutants
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: ci/mutants.sh "${{ matrix.shard }}/$SHARDS" $BASE
+      - name: Report
+        if: always()
+        run: ci/mutants-summary.sh mutants.out "shard ${{ matrix.shard }}/$SHARDS" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mutants-shard-${{ matrix.shard }}
+          path: mutants.out
+          if-no-files-found: ignore

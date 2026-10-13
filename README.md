@@ -153,6 +153,20 @@ The crash tests kill cachy, or fail a syscall, at every filesystem operation of 
 cargo test --features fault-injection
 ```
 
+The property tests (`tests/properties.rs`) generate random cache-branch trees, with odd byte names, hardlink groups, symlinks, sparse and zero-byte files and exclusions, run cachy on each, and check that every move unit ends up exactly once, on one branch, with its content and metadata, that excluded ones stay untouched, and that the run reached its target or left nothing eligible behind. They run 32 cases by default; `PROPTEST_CASES` sets another number. A failing case shrinks to a minimal tree, saved in `tests/proptest-regressions/` and replayed first on later runs; commit it with the fix. A fault-injection build runs them much faster, as it skips the one-second wait before a retired source is deleted:
+
+```sh
+PROPTEST_CASES=500 cargo test --features fault-injection --test properties
+```
+
+The Quality reports workflow publishes test coverage (`cargo-llvm-cov`) and mutation testing (`cargo-mutants`) of the move transaction, recovery and exclusions as job summaries and artifacts; neither fails the build. A pull request tests the mutants in its own diff, and a weekly run tests them all. To run the same locally:
+
+```sh
+cargo llvm-cov --features fault-injection --html
+ci/mutants.sh 0/1          # all mutants; add a base commit to test only its diff
+ci/mutants-summary.sh mutants.out local
+```
+
 ## Licence
 
 GPL-3.0-or-later, same family as the upstream project. See [LICENSE](LICENSE).

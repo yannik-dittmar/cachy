@@ -2,3 +2,4 @@
 
 # Pinned upstream checkout (mergerfs-cache-mover), read-only reference for porting
 /reference/
+/mutants.out*/

@@ -24,5 +24,6 @@ serde_yaml_ng = "0.10"
 xxhash-rust = { version = "0.8.19", features = ["xxh3"] }
 
 [dev-dependencies]
+proptest = "1.12.0"
 rustix = { version = "1", features = ["fs", "process"] }
 tempfile = "3"

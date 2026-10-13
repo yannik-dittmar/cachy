@@ -358,3 +358,28 @@ fn rollback_keeps_an_adopted_backing_file() {
     assert!(fs::read(fx.on_backing_branch("db/journal.log")).unwrap() == content(MIB, 15));
     fx.assert_no_staging_directories();
 }
+
+/// Rolling back a move that replaced a stale copy removes the published copy
+/// but cannot bring the stale copy back: it was hidden behind the source, and
+/// older. The source is then the only copy.
+#[test]
+fn rollback_after_replacing_a_stale_copy_leaves_only_the_source() {
+    let fx = Fixture::new();
+    fx.cache_branch_file("db/journal.log", &content(MIB, 16), 1_000);
+    fx.backing_branch_file("db/journal.log", b"stale", 500);
+    let looked_up = look_up(&fx.on_cache_branch("db/journal.log"));
+    let child = fx.spawn(&fx.move_everything_config());
+
+    wait_for(&fx.staged_on_cache_branch("db/journal.log"));
+    reopen_for_append(&looked_up)
+        .write_all(b"appended")
+        .unwrap();
+
+    let err = assert_exit(&child.wait_with_output().unwrap(), 0);
+    assert!(err.contains("db/journal.log: in use"), "stderr:\n{err}");
+    let mut source = content(MIB, 16);
+    source.extend_from_slice(b"appended");
+    assert!(fs::read(fx.on_cache_branch("db/journal.log")).unwrap() == source);
+    assert!(!fx.on_backing_branch("db/journal.log").exists());
+    fx.assert_no_staging_directories();
+}

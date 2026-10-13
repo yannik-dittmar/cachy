@@ -10,11 +10,12 @@
 //! keeps its files together.
 //!
 //! A branch that already holds a file at one of the move unit's relpaths, a
-//! stale copy, is the only choice, since the move publishes over it. Until
-//! cachy also removes stale copies from other branches, a move unit with a
-//! stale copy on a branch that is not eligible, or on more than one branch,
-//! is not placed at all: publishing elsewhere would leave the stale copy for
-//! the cache pool to show once the cache branch's copy is gone.
+//! stale copy, wins if it is eligible, since the move replaces the stale copy
+//! in place; among several, the usual rules choose. The move removes the
+//! stale copies on the other branches. cachy never writes to a branch that
+//! takes no new files, so a move unit with a stale copy on one is not placed
+//! at all: the cache pool would show the stale copy once the cache branch's
+//! copy is gone.
 //!
 //! Free space and directories are looked up outside the
 //! filesystem-operations port, like every check that changes nothing. A
@@ -50,8 +51,8 @@ pub struct Placement<'a> {
 pub enum Unplaced {
     /// No eligible branch.
     NoRoom,
-    /// A stale copy at `rel` on the backing branch at `branch` cannot be
-    /// published over.
+    /// A stale copy at `rel` is on the backing branch at `branch`, which
+    /// takes no new files, so it cannot be removed.
     StaleCopy { rel: PathBuf, branch: PathBuf },
 }
 
@@ -61,13 +62,15 @@ impl fmt::Display for Unplaced {
             Unplaced::NoRoom => f.write_str("no backing branch has room"),
             Unplaced::StaleCopy { rel, branch } => write!(
                 f,
-                "a stale copy of {} on backing branch {} cannot be replaced from there",
+                "a stale copy of {} on backing branch {}, which takes no new files, cannot be removed",
                 rel.display(),
                 branch.display()
             ),
         }
     }
 }
+
+impl std::error::Error for Unplaced {}
 
 impl<'a> Placement<'a> {
     pub fn new(branches: &'a [BackingBranch]) -> Placement<'a> {
@@ -92,17 +95,26 @@ impl<'a> Placement<'a> {
                 rels.iter().find(|rel| branch.has(rel)).map(|rel| (i, rel))
             })
             .collect();
-        let chosen = match holders[..] {
-            [] => self.choose(eligible, split(&rels[0]).0),
-            [(holder, _)] if eligible.iter().any(|&(i, _)| i == holder) => Some(holder),
-            [(holder, rel), ..] => {
-                return Err(Unplaced::StaleCopy {
-                    rel: rel.clone(),
-                    branch: self.branches[holder].branch.path.clone(),
-                });
-            }
+        if let Some(&(no_new_files, rel)) = holders
+            .iter()
+            .find(|&&(i, _)| !self.branches[i].takes_new_files())
+        {
+            return Err(Unplaced::StaleCopy {
+                rel: rel.clone(),
+                branch: self.branches[no_new_files].branch.path.clone(),
+            });
         }
-        .ok_or(Unplaced::NoRoom)?;
+        let (eligible_holders, eligible): (Vec<_>, Vec<_>) = eligible
+            .into_iter()
+            .partition(|&(i, _)| holders.iter().any(|&(holder, _)| holder == i));
+        let candidates = if eligible_holders.is_empty() {
+            eligible
+        } else {
+            eligible_holders
+        };
+        let chosen = self
+            .choose(candidates, split(&rels[0]).0)
+            .ok_or(Unplaced::NoRoom)?;
         self.placed[chosen] += size;
         for rel in rels {
             self.dirs.insert((chosen, split(rel).0.to_owned()), true);

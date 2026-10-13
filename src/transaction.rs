@@ -11,6 +11,19 @@
 //!
 //! Each staging directory mirrors relpaths (`<root>/.cachy-staging/<relpath>`),
 //! so anything left in it after a crash names the move it belongs to.
+//!
+//! A move looks for stale copies, files at the move unit's relpaths on the
+//! backing branches, when it starts. On the branch it moves to, a stale copy
+//! identical to the source, found by size, metadata and content before
+//! anything is copied, is kept as the published copy. Any other is replaced:
+//! the copy is swapped in for it (`RENAME_EXCHANGE`), and swapped back out
+//! unless what came out is the stale copy as found, so that nothing else is
+//! ever overwritten. Stale copies on the other branches are removed once the
+//! copy is published and before the source is retired, so the relpath never
+//! disappears from the cache pool. A stale copy that changed after the source
+//! (it is newer) fails the move instead: it may hold the latest edit. A
+//! rollback cannot bring a replaced or removed stale copy back; it was hidden
+//! from applications, and older than the source.
 
 use std::collections::VecDeque;
 use std::ffi::OsString;
@@ -26,7 +39,9 @@ use xxhash_rust::xxh3::{Xxh3, xxh3_128};
 
 use crate::config::Verify;
 use crate::fsops::{FsOps, Lease, Stat};
+use crate::layout::BackingBranch;
 use crate::metadata::{self, AllowedLosses};
+use crate::placement::Unplaced;
 use crate::scan::Kind;
 
 /// Name of the staging directory at the root of each filesystem cachy writes to.
@@ -104,10 +119,29 @@ impl Branch {
 }
 
 pub enum MoveOutcome {
-    /// The move unit was moved; its content has this hash.
-    Moved(Hash),
+    /// The move unit was moved.
+    Moved(Moved),
     /// The move unit was left where it is, untouched.
     Skipped(Skip),
+}
+
+/// A finished move.
+pub struct Moved {
+    /// The hash of the move unit's content.
+    pub hash: Hash,
+    /// The stale copies of the move unit that the move dealt with, by path.
+    pub stale_copies: Vec<(PathBuf, Fate)>,
+}
+
+/// What a move did with a stale copy of its move unit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Fate {
+    /// It was identical to the source, so it became the published copy.
+    Kept,
+    /// The copy took its place on the branch moved to.
+    Replaced,
+    /// It was on another branch, and removed from there.
+    Removed,
 }
 
 /// The XXH3-128 hash of a file's content, computed while copying it, or of
@@ -181,6 +215,8 @@ pub struct Mover<'a> {
     fs: &'a dyn FsOps,
     cache_branch: &'a Branch,
     backing_branch: &'a Branch,
+    /// The other backing branches, where moves remove stale copies.
+    other_branches: Vec<&'a BackingBranch>,
     guard: &'a Guard,
     allowed_losses: AllowedLosses,
     verify: Verify,
@@ -199,15 +235,17 @@ struct Retiring<'a> {
     /// of its parent in the cache branch's staging directory, which holds it.
     retired_parents: Vec<OwnedFd>,
     published: Published<'a>,
-    hash: Hash,
+    moved: Moved,
     retired_at: Instant,
 }
 
 impl<'a> Mover<'a> {
+    /// A mover to the backing branch `backing_branches[index]`.
     pub fn new(
         fs: &'a dyn FsOps,
         cache_branch: &'a Branch,
-        backing_branch: &'a Branch,
+        backing_branches: &'a [BackingBranch],
+        index: usize,
         guard: &'a Guard,
         allowed_losses: AllowedLosses,
         verify: Verify,
@@ -215,7 +253,13 @@ impl<'a> Mover<'a> {
         Mover {
             fs,
             cache_branch,
-            backing_branch,
+            backing_branch: &backing_branches[index].branch,
+            other_branches: backing_branches
+                .iter()
+                .enumerate()
+                .filter(|&(i, _)| i != index)
+                .map(|(_, other)| other)
+                .collect(),
             guard,
             allowed_losses,
             verify,
@@ -233,9 +277,7 @@ impl<'a> Mover<'a> {
     /// [`Mover::finished`], possibly only after later moves have started.
     ///
     /// A skipped move, or one that fails before publish, leaves the source
-    /// where it was and no copy behind. A stale copy at one of `rels` on the
-    /// backing branch is not replaced yet: the publish fails and the move
-    /// with it.
+    /// where it was and no copy behind.
     pub fn start(&mut self, rels: &'a [PathBuf], kind: Kind) {
         self.service();
         let finished = match kind {
@@ -247,7 +289,7 @@ impl<'a> Mover<'a> {
                 // A move that reaches its retire finishes once serviced.
                 self.transact(rels).err().map(Err)
             }
-            Kind::Symlink => Some(self.transact_symlink(&rels[0])),
+            Kind::Symlink => Some(self.transact_symlink(rels)),
             Kind::Special => Some(Err(Abort::Skip(Skip::SpecialFile))),
             Kind::PartlyExcluded => Some(Err(Abort::Skip(Skip::PartlyExcluded))),
         };
@@ -316,7 +358,7 @@ impl<'a> Mover<'a> {
     /// meanwhile, which would keep it on the cache branch. Never waits.
     pub fn service(&mut self) {
         for retiring in std::mem::take(&mut self.retiring) {
-            let (rels, hash) = (retiring.source.rels, retiring.hash);
+            let rels = retiring.source.rels;
             let finished = match retiring.source.check_lease() {
                 Err(abort) => Some(retiring.roll_back(self.fs).and_then(|()| Err(abort))),
                 Ok(()) if retiring.retired_at.elapsed() >= retire_wait() => {
@@ -327,7 +369,7 @@ impl<'a> Mover<'a> {
                             if unlinked.is_ok() {
                                 self.moved_bytes += allocated;
                             }
-                            Some(unlinked.map(|()| hash))
+                            Some(unlinked)
                         }
                         Err(abort) => Some(retiring.roll_back(self.fs).and_then(|()| Err(abort))),
                     }
@@ -347,17 +389,63 @@ impl<'a> Mover<'a> {
     /// retire, after which it waits in the queue of retiring moves.
     fn transact(&mut self, rels: &'a [PathBuf]) -> Result<(), Abort> {
         let fs = self.fs;
-        let rel = &rels[0];
-        let (parent, name) = split(rel);
-
         let source = Source::open(fs, self.cache_branch, rels, self.guard)?;
+        let stale = self.find_stale_copies(rels, &source.stat)?;
+        let first = stale.here[0].as_ref();
+        let kept = match first {
+            Some(copy) => self.compare(&source, copy)?,
+            None => None,
+        };
+        let (mut published, hash) = match kept.zip(first) {
+            Some((hash, copy)) => (self.keep(&source, copy)?, hash),
+            None => self.copy_and_publish(&source, first)?,
+        };
+        let mut stale_copies = Vec::new();
+        if let Some(copy) = first {
+            let fate = if kept.is_some() {
+                Fate::Kept
+            } else {
+                Fate::Replaced
+            };
+            stale_copies.push((copy.path(), fate));
+        }
+        for (rel, copy) in rels[1..].iter().zip(&stale.here[1..]) {
+            match self.link(&mut published, rel, copy.as_ref()) {
+                Ok(true) => stale_copies.extend(copy.as_ref().map(|c| (c.path(), Fate::Replaced))),
+                Ok(false) => {}
+                Err(e) => {
+                    // A link that cannot be removed stays as a stale copy,
+                    // identical to the source.
+                    let _ = published.remove(fs);
+                    return Err(e.into());
+                }
+            }
+        }
+        remove_stale_copies(fs, &stale.elsewhere, &published, &mut stale_copies)?;
+        let moved = Moved { hash, stale_copies };
+        let retiring = retire(fs, source, published, moved)?;
+        self.retiring.push_back(retiring);
+        Ok(())
+    }
+
+    /// Copies `source` into a temp file and publishes it under the source's
+    /// first name, in place of the stale copy `stale` there, if any. Returns
+    /// the published copy and the hash of its content.
+    fn copy_and_publish(
+        &mut self,
+        source: &Source<'a>,
+        stale: Option<&StaleCopy>,
+    ) -> Result<(Published<'a>, Hash), Abort> {
+        let fs = self.fs;
+        let rel = &source.rels[0];
+        let (parent, name) = split(rel);
         let (backing_staging, staged_parent) = staging_dirs(fs, self.backing_branch, parent)
             .context("create staging directory on the backing branch")?;
 
         let temp = fs
             .create_new(staged_parent.as_fd(), name, TEMP_MODE)
             .context("create temp file")?;
-        let staged = self.stage(&source, &temp, rel);
+        let staged = self.stage(source, &temp, rel);
         let published = staged.and_then(|hash| {
             let dest_parent = make_dirs_like(
                 fs,
@@ -368,33 +456,30 @@ impl<'a> Mover<'a> {
                 &mut self.created_dirs,
             )
             .context("create destination directory")?;
-            let mut published = publish(fs, dest_parent, name, &staged_parent, &temp)?;
-            for rel in &rels[1..] {
-                if let Err(e) = self.link(&mut published, rel) {
-                    // A link that cannot be removed stays as a stale copy,
-                    // identical to the source.
-                    let _ = published.remove(fs);
-                    return Err(e.into());
-                }
-            }
+            let published = publish(fs, dest_parent, name, &staged_parent, &temp, stale)?;
             Ok((published, hash))
         });
         drop(temp);
-        if published.is_err() {
+        if let Err(abort) = &published
+            && staged_is_own(abort)
+        {
             let _ = fs.unlink(staged_parent.as_fd(), name);
         }
         remove_empty_dirs(fs, &backing_staging, parent);
-
-        let (published, hash) = published?;
-        let retiring = retire(fs, source, published, hash)?;
-        self.retiring.push_back(retiring);
-        Ok(())
+        published
     }
 
     /// Publishes the copy of a hardlink group under its further name `rel`,
-    /// as a link to the name it was published under first. A link to the
-    /// copy that is already there, left by a crash, is adopted.
-    fn link(&mut self, published: &mut Published<'a>, rel: &'a Path) -> Result<()> {
+    /// as a link to the name it was published under first, in place of the
+    /// stale copy `stale` there, if any. A link to the copy that is already
+    /// there, left by a crash, is adopted. Returns whether a stale copy was
+    /// replaced.
+    fn link(
+        &mut self,
+        published: &mut Published<'a>,
+        rel: &'a Path,
+        stale: Option<&StaleCopy>,
+    ) -> Result<bool> {
         let fs = self.fs;
         let (parent, name) = split(rel);
         let dest_parent = make_dirs_like(
@@ -407,11 +492,18 @@ impl<'a> Mover<'a> {
         )
         .context("create destination directory")?;
         let first = &published.names[0];
-        let linked = match fs.link(first.dir.as_fd(), first.name, dest_parent.as_fd(), name) {
-            Ok(()) => true,
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => false,
-            Err(e) => return Err(e).with_context(|| format!("publish {}", rel.display())),
-        };
+        let (linked, replaced) =
+            match fs.link(first.dir.as_fd(), first.name, dest_parent.as_fd(), name) {
+                Ok(()) => (true, false),
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => match stale {
+                    Some(stale) if !published.identity.same_inode(&stale.stat) => {
+                        self.link_over(published, &dest_parent, rel, stale)?;
+                        (true, true)
+                    }
+                    _ => (false, false),
+                },
+                Err(e) => return Err(e).with_context(|| format!("publish {}", rel.display())),
+            };
         let stat = (|| {
             if linked {
                 fs.fsync(dest_parent.as_fd())
@@ -437,14 +529,7 @@ impl<'a> Mover<'a> {
             Err(e) => {
                 if linked {
                     unpublish_inode(fs, &dest_parent, name, &published.identity);
-                    // Linking and unlinking changed the copy's ctime, which
-                    // would make a rollback take it for no longer its own.
-                    let first = &published.names[0];
-                    if let Ok(stat) = fs.stat_at(first.dir.as_fd(), first.name)
-                        && published.identity.same_inode(&stat)
-                    {
-                        published.identity = Identity::of(&stat);
-                    }
+                    published.refresh(fs);
                 }
                 return Err(e);
             }
@@ -456,18 +541,51 @@ impl<'a> Mover<'a> {
             name,
             adopted: !linked,
         });
-        Ok(())
+        Ok(replaced)
     }
 
-    /// Moves the symlink `rel`: recreates it with the same link text in the
-    /// staging directory, gives it the source's owner and timestamps,
+    /// Links the copy of a hardlink group into the staging directory as
+    /// `rel`, and swaps that link in for the stale copy `stale` at
+    /// `<dest_parent>/<name of rel>`.
+    fn link_over(
+        &mut self,
+        published: &mut Published<'a>,
+        dest_parent: &OwnedFd,
+        rel: &Path,
+        stale: &StaleCopy,
+    ) -> Result<()> {
+        let fs = self.fs;
+        let (parent, name) = split(rel);
+        let (backing_staging, staged_parent) = staging_dirs(fs, self.backing_branch, parent)
+            .context("create staging directory on the backing branch")?;
+        let first = &published.names[0];
+        let replaced = fs
+            .link(first.dir.as_fd(), first.name, staged_parent.as_fd(), name)
+            .with_context(|| format!("publish {}", rel.display()))
+            .and_then(|()| replace(fs, &staged_parent, dest_parent, name, stale));
+        if let Err(e) = &replaced {
+            if e.downcast_ref::<Unswapped>().is_none() {
+                let _ = fs.unlink(staged_parent.as_fd(), name);
+            }
+            unpublish_inode(fs, dest_parent, name, &published.identity);
+            published.refresh(fs);
+        }
+        remove_empty_dirs(fs, &backing_staging, parent);
+        replaced
+    }
+
+    /// Moves the symlink `rels[0]`: recreates it with the same link text in
+    /// the staging directory, gives it the source's owner and timestamps,
     /// publishes it and retires the source. Nothing can have a symlink open,
     /// so the move needs no lease and no retire wait.
-    fn transact_symlink(&mut self, rel: &'a Path) -> Result<Hash, Abort> {
+    fn transact_symlink(&mut self, rels: &'a [PathBuf]) -> Result<Moved, Abort> {
         let fs = self.fs;
+        let rel = &rels[0];
         let (parent, name) = split(rel);
 
         let source = Link::open(fs, self.cache_branch, rel, self.guard)?;
+        let stale = self.find_stale_copies(rels, &source.stat)?;
+        let here = stale.here[0].as_ref();
         let (backing_staging, staged_parent) = staging_dirs(fs, self.backing_branch, parent)
             .context("create staging directory on the backing branch")?;
 
@@ -490,19 +608,123 @@ impl<'a> Mover<'a> {
                     &mut self.created_dirs,
                 )
                 .context("create destination directory")?;
-                Ok(publish_symlink(fs, dest_parent, name, &staged_parent)?)
+                Ok(publish_symlink(
+                    fs,
+                    dest_parent,
+                    name,
+                    &staged_parent,
+                    here,
+                )?)
             });
-        if published.is_err() {
+        if let Err(abort) = &published
+            && staged_is_own(abort)
+        {
             let _ = fs.unlink(staged_parent.as_fd(), name);
         }
         remove_empty_dirs(fs, &backing_staging, parent);
 
         let published = published?;
+        let mut stale_copies = Vec::new();
+        if let Some(copy) = here {
+            let fate = if published.names[0].adopted {
+                Fate::Kept
+            } else {
+                Fate::Replaced
+            };
+            stale_copies.push((copy.path(), fate));
+        }
+        remove_stale_copies(fs, &stale.elsewhere, &published, &mut stale_copies)?;
         let hash = Hash(xxh3_128(source.target.as_encoded_bytes()));
         let allocated = source.stat.st_blocks.max(0) as u64 * 512;
         source.retire(published)?;
         self.moved_bytes += allocated;
-        Ok(hash)
+        Ok(Moved { hash, stale_copies })
+    }
+
+    /// The stale copies of the move unit `rels` whose source is as `source`
+    /// describes it. Fails the move if one cannot be replaced or removed: it
+    /// is a directory, it is on a branch that takes no new files, or it is
+    /// newer than the source.
+    fn find_stale_copies(&self, rels: &'a [PathBuf], source: &Stat) -> Result<StaleCopies<'a>> {
+        let here = rels
+            .iter()
+            .map(|rel| stale_copy(self.fs, self.backing_branch, rel, source))
+            .collect::<Result<_>>()?;
+        let mut elsewhere = Vec::new();
+        for other in &self.other_branches {
+            for rel in rels {
+                let Some(copy) = stale_copy(self.fs, &other.branch, rel, source)? else {
+                    continue;
+                };
+                if !other.takes_new_files() {
+                    return Err(Unplaced::StaleCopy {
+                        rel: rel.clone(),
+                        branch: other.branch.path.clone(),
+                    }
+                    .into());
+                }
+                elsewhere.push(copy);
+            }
+        }
+        Ok(StaleCopies { here, elsewhere })
+    }
+
+    /// The hash of `source`'s content if the stale copy `copy` is identical
+    /// to it: a regular file with the same size, owner, group, mode, mtime
+    /// and content. Reads both, aborting as soon as the source's lease
+    /// breaks, and services retiring moves between chunks, like a copy.
+    fn compare(&mut self, source: &Source, copy: &StaleCopy) -> Result<Option<Hash>, Abort> {
+        let fs = self.fs;
+        let (stat, size) = (&copy.stat, source.stat.st_size);
+        if stat.st_size != size || !metadata::same(stat, &source.stat) {
+            return Ok(None);
+        }
+        let (parent, name) = split(copy.rel);
+        let file = open_dirs(fs, &copy.branch.fd, parent)
+            .and_then(|dir| fs.open_read(dir.as_fd(), name))
+            .context("open stale copy")?;
+        if !copy.is(&fs.fstat(file.as_fd()).context("fstat stale copy")?) {
+            return Err(copy.changed().into());
+        }
+        let size = size.max(0) as u64;
+        let mut hasher = Xxh3::new();
+        let (mut ours, mut theirs) = (vec![0; COPY_BUF], vec![0; COPY_BUF]);
+        let mut offset = 0;
+        while offset < size {
+            self.service();
+            source.check_lease()?;
+            let len = (size - offset).min(COPY_BUF as u64) as usize;
+            let n = read_full_at(fs, &source.file, &mut ours[..len], offset)
+                .context("compare: read source")?;
+            if n < len {
+                // Truncated, which only a writer can do.
+                return Err(Abort::Skip(Skip::Changed));
+            }
+            let m = read_full_at(fs, &file, &mut theirs[..len], offset)
+                .context("compare: read stale copy")?;
+            if m != n || ours[..n] != theirs[..n] {
+                return Ok(None);
+            }
+            hasher.update(&ours[..n]);
+            offset += n as u64;
+        }
+        Ok(Some(Hash(hasher.digest128())))
+    }
+
+    /// Takes the stale copy `copy`, identical to `source`, as its published
+    /// copy, once the source is checked to be still current and the stale
+    /// copy still as found.
+    fn keep(&self, source: &Source, copy: &StaleCopy<'a>) -> Result<Published<'a>, Abort> {
+        let fs = self.fs;
+        source.revalidate()?;
+        let (parent, name) = split(copy.rel);
+        let dir =
+            open_dirs(fs, &self.backing_branch.fd, parent).context("open destination directory")?;
+        let stat = fs.stat_at(dir.as_fd(), name).context("stat stale copy")?;
+        if Identity::of(&stat) != Identity::of(&copy.stat) {
+            return Err(copy.changed().into());
+        }
+        Ok(Published::one(dir, name, Identity::of(&stat), true))
     }
 
     /// Writes the staged copy of `source` into the temp file `temp`, makes it
@@ -649,9 +871,9 @@ fn hash_zeros(hasher: &mut Xxh3, mut len: u64) {
     }
 }
 
-fn outcome(result: Result<Hash, Abort>) -> Result<MoveOutcome> {
+fn outcome(result: Result<Moved, Abort>) -> Result<MoveOutcome> {
     match result {
-        Ok(hash) => Ok(MoveOutcome::Moved(hash)),
+        Ok(moved) => Ok(MoveOutcome::Moved(moved)),
         Err(Abort::Skip(skip)) => Ok(MoveOutcome::Skipped(skip)),
         Err(Abort::Fail(e)) => Err(e),
     }
@@ -684,6 +906,17 @@ impl<'a> Published<'a> {
         }
     }
 
+    /// Takes the copy's identity anew, after linking or unlinking a name
+    /// changed its ctime, if its first name still refers to it.
+    fn refresh(&mut self, fs: &dyn FsOps) {
+        let first = &self.names[0];
+        if let Ok(stat) = fs.stat_at(first.dir.as_fd(), first.name)
+            && self.identity.same_inode(&stat)
+        {
+            self.identity = Identity::of(&stat);
+        }
+    }
+
     /// Removes the names that this move created, unless the copy is no
     /// longer cachy's own under them. All are checked before any is removed,
     /// since removing one changes the copy's ctime.
@@ -708,39 +941,27 @@ impl<'a> Published<'a> {
     }
 }
 
-/// Makes the staged temp file `copy` visible as `<dest_parent>/<name>`,
-/// never replacing an existing file. An existing file identical to the copy
-/// is adopted as the published copy instead.
+/// Makes the staged temp file `copy` visible as `<dest_parent>/<name>`, in
+/// place of the stale copy `stale` there, if any, and otherwise never
+/// replacing an existing file.
 fn publish<'a>(
     fs: &dyn FsOps,
     dest_parent: OwnedFd,
     name: &'a Path,
     staged_parent: &OwnedFd,
     copy: &OwnedFd,
+    stale: Option<&StaleCopy>,
 ) -> Result<Published<'a>> {
-    match fs.rename_noreplace(staged_parent.as_fd(), name, dest_parent.as_fd(), name) {
-        Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-            return match adopt_identical(fs, dest_parent, name, staged_parent) {
-                Ok(Some(published)) => Ok(published),
-                _ => Err(e).context("publish"),
-            };
-        }
-        Err(e) => return Err(e).context("publish"),
-    }
-    let identity = fs
-        .fsync(dest_parent.as_fd())
-        .context("fsync destination directory")
-        .and_then(|()| {
-            fs.fsync(staged_parent.as_fd())
-                .context("fsync staging directory on the backing branch")
-        })
-        // After the rename, which may have changed the copy's ctime.
-        .and_then(|()| {
-            Ok(Identity::of(
-                &fs.fstat(copy.as_fd()).context("fstat published copy")?,
-            ))
-        });
+    let placed = match stale {
+        Some(stale) => replace(fs, staged_parent, &dest_parent, name, stale),
+        None => rename_into_place(fs, staged_parent, &dest_parent, name),
+    };
+    // After the rename, which may have changed the copy's ctime.
+    let identity = placed.and_then(|()| {
+        Ok(Identity::of(
+            &fs.fstat(copy.as_fd()).context("fstat published copy")?,
+        ))
+    });
     match identity {
         Ok(identity) => Ok(Published::one(dest_parent, name, identity, false)),
         Err(e) => {
@@ -748,6 +969,110 @@ fn publish<'a>(
             Err(e)
         }
     }
+}
+
+/// Swaps the staged `<staged_parent>/<name>` in for the stale copy `stale` at
+/// `<dest_parent>/<name>`, and deletes the stale copy once it is out. If what
+/// came out is not the stale copy as found, it is swapped back in and the
+/// move fails: a move overwrites nothing but a stale copy it has inspected.
+///
+/// Until the stale copy is removed, it waits in the staging directory under
+/// the temp file's name, where recovery deletes it after a crash. If what
+/// came out cannot be swapped back, it stays there too, and the error is
+/// [`Unswapped`]: it is not the move's to delete.
+fn replace(
+    fs: &dyn FsOps,
+    staged_parent: &OwnedFd,
+    dest_parent: &OwnedFd,
+    name: &Path,
+    stale: &StaleCopy,
+) -> Result<()> {
+    fs.rename_exchange(staged_parent.as_fd(), name, dest_parent.as_fd(), name)
+        .context("publish: swap in for the stale copy")?;
+    let out = fs
+        .stat_at(staged_parent.as_fd(), name)
+        .context("stat replaced stale copy");
+    if !out.as_ref().is_ok_and(|out| stale.is(out)) {
+        fs.rename_exchange(staged_parent.as_fd(), name, dest_parent.as_fd(), name)
+            .context(Unswapped)?;
+        return Err(out.err().unwrap_or_else(|| stale.changed()));
+    }
+    fs.fsync(dest_parent.as_fd())
+        .context("fsync destination directory")?;
+    fs.unlink(staged_parent.as_fd(), name)
+        .context("remove replaced stale copy")?;
+    fs.fsync(staged_parent.as_fd())
+        .context("fsync staging directory on the backing branch")
+}
+
+/// Renames the staged `<staged_parent>/<name>` to `<dest_parent>/<name>`,
+/// never replacing an existing file, and makes the rename durable.
+fn rename_into_place(
+    fs: &dyn FsOps,
+    staged_parent: &OwnedFd,
+    dest_parent: &OwnedFd,
+    name: &Path,
+) -> Result<()> {
+    fs.rename_noreplace(staged_parent.as_fd(), name, dest_parent.as_fd(), name)
+        .context("publish")?;
+    fs.fsync(dest_parent.as_fd())
+        .context("fsync destination directory")?;
+    fs.fsync(staged_parent.as_fd())
+        .context("fsync staging directory on the backing branch")
+}
+
+/// A failed [`replace`] that left under the temp file's name a file that is
+/// not the stale copy it inspected.
+#[derive(Debug)]
+struct Unswapped;
+
+impl fmt::Display for Unswapped {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str("publish: cannot swap back what is not the stale copy")
+    }
+}
+
+/// Whether the staged name of a move that stopped with `abort` holds nothing
+/// but the move's own temp file, which it may then delete.
+fn staged_is_own(abort: &Abort) -> bool {
+    match abort {
+        Abort::Skip(_) => true,
+        Abort::Fail(e) => e.downcast_ref::<Unswapped>().is_none(),
+    }
+}
+
+/// Removes the stale copies `elsewhere`, on branches other than the one moved
+/// to, now that the copy is `published`, and adds them to `resolved`. If one
+/// cannot be removed, the published copy is removed again and the move fails.
+fn remove_stale_copies(
+    fs: &dyn FsOps,
+    elsewhere: &[StaleCopy],
+    published: &Published,
+    resolved: &mut Vec<(PathBuf, Fate)>,
+) -> Result<()> {
+    for copy in elsewhere {
+        if let Err(e) = remove_stale_copy(fs, copy) {
+            // A published copy that cannot be removed stays as a stale copy,
+            // identical to the source.
+            let _ = published.remove(fs);
+            return Err(e);
+        }
+        resolved.push((copy.path(), Fate::Removed));
+    }
+    Ok(())
+}
+
+/// Removes the stale copy `copy`, if it is still as found.
+fn remove_stale_copy(fs: &dyn FsOps, copy: &StaleCopy) -> Result<()> {
+    let (parent, name) = split(copy.rel);
+    let dir = open_dirs(fs, &copy.branch.fd, parent).context("open directory of stale copy")?;
+    // Removing another name of its inode, if it has one, changed its ctime.
+    if !copy.is(&fs.stat_at(dir.as_fd(), name).context("stat stale copy")?) {
+        return Err(copy.changed());
+    }
+    fs.unlink(dir.as_fd(), name).context("remove stale copy")?;
+    fs.fsync(dir.as_fd())
+        .context("fsync directory of stale copy")
 }
 
 /// Removes the copy published as `<dest_parent>/<name>` after a failure, if
@@ -770,52 +1095,49 @@ fn unpublish_inode(fs: &dyn FsOps, dest_parent: &OwnedFd, name: &Path, copy: &Id
 }
 
 /// Makes the staged symlink `<staged_parent>/<name>` visible as
-/// `<dest_parent>/<name>`, never replacing an existing file. An existing
-/// identical symlink is adopted as the published copy instead.
+/// `<dest_parent>/<name>`, in place of the stale copy `stale` there, if any,
+/// and otherwise never replacing an existing file. A stale copy that is an
+/// identical symlink is kept as the published copy instead.
 fn publish_symlink<'a>(
     fs: &dyn FsOps,
     dest_parent: OwnedFd,
     name: &'a Path,
     staged_parent: &OwnedFd,
+    stale: Option<&StaleCopy>,
 ) -> Result<Published<'a>> {
     let staged = fs
         .stat_at(staged_parent.as_fd(), name)
         .context("stat temp file")?;
-    match fs.rename_noreplace(staged_parent.as_fd(), name, dest_parent.as_fd(), name) {
-        Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-            let identical = identical_symlinks(fs, staged_parent, name, &dest_parent, name);
-            if !identical.unwrap_or(false) {
-                return Err(e).context("publish");
-            }
+    let placed = match stale {
+        Some(stale)
+            if identical_symlinks(fs, staged_parent, name, &dest_parent, name).unwrap_or(false) =>
+        {
             let identity = Identity::of(
                 &fs.stat_at(dest_parent.as_fd(), name)
-                    .context("stat existing symlink")?,
+                    .context("stat stale copy")?,
             );
+            if identity != Identity::of(&stale.stat) {
+                return Err(stale.changed());
+            }
             fs.unlink(staged_parent.as_fd(), name)
                 .context("delete temp file")?;
             fs.fsync(staged_parent.as_fd())
                 .context("fsync staging directory on the backing branch")?;
             return Ok(Published::one(dest_parent, name, identity, true));
         }
-        Err(e) => return Err(e).context("publish"),
-    }
-    // A symlink cannot be fsynced; fsyncing its directory makes it durable.
-    // Its owner and timestamps may not be: on ZFS, the directory's fsync
-    // need not commit the symlink's own changes (see ADR 0002).
-    let identity = fs
-        .fsync(dest_parent.as_fd())
-        .context("fsync destination directory")
-        .and_then(|()| {
-            fs.fsync(staged_parent.as_fd())
-                .context("fsync staging directory on the backing branch")
-        })
-        .and_then(|()| {
-            Ok(Identity::of(
-                &fs.stat_at(dest_parent.as_fd(), name)
-                    .context("stat published copy")?,
-            ))
-        });
+        Some(stale) => replace(fs, staged_parent, &dest_parent, name, stale),
+        // A symlink cannot be fsynced; fsyncing its directory makes it
+        // durable. Its owner and timestamps may not be: on ZFS, the
+        // directory's fsync need not commit the symlink's own changes (see
+        // ADR 0002).
+        None => rename_into_place(fs, staged_parent, &dest_parent, name),
+    };
+    let identity = placed.and_then(|()| {
+        Ok(Identity::of(
+            &fs.stat_at(dest_parent.as_fd(), name)
+                .context("stat published copy")?,
+        ))
+    });
     match identity {
         Ok(identity) if identity.same_inode(&staged) => {
             Ok(Published::one(dest_parent, name, identity, false))
@@ -828,33 +1150,6 @@ fn publish_symlink<'a>(
     }
 }
 
-/// Adopts the existing file `<dest_parent>/<name>` as the published copy if
-/// it is identical to the staged copy, which is then deleted. A run that was
-/// interrupted between publish and retire leaves such a file behind.
-///
-/// A rollback keeps an adopted copy, as a stale copy identical to the source
-/// it puts back: cachy did not write it.
-fn adopt_identical<'a>(
-    fs: &dyn FsOps,
-    dest_parent: OwnedFd,
-    name: &'a Path,
-    staged_parent: &OwnedFd,
-) -> io::Result<Option<Published<'a>>> {
-    let before = Identity::of(&fs.stat_at(dest_parent.as_fd(), name)?);
-    let staged = fs.open_read(staged_parent.as_fd(), name)?;
-    let existing = fs.open_read(dest_parent.as_fd(), name)?;
-    if !identical(fs, &staged, &existing)? {
-        return Ok(None);
-    }
-    let identity = Identity::of(&fs.stat_at(dest_parent.as_fd(), name)?);
-    if identity != before {
-        return Ok(None);
-    }
-    fs.unlink(staged_parent.as_fd(), name)?;
-    fs.fsync(staged_parent.as_fd())?;
-    Ok(Some(Published::one(dest_parent, name, identity, true)))
-}
-
 /// Starts removing the source from the cache branch: renames each of its
 /// names into the cache branch's staging directory, where they wait for
 /// [`RETIRE_WAIT`] so an open that looked up the source before the rename
@@ -863,13 +1158,13 @@ fn retire<'a>(
     fs: &dyn FsOps,
     source: Source<'a>,
     published: Published<'a>,
-    hash: Hash,
+    moved: Moved,
 ) -> Result<Retiring<'a>, Abort> {
     let mut retiring = Retiring {
         source,
         retired_parents: Vec::new(),
         published,
-        hash,
+        moved,
         retired_at: Instant::now(),
     };
     // From here on, every way out either unlinks the retired names or puts
@@ -912,9 +1207,9 @@ impl Retiring<'_> {
             .zip(&self.retired_parents)
     }
 
-    /// Unlinks every retired name. One that cannot be unlinked stays in the
-    /// staging directory, for recovery to delete.
-    fn unlink(self, fs: &dyn FsOps) -> Result<(), Abort> {
+    /// Unlinks every retired name, finishing the move. One that cannot be
+    /// unlinked stays in the staging directory, for recovery to delete.
+    fn unlink(self, fs: &dyn FsOps) -> Result<Moved, Abort> {
         let mut unlinked = Ok(());
         for (name, retired_parent) in self.retired() {
             let result = fs
@@ -929,7 +1224,8 @@ impl Retiring<'_> {
             }
         }
         self.remove_empty_staging_dirs(fs);
-        Ok(unlinked?)
+        unlinked?;
+        Ok(self.moved)
     }
 
     /// Undoes the move: renames the retired names back and removes the
@@ -964,6 +1260,88 @@ fn staging_dirs(fs: &dyn FsOps, branch: &Branch, parent: &Path) -> io::Result<(O
     let staging = make_dirs(fs, &branch.fd, Path::new(STAGING), STAGING_MODE)?;
     let mirrored_parent = make_dirs(fs, &staging, parent, STAGING_MODE)?;
     Ok((staging, mirrored_parent))
+}
+
+/// The stale copies of a move unit, as found when its move started.
+struct StaleCopies<'a> {
+    /// On the branch moved to, at each of the move unit's names, in order.
+    here: Vec<Option<StaleCopy<'a>>>,
+    /// On the other backing branches.
+    elsewhere: Vec<StaleCopy<'a>>,
+}
+
+/// A file at one of a move unit's relpaths on a backing branch.
+struct StaleCopy<'a> {
+    branch: &'a Branch,
+    rel: &'a Path,
+    /// The file as found.
+    stat: Stat,
+}
+
+impl StaleCopy<'_> {
+    fn path(&self) -> PathBuf {
+        self.branch.path.join(self.rel)
+    }
+
+    /// Whether `stat` is of this stale copy, unchanged, apart from its
+    /// ctime, which a rename or another name's unlink changes.
+    fn is(&self, stat: &Stat) -> bool {
+        let unchanged = |s: &Stat| {
+            let (mtime, mtime_nsec) = (s.st_mtime, s.st_mtime_nsec);
+            (s.st_dev, s.st_ino, s.st_mode, s.st_size, mtime, mtime_nsec)
+        };
+        unchanged(stat) == unchanged(&self.stat)
+    }
+
+    fn changed(&self) -> anyhow::Error {
+        anyhow!(
+            "the stale copy {} changed during the move",
+            self.path().display()
+        )
+    }
+}
+
+/// The stale copy at `rel` on `branch`, if there is one, of the source that
+/// `source` describes. Fails if it is a directory, which is never a stale
+/// copy, or if it changed after the source.
+fn stale_copy<'a>(
+    fs: &dyn FsOps,
+    branch: &'a Branch,
+    rel: &'a Path,
+    source: &Stat,
+) -> Result<Option<StaleCopy<'a>>> {
+    let (parent, name) = split(rel);
+    let stat = match open_dirs(fs, &branch.fd, parent).and_then(|dir| fs.stat_at(dir.as_fd(), name))
+    {
+        Ok(stat) => stat,
+        Err(e)
+            if matches!(
+                e.raw_os_error(),
+                Some(libc::ENOENT | libc::ENOTDIR | libc::ELOOP)
+            ) =>
+        {
+            return Ok(None);
+        }
+        Err(e) => {
+            return Err(e).with_context(|| {
+                format!("look up stale copy {}", branch.path.join(rel).display())
+            });
+        }
+    };
+    let copy = StaleCopy { branch, rel, stat };
+    if stat.st_mode & libc::S_IFMT == libc::S_IFDIR {
+        return Err(anyhow!(
+            "{} is a directory, which a move never replaces",
+            copy.path().display()
+        ));
+    }
+    if (stat.st_mtime, stat.st_mtime_nsec) > (source.st_mtime, source.st_mtime_nsec) {
+        return Err(anyhow!(
+            "the stale copy {} is newer than the cache branch's copy",
+            copy.path().display()
+        ));
+    }
+    Ok(Some(copy))
 }
 
 /// The source of a move, held open under a lease for the whole move.
@@ -1327,6 +1705,18 @@ fn read_full(fs: &dyn FsOps, fd: &OwnedFd, buf: &mut [u8]) -> io::Result<usize> 
     let mut filled = 0;
     while filled < buf.len() {
         match fs.read(fd.as_fd(), &mut buf[filled..])? {
+            0 => break,
+            n => filled += n,
+        }
+    }
+    Ok(filled)
+}
+
+/// Reads into `buf` from `offset` until it is full or the file ends.
+fn read_full_at(fs: &dyn FsOps, fd: &OwnedFd, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match fs.read_at(fd.as_fd(), &mut buf[filled..], offset + filled as u64)? {
             0 => break,
             n => filled += n,
         }

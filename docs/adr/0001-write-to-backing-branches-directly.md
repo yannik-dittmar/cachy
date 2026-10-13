@@ -5,5 +5,5 @@ cachy writes moved files straight to `<backing branch>/<relpath>` and picks the 
 ## Consequences
 
 - cachy must know the branch layout. It reads `user.mergerfs.branches` from the cache pool, or takes an explicit branch list, and refuses to start unless the cache branch is the first branch of the cache pool.
-- cachy honours `RO`/`NC` branch modes and `minfreespace` itself, keeps hardlink groups on one branch, and removes stale copies on other branches when it publishes a move.
+- cachy honours `RO`/`NC` branch modes and `minfreespace` itself, keeps hardlink groups on one branch, and removes stale copies on other branches when it publishes a move. It never writes to an `RO` or `NC` branch, so a stale copy there fails the move instead.
 - Users cannot get their cache pool's create policy for moved files. cachy's placement (existing parent directory first, then most free space) applies instead.

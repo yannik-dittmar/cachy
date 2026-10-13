@@ -18,7 +18,9 @@
 //!   symlink open, so it takes no lease.
 //! - A temp file (in a backing branch's staging directory) is deleted. A move
 //!   retires its source only once the copy is published, so a temp file is
-//!   never the only copy of anything. Recovery never writes to a branch that
+//!   never the only copy of anything. A stale copy that a move swapped out
+//!   for its copy waits under the temp file's name, and is deleted too: the
+//!   copy replaced it. Recovery never writes to a branch that
 //!   takes no new files (`RO` or `NC`), so leftovers there stay, with a
 //!   warning, until the branch takes new files again.
 

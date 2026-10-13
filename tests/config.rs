@@ -187,16 +187,57 @@ fn unknown_metadata_loss_kind_is_refused() {
     assert!(err.contains("owner"), "stderr:\n{err}");
 }
 
-#[test]
-fn example_config_is_valid() {
-    let example =
-        fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/cachy.example.yml")).unwrap();
-    let fx = Fixture::new();
-    let config = example
+/// The shipped example configuration.
+fn example() -> String {
+    fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/cachy.example.yml")).unwrap()
+}
+
+/// `example` with its paths pointing into `fx`.
+fn example_under(fx: &Fixture, example: &str) -> String {
+    example
         .replace("/mnt/cache", fx.cache_branch.path().to_str().unwrap())
         .replace("/mnt/storage", fx.backing_branch.path().to_str().unwrap())
-        .replace("/var/lib/cachy", fx.state_dir().to_str().unwrap());
+        .replace("/var/lib/cachy", fx.state_dir().to_str().unwrap())
+}
+
+#[test]
+fn example_config_is_valid() {
+    let fx = Fixture::new();
+    let config = example_under(&fx, &example());
     assert!(!config.contains("/var/lib/cachy"));
+
+    assert_exit(&fx.run(&config), 0);
+}
+
+/// `example` with its commented-out `max_age` and `run_hook` settings
+/// enabled.
+fn uncomment_optional_settings(example: &str) -> String {
+    let mut out = String::new();
+    let mut in_hook = false;
+    for line in example.lines() {
+        let line = if line.starts_with("# max_age:") || line.starts_with("# run_hook:") {
+            in_hook = line.starts_with("# run_hook:");
+            &line[2..]
+        } else if in_hook && line.starts_with("#   ") {
+            &line[2..]
+        } else {
+            in_hook = false;
+            line
+        };
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
+#[test]
+fn example_config_with_its_optional_settings_is_valid() {
+    let example = uncomment_optional_settings(&example());
+    for setting in ["\nmax_age: 7d\n", "\nrun_hook:\n", "\n  timeout: 60s\n"] {
+        assert!(example.contains(setting), "not uncommented: {setting:?}");
+    }
+    let fx = Fixture::new();
+    let config = example_under(&fx, &example);
 
     assert_exit(&fx.run(&config), 0);
 }

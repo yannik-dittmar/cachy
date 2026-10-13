@@ -1,6 +1,6 @@
-# One cachy run: checks the cache branch's free space, and moves files if it is
-# below the threshold. Started by cachy.timer; see the README's Installation
-# section.
+# One cachy invocation: a check of the cache branch, and a run that moves files
+# if the check finds work. Started by cachy.timer; see the README's
+# Installation section.
 [Unit]
 Description=cachy: move files off the mergerfs cache branch
 Documentation=https://github.com/yannik-dittmar/cachy

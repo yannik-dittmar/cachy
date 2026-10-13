@@ -61,7 +61,7 @@ cachy logs to stderr, one line per event, each starting with `cachy: ` and its l
 
 ## Installation
 
-CI builds a statically linked x86_64 binary, `cachy-x86_64-unknown-linux-musl`, on every push to `main` and every pull request; download it from the run's artifacts on the repository's Actions page. It has no runtime dependencies. To build it yourself:
+CI builds a statically linked x86_64 binary on every push to `main` and every pull request; download the `cachy-x86_64-unknown-linux-musl` artifact of a run from the repository's Actions page, which holds the binary `cachy`. It has no runtime dependencies. To build it yourself:
 
 ```sh
 rustup target add x86_64-unknown-linux-musl
@@ -81,7 +81,7 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now cachy.timer
 ```
 
-`cachy.service` runs `cachy run --config /etc/cachy/cachy.yml` once, as root, and has systemd create the state directory `/var/lib/cachy` (`StateDirectory=cachy`), the default `state_dir`. `cachy.timer` starts it every hour, and catches up on a run missed while the machine was off; a check that finds nothing to do only reads the cache branch's free space. To run it more often, or only after the cache branch and pools are mounted, override the units with `systemctl edit cachy.timer` or `systemctl edit cachy.service` (such as `RequiresMountsFor=/mnt/cache /mnt/pool /mnt/storage` under `[Unit]`). cachy's log goes to the journal: `journalctl -u cachy`. Exit codes 1 and 2 mark the service failed, so `OnFailure=` catches refusals and failed moves alike.
+`cachy.service` runs `cachy run --config /etc/cachy/cachy.yml` once, as root, and has systemd create the state directory `/var/lib/cachy` (`StateDirectory=cachy`), the default `state_dir`. `cachy.timer` starts it every hour, and catches up on a run missed while the machine was off; a check that finds nothing to do only reads the cache branch's free space, unless a `max_age` makes it walk the cache branch. To run it more often, or only after the cache branch and pools are mounted, override the units with `systemctl edit cachy.timer` or `systemctl edit cachy.service` (such as `RequiresMountsFor=/mnt/cache /mnt/pool /mnt/storage` under `[Unit]`). cachy's log goes to the journal: `journalctl -u cachy`. Exit codes 1 and 2 mark the service failed, so `OnFailure=` catches refusals and failed moves alike.
 
 ## Configuration
 
@@ -123,7 +123,7 @@ Run cachy as root, as the shipped service does. The in-use guard takes kernel fi
 | Code | Meaning |
 | --- | --- |
 | `0` | Success: a run whose moves all succeeded, a check that found nothing to do, or a dry run that could check every move unit. Skips (in use, changed during the move, too young and the like) are not failures. |
-| `1` | cachy refused to run, and moved nothing: an invalid configuration or command line, another invocation holding the instance lock, a failed capability probe, or a cache pool whose first branch is not the cache branch. |
+| `1` | cachy refused to run, and moved nothing: for example, an invalid configuration or command line, an unreadable cache branch, another invocation holding the instance lock, a failed capability probe, or a cache pool whose first branch is not the cache branch. |
 | `2` | At least one move failed, or the run stopped early: on `SIGTERM` or `SIGINT`, or on an error outside any move, such as a recovery leftover that could not be resolved. Whatever moved stays moved; the run summary lists the failures. |
 
 A failing run hook never changes the exit code.

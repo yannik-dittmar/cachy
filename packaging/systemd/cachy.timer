@@ -1,5 +1,5 @@
-# Starts cachy.service every hour. A check that finds the cache branch above its
-# threshold, and no file older than max_age, only reads the free space.
+# Starts cachy.service every hour. Without a max_age, a check that finds no
+# work only reads the cache branch's free space.
 [Unit]
 Description=Run cachy every hour
 Documentation=https://github.com/yannik-dittmar/cachy

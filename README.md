@@ -8,6 +8,8 @@ cachy is heavily inspired by [mergerfs-cache-mover](https://github.com/monstermu
 
 Early development. Do not use it on real data yet. `cachy run` moves files, skips files in use, recovers from a crash in the middle of a move, and preserves owner, group, mode, xattrs, ACLs and timestamps.
 
+## How it works
+
 A move fails, keeping the source, if the backing branch cannot store the source's xattrs or ACLs. To accept losing them instead, with a warning, list the kinds in the configuration:
 
 ```yaml
@@ -56,6 +58,75 @@ Under either, the minimum age still applies. Each run's last line names the in-u
 After each run, cachy executes the configured run hook, if there is one, and hands it the run summary on stdin: a JSON document that lists the moved, skipped and failed move units (files, hardlink groups and symlinks), with reason codes, the stale copies that moves replaced or removed, the free space before and after, the byte budget, the throughput and the duration. [`docs/run-summary.md`](docs/run-summary.md) documents its schema. An `on` filter limits the hook to runs with some outcomes, such as failed ones; a hook that fails, or that runs past its timeout (60 seconds by default) and is killed, is logged without changing the exit code.
 
 cachy logs to stderr, one line per event, each starting with `cachy: ` and its level: `error`, `warning` or `info`. Lines are never coloured. When systemd connects its stderr to the journal, cachy also gives each line its syslog priority, which journald records, so `journalctl -p warning` shows just the warnings and errors. `cachy --version` prints the version.
+
+## Installation
+
+CI builds a statically linked x86_64 binary, `cachy-x86_64-unknown-linux-musl`, on every push to `main` and every pull request; download it from the run's artifacts on the repository's Actions page. It has no runtime dependencies. To build it yourself:
+
+```sh
+rustup target add x86_64-unknown-linux-musl
+cargo build --release --locked --target x86_64-unknown-linux-musl
+# The binary is target/x86_64-unknown-linux-musl/release/cachy.
+```
+
+Then install the binary, a configuration and the systemd units from [`packaging/systemd`](packaging/systemd):
+
+```sh
+sudo install -m 755 cachy /usr/local/bin/cachy
+sudo install -D -m 644 cachy.example.yml /etc/cachy/cachy.yml
+sudo install -m 644 packaging/systemd/cachy.service packaging/systemd/cachy.timer /etc/systemd/system/
+sudoedit /etc/cachy/cachy.yml
+sudo /usr/local/bin/cachy run --config /etc/cachy/cachy.yml --dry-run
+sudo systemctl daemon-reload
+sudo systemctl enable --now cachy.timer
+```
+
+`cachy.service` runs `cachy run --config /etc/cachy/cachy.yml` once, as root, and has systemd create the state directory `/var/lib/cachy` (`StateDirectory=cachy`), the default `state_dir`. `cachy.timer` starts it every hour, and catches up on a run missed while the machine was off; a check that finds nothing to do only reads the cache branch's free space. To run it more often, or only after the cache branch and pools are mounted, override the units with `systemctl edit cachy.timer` or `systemctl edit cachy.service` (such as `RequiresMountsFor=/mnt/cache /mnt/pool /mnt/storage` under `[Unit]`). cachy's log goes to the journal: `journalctl -u cachy`. Exit codes 1 and 2 mark the service failed, so `OnFailure=` catches refusals and failed moves alike.
+
+## Configuration
+
+cachy reads one YAML file, given with `--config`; [`cachy.example.yml`](cachy.example.yml) explains every key, with examples. Byte sizes take a `K`, `M`, `G` or `T` suffix (binary: `1G` is 1024³ bytes), and durations an `s`, `m`, `h` or `d` suffix. Unknown keys are refused.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `cache_branch` | required | The cache branch: the fast branch that cachy drains, listed first in the cache pool. |
+| `state_dir` | `/var/lib/cachy` | Where the instance lock of each cache branch lives. |
+| `cache_pool` | none | The cache pool's mount, whose mergerfs runtime interface lists the backing branches. |
+| `backing_branches` | none | The backing branches, as `<path>[=<mode>[,<minfreespace>]]` with mode `RW`, `RO` or `NC`, for when the cache pool's runtime interface is unavailable or there is no `cache_pool`. One of the two is required. |
+| `threshold` | required | A check runs when the cache branch's free space is below this byte size or percentage of its size. |
+| `target` | required | A run moves files until free space reaches this; must be above `threshold`. |
+| `order` | `atime` | Which files move first: `atime` (least recently accessed) or `mtime` (least recently modified). |
+| `minimum_age` | `15m` | Files changed more recently than this, by the later of their mtime and ctime, are never moved. |
+| `max_age` | none | Files unchanged for longer than this move on every run, whatever the free space. Must be above `minimum_age`. |
+| `open_file_guard` | `lease` | How cachy tells that a file is in use: `lease`, `proc` or `off`. |
+| `lease_type` | `read` | What counts as in use: `read` for a file open for writing; `write` for a file open at all, even for reading only. |
+| `allow_metadata_loss` | `[]` | Metadata a move may lose, with a warning, when the backing branch cannot store it: `xattrs`, `acls`. |
+| `verify` | `hash` | `hash` hashes the source while copying; `readback` also reads the copy back from storage and compares. |
+| `exclude` | `[]` | Gitignore patterns for files and directories that stay on the cache branch. |
+| `keep_empty_dirs` | `false` | Keep the cache-branch directories that a run empties, rather than remove them. |
+| `run_hook` | none | A command to execute after each run, with the run summary on stdin. Its keys: `command` (required, executed by `/bin/sh -c`), `on` (the outcomes `moved`, `nothing_moved` and `failed` that call it; default all three) and `timeout` (default `60s`). |
+
+### Cache pool requirements
+
+- The cache branch must be the cache pool's **first** branch, so that applications see its copy of a file over a stale copy on a backing branch. With a readable `cache_pool`, cachy refuses to run otherwise.
+- cachy writes moved files to the backing branches directly, never through the cache pool. The cache pool's create policy decides where applications create files: on the cache branch while it has room, as with `category.create=ff`.
+- Set `moveonenospc=false` on the cache pool: otherwise, a write to a backing branch that runs out of space can move the file back onto the cache branch. cachy warns when it is enabled.
+- The `threshold` should not be below the cache branch's `minfreespace`, or mergerfs stops creating files on the cache branch before cachy starts a run. cachy warns if it is.
+- Snapshots of the cache branch keep the space of the files that cachy moves; cachy warns when a run frees much less than it moved.
+
+### Privileges
+
+Run cachy as root, as the shipped service does. The in-use guard takes kernel file leases (`fcntl(F_SETLEASE)`), which need leases enabled (`fs.leases-enable = 1`, the default) and the file's owner or `CAP_LEASE`. When cachy runs as another user, or in a container, it needs `CAP_LEASE` for files owned by other users (in Docker, `cap_add: [LEASE]`), and the capabilities to read those files and to recreate them with their owner, mode and timestamps on the backing branch, such as `CAP_DAC_READ_SEARCH`, `CAP_CHOWN` and `CAP_FOWNER`. The capability probe uses scratch files that cachy owns, so it cannot tell that `CAP_LEASE` is missing: each move of another user's file then fails. With `open_file_guard: proc`, cachy needs root or `CAP_SYS_PTRACE` in the host's PID namespace to see every process's open files.
+
+## Exit codes
+
+| Code | Meaning |
+| --- | --- |
+| `0` | Success: a run whose moves all succeeded, a check that found nothing to do, or a dry run that could check every move unit. Skips (in use, changed during the move, too young and the like) are not failures. |
+| `1` | cachy refused to run, and moved nothing: an invalid configuration or command line, another invocation holding the instance lock, a failed capability probe, or a cache pool whose first branch is not the cache branch. |
+| `2` | At least one move failed, or the run stopped early: on `SIGTERM` or `SIGINT`, or on an error outside any move, such as a recovery leftover that could not be resolved. Whatever moved stays moved; the run summary lists the failures. |
+
+A failing run hook never changes the exit code.
 
 ## Testing
 

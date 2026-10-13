@@ -28,6 +28,36 @@ jobs:
       - run: cargo test --locked -- --show-output
       - run: cargo test --locked --features fault-injection -- --show-output
 
+  # The statically linked binary that the README's Installation section points
+  # to, tested as it ships, with the systemd units checked against it.
+  static:
+    name: static binary (x86_64 musl)
+    runs-on: ubuntu-latest
+    env:
+      TARGET: x86_64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup update stable && rustup default stable
+      - run: rustup target add "$TARGET"
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked --target "$TARGET" -- --show-output
+      - run: cargo build --release --locked --target "$TARGET"
+      - name: Check that the binary is statically linked
+        run: |
+          bin=target/$TARGET/release/cachy
+          file "$bin"
+          file "$bin" | grep -Eq 'static(-pie)? linked'
+          "$bin" --version
+      - name: Verify the systemd units
+        run: |
+          sudo install -m 755 "target/$TARGET/release/cachy" /usr/local/bin/cachy
+          systemd-analyze verify packaging/systemd/cachy.service packaging/systemd/cachy.timer
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cachy-${{ env.TARGET }}
+          path: target/${{ env.TARGET }}/release/cachy
+          if-no-files-found: error
+
   # The same integration tests on every pair of tmpfs, ext4 and ZFS (as cache
   # branch and as backing branch), plus mergerfs cache pools. Hosted runners
   # allow passwordless sudo, the zfs module, loop devices and /dev/fuse; see

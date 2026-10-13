@@ -1,0 +1,14 @@
+# Starts cachy.service every hour. A check that finds the cache branch above its
+# threshold, and no file older than max_age, only reads the free space.
+[Unit]
+Description=Run cachy every hour
+Documentation=https://github.com/yannik-dittmar/cachy
+
+[Timer]
+OnCalendar=hourly
+RandomizedDelaySec=5m
+# Catches up on a run missed while the machine was off.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

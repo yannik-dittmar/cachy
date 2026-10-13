@@ -1,0 +1,26 @@
+# One cachy run: checks the cache branch's free space, and moves files if it is
+# below the threshold. Started by cachy.timer; see the README's Installation
+# section.
+[Unit]
+Description=cachy: move files off the mergerfs cache branch
+Documentation=https://github.com/yannik-dittmar/cachy
+# The cache branch, cache pool and backing branches must be mounted. Add them
+# here, such as RequiresMountsFor=/mnt/cache /mnt/pool /mnt/storage, with
+# `systemctl edit cachy.service`.
+After=local-fs.target remote-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/cachy run --config /etc/cachy/cachy.yml
+# Creates /var/lib/cachy, the default state_dir, which holds the instance lock.
+StateDirectory=cachy
+StateDirectoryMode=0700
+# cachy runs as root, so that it may take leases on, read and recreate the
+# files of every user. Moves yield to other work.
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+# systemctl stop sends SIGTERM: cachy aborts the copies in progress, lets the
+# moves that already published finish, and exits within seconds. Its run hook
+# is killed at its own timeout, or on SIGTERM.
+KillMode=mixed

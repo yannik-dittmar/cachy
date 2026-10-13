@@ -10,6 +10,9 @@ use common::{
 };
 
 const MIB: u64 = 1 << 20;
+/// An explicit order, for tests that expect no warning: on a ZFS cache branch,
+/// cachy warns when none is configured.
+const EXPLICIT_ORDER: &str = "order: atime\n";
 
 /// Five 1 MiB files with distinct content, oldest first.
 const FILES: [(&str, i64); 5] = [
@@ -64,7 +67,7 @@ fn run_moves_oldest_files_until_free_space_reaches_target() {
     let config = fx.config(
         &(free + 1).to_string(),
         &(free + 2 * MIB + MIB / 2).to_string(),
-    );
+    ) + EXPLICIT_ORDER;
 
     let err = assert_exit(
         &output(&mut fx.command_waiting_for_frees(&config)).unwrap(),
@@ -364,7 +367,7 @@ fn frees_that_show_late_cause_no_warning() {
     let config = fx.config(
         &(free + 1).to_string(),
         &(free + 2 * MIB + MIB / 2).to_string(),
-    );
+    ) + EXPLICIT_ORDER;
 
     let child = spawn(&mut fx.command_waiting_for_frees(&config)).unwrap();
     for (rel, _) in &FILES[..3] {
@@ -397,7 +400,7 @@ fn frees_that_show_a_part_at_a_time_cause_no_warning() {
     let config = fx.config(
         &(free + 1).to_string(),
         &(free + 2 * MIB + MIB / 2).to_string(),
-    );
+    ) + EXPLICIT_ORDER;
 
     let child = spawn(&mut fx.command_waiting_for_frees(&config)).unwrap();
     for (rel, _) in &FILES[..3] {

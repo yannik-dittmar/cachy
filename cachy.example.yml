@@ -45,7 +45,9 @@ target: 200G
 #   atime - least recently accessed first (default)
 #   mtime - least recently modified first
 # Ties go to the older mtime, then to the path in byte order. On a cache branch
-# mounted noatime, cachy orders by mtime instead, with a warning.
+# mounted noatime, cachy orders by mtime instead, with a warning. On a ZFS
+# cache branch, cachy warns unless this is set: ZFS's atime=off does not always
+# show as a mount option. Default: atime.
 order: atime
 
 # Files changed more recently than this are never moved. Default: 15m.

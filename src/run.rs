@@ -15,10 +15,12 @@ use crate::fsops::{FsOps, FsStat, Lease};
 use crate::layout::{self, BackingBranch};
 use crate::metadata::AllowedLosses;
 use crate::placement::{Placement, Unplaced};
+use crate::probe::probe;
 use crate::recovery::recover;
 use crate::scan::{Entry, Kind, scan};
 use crate::transaction::{
-    Branch, Fate, Guard, MoveOutcome, Moved, Mover, RETIRING_POLL, STAGING, Skip, would_skip,
+    Branch, Copying, Fate, Guard, MoveOutcome, Moved, Mover, RETIRING_POLL, STAGING, Skip,
+    would_skip,
 };
 
 pub struct Outcome {
@@ -68,13 +70,22 @@ fn freed_wait() -> Duration {
     FREED_WAIT
 }
 
-/// Recovers from unfinished moves, then performs a check and, if free space
-/// is below the threshold or move units are past the max age, a run. The run
-/// moves the move units past the max age first, and stops once they are moved
-/// and its byte budget is consumed. A drain skips the check and has no byte
-/// budget; a dry run only prints what a run would do. An error means cachy refused to run; once
-/// recovery has started, errors are reported in the outcome instead.
-pub fn run(fs: &dyn FsOps, config: &Config, options: Options) -> Result<Outcome> {
+/// Probes the branches' filesystems and recovers from unfinished moves, then
+/// performs a check and, if free space is below the threshold or move units
+/// are past the max age, a run. The run moves the move units past the max age
+/// first, and stops once they are moved and its byte budget is consumed. A
+/// drain skips the check and has no byte budget; a dry run only prints what a
+/// run would do. An error means cachy refused to run; once recovery has
+/// started, errors are reported in the outcome instead.
+///
+/// The probe performs its operations through `probe_fs`, apart from the
+/// others, so that fault injection numbers them apart.
+pub fn run(
+    fs: &dyn FsOps,
+    probe_fs: &dyn FsOps,
+    config: &Config,
+    options: Options,
+) -> Result<Outcome> {
     let cache_branch = Branch::open(&config.cache_branch)
         .with_context(|| format!("cannot open cache branch {}", config.cache_branch.display()))?;
     let cache_fs = FsStat::of(cache_branch.fd.as_fd()).with_context(|| {
@@ -103,6 +114,15 @@ pub fn run(fs: &dyn FsOps, config: &Config, options: Options) -> Result<Outcome>
         },
         minimum_age: config.minimum_age,
     };
+    // Measured before cachy writes anything, the probe's scratch files
+    // included: ZFS shows their frees only once their transaction group syncs,
+    // so a check after them would find less free space than applications left.
+    let free_before = stat_fs(fs, &cache_branch);
+    let capabilities = probe(probe_fs, guard.lease, &cache_branch, &backing_branches)?;
+    let copying = Copying {
+        verify: config.verify,
+        dense: capabilities.dense_copies,
+    };
     let allowed_losses = AllowedLosses::of(&config.allow_metadata_loss);
     let unresolved = if options.dry_run {
         warn_of_leftovers(&cache_branch, &backing_branches);
@@ -122,7 +142,7 @@ pub fn run(fs: &dyn FsOps, config: &Config, options: Options) -> Result<Outcome>
         undated_dirs: 0,
         stopped: false,
     };
-    let free_before = match stat_fs(fs, &cache_branch) {
+    let free_before = match free_before {
         Ok(stat) => stat.free,
         Err(e) => {
             eprintln!("cachy: error: run stopped: {e:#}");
@@ -137,13 +157,19 @@ pub fn run(fs: &dyn FsOps, config: &Config, options: Options) -> Result<Outcome>
     }
 
     let order = match config.order {
-        Order::Atime if cache_fs.noatime => {
+        None | Some(Order::Atime) if cache_fs.noatime => {
             eprintln!(
                 "cachy: warning: the cache branch is mounted noatime, so move units are ordered by mtime instead of atime"
             );
             Order::Mtime
         }
-        order => order,
+        None if capabilities.cache_branch_on_zfs => {
+            eprintln!(
+                "cachy: warning: the cache branch is on ZFS, where atime=off does not always show as a mount option, so the atimes that move units are ordered by may never change; set `order` to atime or mtime"
+            );
+            Order::Atime
+        }
+        order => order.unwrap_or_default(),
     };
     let entries = match scan(fs, &cache_branch, &config.exclude, order) {
         Ok(entries) => entries,
@@ -208,7 +234,7 @@ pub fn run(fs: &dyn FsOps, config: &Config, options: Options) -> Result<Outcome>
                     index,
                     &guard,
                     allowed_losses,
-                    config.verify,
+                    copying,
                 )
             })
         })

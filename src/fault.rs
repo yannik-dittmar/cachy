@@ -2,13 +2,14 @@
 //!
 //! [`FaultyFs`] performs every filesystem operation through [`RealFs`], except
 //! the one named by `CACHY_FAULT=<fault>@<n>` (the `n`th operation of the
-//! process, counting from 1). A `kill` fault kills the process with `SIGKILL`
-//! instead, and `eio`, `enospc`, `exdev` or `eintr` fails the operation with
-//! that errno. A `corrupt` fault lets a write succeed with the first byte of
-//! its data flipped, as faulty storage would; on any other operation it does
-//! nothing. Either way cachy first notes the fault on stderr. A
-//! comma-separated list injects several faults, such as one that starts a
-//! rollback and one during it: `eio@20,kill@23`.
+//! process, counting from 1), or every operation of the given name with
+//! `<fault>@<name>`, such as `einval@rename_noreplace`. A `kill` fault kills
+//! the process with `SIGKILL` instead, and `eio`, `enospc`, `exdev`, `eintr`
+//! or `einval` fails the operation with that errno. A `corrupt` fault lets a
+//! write succeed with the first byte of its data flipped, as faulty storage
+//! would; on any other operation it does nothing. Either way cachy first
+//! notes the fault on stderr. A comma-separated list injects several faults,
+//! such as one that starts a rollback and one during it: `eio@20,kill@23`.
 //!
 //! Lease queries are not counted, nor can they fail: how often a run polls its
 //! leases depends on timing, and the operation numbers must not.
@@ -16,6 +17,13 @@
 //! `CACHY_FAULT_TRACE=1` notes every counted operation on stderr, as
 //! `cachy: trace: operation <n> (<name>)`, so that a test can find the
 //! number of the operation it wants to inject a fault at.
+//!
+//! The capability probe's operations are counted apart, so that the probe
+//! does not shift the numbers of a run's other operations, and take their
+//! faults from `CACHY_PROBE_FAULT`, in the same syntax. Their trace lines read
+//! `cachy: trace: probe operation <n> (<name>)`. `CACHY_ZFS_VERSION=<version>`
+//! makes the probe take the cache branch for OpenZFS with that module
+//! version, as `/sys/module/zfs/version` would give it.
 //!
 //! `CACHY_RETIRE_WAIT_MS=<ms>` shortens the retire wait, and
 //! `CACHY_FREED_WAIT_MS=<ms>` the wait for freed space at the end of a run, so
@@ -38,6 +46,8 @@ use rustix::fs::Timespec;
 use crate::fsops::{FsOps, FsStat, Lease, RealFs, Stat};
 
 const FAULT: &str = "CACHY_FAULT";
+const PROBE_FAULT: &str = "CACHY_PROBE_FAULT";
+const ZFS_VERSION: &str = "CACHY_ZFS_VERSION";
 const TRACE: &str = "CACHY_FAULT_TRACE";
 const RETIRE_WAIT: &str = "CACHY_RETIRE_WAIT_MS";
 const FREED_WAIT: &str = "CACHY_FREED_WAIT_MS";
@@ -53,6 +63,11 @@ pub fn retire_wait() -> Option<Duration> {
 pub fn freed_wait() -> Option<Duration> {
     static WAIT: OnceLock<Option<Duration>> = OnceLock::new();
     *WAIT.get_or_init(|| wait_from_env(FREED_WAIT))
+}
+
+/// The OpenZFS module version set by `CACHY_ZFS_VERSION`, if any.
+pub fn zfs_version() -> Option<String> {
+    std::env::var(ZFS_VERSION).ok()
 }
 
 fn wait_from_env(var: &str) -> Option<Duration> {
@@ -77,9 +92,20 @@ enum CorruptWrite {
     No,
 }
 
+/// The operations a fault replaces.
+#[derive(PartialEq, Eq)]
+enum Target {
+    /// The operation with this number.
+    Number(u64),
+    /// Every operation of this name.
+    Name(String),
+}
+
 pub struct FaultyFs {
-    /// The faults, each with the number of the operation it replaces.
-    faults: Vec<(Fault, u64)>,
+    /// The faults, each with the operations it replaces.
+    faults: Vec<(Fault, Target)>,
+    /// What trace lines and fault notes call an operation.
+    label: &'static str,
     /// Operations performed so far, by all threads. With moves on more than
     /// one backing branch at once, the numbers depend on timing.
     count: AtomicU64,
@@ -91,16 +117,27 @@ pub struct FaultyFs {
 impl FaultyFs {
     /// Injects the faults that `CACHY_FAULT` names, if it is set.
     pub fn from_env() -> Result<FaultyFs> {
-        let faults = match std::env::var(FAULT) {
+        FaultyFs::from_var(FAULT, "operation")
+    }
+
+    /// The capability probe's operations, counted apart from the others,
+    /// with the faults that `CACHY_PROBE_FAULT` names, if it is set.
+    pub fn probe_from_env() -> Result<FaultyFs> {
+        FaultyFs::from_var(PROBE_FAULT, "probe operation")
+    }
+
+    fn from_var(var: &str, label: &'static str) -> Result<FaultyFs> {
+        let faults = match std::env::var(var) {
             Ok(spec) => spec
                 .split(',')
                 .map(parse)
                 .collect::<Result<_>>()
-                .with_context(|| format!("invalid {FAULT}=`{spec}`"))?,
+                .with_context(|| format!("invalid {var}=`{spec}`"))?,
             Err(_) => Vec::new(),
         };
         Ok(FaultyFs {
             faults,
+            label,
             count: AtomicU64::new(0),
             trace: std::env::var_os(TRACE).is_some_and(|v| v == "1"),
             write_delay: wait_from_env(WRITE_DELAY),
@@ -111,23 +148,28 @@ impl FaultyFs {
     /// any. A `corrupt` fault is left to the operation.
     fn count_op(&self, name: &str) -> io::Result<CorruptWrite> {
         let n = self.count.fetch_add(1, Ordering::Relaxed) + 1;
+        let label = self.label;
         if self.trace {
-            eprintln!("cachy: trace: operation {n} ({name})");
+            eprintln!("cachy: trace: {label} {n} ({name})");
         }
-        match self.faults.iter().find(|&&(_, at)| at == n) {
+        let fault = self.faults.iter().find(|(_, target)| match target {
+            Target::Number(at) => *at == n,
+            Target::Name(at) => at == name,
+        });
+        match fault {
             Some((Fault::Kill, _)) => {
-                eprintln!("cachy: fault injection: kill at operation {n} ({name})");
+                eprintln!("cachy: fault injection: kill at {label} {n} ({name})");
                 // SAFETY: kill(2) on our own pid touches no memory.
                 unsafe { libc::kill(libc::getpid(), libc::SIGKILL) };
                 unreachable!("SIGKILL to self returned");
             }
             Some(&(Fault::Errno(errno), _)) => {
                 let e = io::Error::from_raw_os_error(errno);
-                eprintln!("cachy: fault injection: {e} at operation {n} ({name})");
+                eprintln!("cachy: fault injection: {e} at {label} {n} ({name})");
                 Err(e)
             }
             Some((Fault::Corrupt, _)) => {
-                eprintln!("cachy: fault injection: corrupt at operation {n} ({name})");
+                eprintln!("cachy: fault injection: corrupt at {label} {n} ({name})");
                 Ok(CorruptWrite::Yes)
             }
             None => Ok(CorruptWrite::No),
@@ -135,9 +177,9 @@ impl FaultyFs {
     }
 }
 
-fn parse(spec: &str) -> Result<(Fault, u64)> {
-    let Some((fault, n)) = spec.split_once('@') else {
-        bail!("expected <fault>@<operation number>");
+fn parse(spec: &str) -> Result<(Fault, Target)> {
+    let Some((fault, at)) = spec.split_once('@') else {
+        bail!("expected <fault>@<operation number or name>");
     };
     let fault = match fault {
         "kill" => Fault::Kill,
@@ -145,14 +187,22 @@ fn parse(spec: &str) -> Result<(Fault, u64)> {
         "enospc" => Fault::Errno(libc::ENOSPC),
         "exdev" => Fault::Errno(libc::EXDEV),
         "eintr" => Fault::Errno(libc::EINTR),
+        "einval" => Fault::Errno(libc::EINVAL),
         "corrupt" => Fault::Corrupt,
-        _ => bail!("unknown fault `{fault}`: expected kill, eio, enospc, exdev, eintr or corrupt"),
+        _ => bail!(
+            "unknown fault `{fault}`: expected kill, eio, enospc, exdev, eintr, einval or corrupt"
+        ),
     };
-    let n = n.parse().context("invalid operation number")?;
-    if n == 0 {
-        bail!("operations are numbered from 1");
-    }
-    Ok((fault, n))
+    let target = if at.bytes().all(|b| b.is_ascii_digit()) {
+        let n = at.parse().context("invalid operation number")?;
+        if n == 0 {
+            bail!("operations are numbered from 1");
+        }
+        Target::Number(n)
+    } else {
+        Target::Name(at.to_owned())
+    };
+    Ok((fault, target))
 }
 
 impl FsOps for FaultyFs {

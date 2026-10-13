@@ -6,6 +6,7 @@ mod fsops;
 mod layout;
 mod metadata;
 mod placement;
+mod probe;
 mod recovery;
 mod run;
 mod scan;
@@ -71,6 +72,20 @@ fn fs() -> anyhow::Result<fault::FaultyFs> {
     fault::FaultyFs::from_env()
 }
 
+/// The filesystem operations the capability probe performs.
+#[cfg(not(feature = "fault-injection"))]
+fn probe_fs() -> anyhow::Result<fsops::RealFs> {
+    Ok(fsops::RealFs)
+}
+
+/// The filesystem operations the capability probe performs, counted apart
+/// from a run's others, with any fault that the environment asks for
+/// injected.
+#[cfg(feature = "fault-injection")]
+fn probe_fs() -> anyhow::Result<fault::FaultyFs> {
+    fault::FaultyFs::probe_from_env()
+}
+
 fn main() -> ExitCode {
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
@@ -99,7 +114,8 @@ fn main() -> ExitCode {
                 }
                 Ok(config)
             });
-            match config.and_then(|c| run(&fs()?, &c, Options { dry_run, drain })) {
+            let options = Options { dry_run, drain };
+            match config.and_then(|c| run(&fs()?, &probe_fs()?, &c, options)) {
                 Ok(outcome) if outcome.succeeded() => ExitCode::SUCCESS,
                 Ok(_) => ExitCode::from(EXIT_MOVE_FAILED),
                 Err(e) => {

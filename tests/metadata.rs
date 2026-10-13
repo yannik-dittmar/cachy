@@ -304,3 +304,20 @@ fn stale_copy_with_other_metadata_is_replaced_not_kept() {
         assert_eq!(moved.mtime(), 1_000, "{rel}");
     }
 }
+
+#[test]
+fn read_only_file_keeps_its_xattrs() {
+    let fx = Fixture::new();
+    fx.cache_branch_file("file.bin", b"content", 1_000);
+    let source = fx.on_cache_branch("file.bin");
+    set_xattr(&source, "user.comment", b"keep me").unwrap();
+    // Without write permission, only root may set the copy's user xattrs.
+    set_mode(&source, 0o444);
+    let xattrs_before = xattrs(&source);
+
+    let err = assert_exit(&fx.run(&fx.move_everything_config()), 0);
+
+    let moved = fx.on_backing_branch("file.bin");
+    assert_eq!(mode(&moved) & 0o7777, 0o444, "stderr:\n{err}");
+    assert_eq!(xattrs(&moved), xattrs_before);
+}

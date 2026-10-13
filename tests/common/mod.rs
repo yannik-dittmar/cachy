@@ -356,8 +356,16 @@ impl Fixture {
 
     /// Like [`Fixture::command`], but the run waits for freed space to show
     /// before it warns that something holds it, as a normal build does.
+    ///
+    /// Unless `config` sets a `state_dir`, the run keeps its state, the
+    /// instance lock, in [`Fixture::state_dir`], rather than in the system's.
     pub fn command_waiting_for_frees(&self, config: &str) -> Command {
         let path = self.scratch.path().join("cachy.yml");
+        let config = if config.contains("state_dir:") {
+            config.to_owned()
+        } else {
+            format!("state_dir: {}\n{config}", self.state_dir().display())
+        };
         fs::write(&path, config).unwrap();
         let mut command = Command::new(env!("CARGO_BIN_EXE_cachy"));
         command
@@ -365,6 +373,11 @@ impl Fixture {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         command
+    }
+
+    /// The state directory of this fixture's runs.
+    pub fn state_dir(&self) -> PathBuf {
+        self.scratch.path().join("state")
     }
 
     /// Relative paths of all entries (files and directories) under a branch,

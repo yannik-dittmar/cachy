@@ -4,6 +4,7 @@ mod exclude;
 mod fault;
 mod fsops;
 mod layout;
+mod lock;
 mod metadata;
 mod placement;
 mod probe;
@@ -11,6 +12,7 @@ mod proc_scan;
 mod recovery;
 mod run;
 mod scan;
+mod stop;
 mod transaction;
 
 use std::path::PathBuf;

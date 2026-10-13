@@ -11,16 +11,19 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 
 use crate::config::{Config, LeaseType, OpenFileGuard, Order};
+use crate::exclude::Exclusions;
 use crate::fsops::{FsOps, FsStat, Lease};
 use crate::layout::{self, BackingBranch};
+use crate::lock::InstanceLock;
 use crate::metadata::AllowedLosses;
 use crate::placement::{Placement, Unplaced};
 use crate::probe::probe;
 use crate::recovery::recover;
 use crate::scan::{Entry, Kind, scan};
+use crate::stop;
 use crate::transaction::{
     Branch, Copying, Fate, Guard, InUseGuard, MoveOutcome, Moved, Mover, RETIRING_POLL, STAGING,
-    Skip, would_skip,
+    Skip, open_dirs, split, would_skip,
 };
 
 pub struct Outcome {
@@ -72,13 +75,14 @@ fn freed_wait() -> Duration {
     FREED_WAIT
 }
 
-/// Probes the branches' filesystems and recovers from unfinished moves, then
-/// performs a check and, if free space is below the threshold or move units
-/// are past the max age, a run. The run moves the move units past the max age
-/// first, and stops once they are moved and its byte budget is consumed. A
-/// drain skips the check and has no byte budget; a dry run only prints what a
-/// run would do. An error means cachy refused to run; once recovery has
-/// started, errors are reported in the outcome instead.
+/// Takes the instance lock on the cache branch, probes the branches'
+/// filesystems and recovers from unfinished moves, then performs a check and,
+/// if free space is below the threshold or move units are past the max age, a
+/// run. The run moves the move units past the max age first, and stops once
+/// they are moved and its byte budget is consumed. A drain skips the check and
+/// has no byte budget; a dry run only prints what a run would do. An error
+/// means cachy refused to run; once recovery has started, errors are reported
+/// in the outcome instead.
 ///
 /// The probe performs its operations through `probe_fs`, apart from the
 /// others, so that fault injection numbers them apart.
@@ -90,6 +94,9 @@ pub fn run(
 ) -> Result<Outcome> {
     let cache_branch = Branch::open(&config.cache_branch)
         .with_context(|| format!("cannot open cache branch {}", config.cache_branch.display()))?;
+    // Before anything writes: another run's moves would look like leftovers
+    // to recovery.
+    let _lock = InstanceLock::acquire(&config.state_dir, &cache_branch.path)?;
     let cache_fs = FsStat::of(cache_branch.fd.as_fd()).with_context(|| {
         format!(
             "cannot measure the size of cache branch {}",
@@ -109,6 +116,7 @@ pub fn run(
     let backing_branches = layout::discover(config, &cache_branch, threshold)?;
 
     ignore_lease_break_signal();
+    stop::install();
     let guard = Guard {
         in_use: in_use(config),
         minimum_age: config.minimum_age,
@@ -142,6 +150,9 @@ pub fn run(
         stopped: false,
         open_file_guard: config.open_file_guard,
     };
+    if stopping(&mut outcome) {
+        return Ok(outcome);
+    }
     let free_before = match free_before {
         Ok(stat) => stat.free,
         Err(e) => {
@@ -182,6 +193,9 @@ pub fn run(
             return Ok(outcome);
         }
     };
+    if stopping(&mut outcome) {
+        return Ok(outcome);
+    }
     // Move units past the max age first, each part still in order.
     let (mut entries, rest): (Vec<_>, Vec<_>) = entries.into_iter().partition(|entry| {
         config
@@ -256,6 +270,10 @@ pub fn run(
         );
     }
     outcome.undated_dirs = undated.len();
+    let stopped = stopping(&mut outcome);
+    if !config.keep_empty_dirs {
+        remove_emptied_dirs(fs, &cache_branch, &config.exclude, &tally.left_dirs);
+    }
 
     let written = backing_branches
         .iter()
@@ -266,6 +284,8 @@ pub fn run(
         let _ = fs.rmdir(branch.fd.as_fd(), Path::new(STAGING));
     }
     match stat_fs(fs, &cache_branch) {
+        // A stop leaves the target missed; the frees are not worth waiting for.
+        Ok(_) if stopped => {}
         Ok(stat) => {
             let freed = |free: u64| free.saturating_sub(free_before);
             let target_missed = |free: u64| below_threshold && !options.drain && free < target;
@@ -293,6 +313,7 @@ pub fn run(
         moved,
         skipped,
         failed,
+        ..
     } = tally;
     eprintln!(
         "cachy: run finished: {moved} moved, {skipped} skipped, {failed} failed; in-use guard: {}",
@@ -368,8 +389,10 @@ struct Worker<'a> {
 /// takes new files has a mover (`None` for the others), which runs on a
 /// worker thread of its own and works through a queue of move units: moves
 /// on one branch run one at a time, and moves on different branches in
-/// parallel. Returns the space the moves freed on the cache branch, and the
-/// directories created on backing branches whose times could not be set.
+/// parallel. Once a stop is requested, no further move unit is queued, and
+/// the workers skip those still queued. Returns the space the moves freed on
+/// the cache branch, and the directories created on backing branches whose
+/// times could not be set.
 fn move_units<'a>(
     movers: Vec<Option<Mover<'a>>>,
     entries: &'a [Entry],
@@ -407,6 +430,9 @@ fn move_units<'a>(
         };
         let next = || reports.recv().expect("the workers are running");
         'entries: for (i, entry) in entries.iter().enumerate() {
+            if stop::requested() {
+                break;
+            }
             while let Ok(report) = reports.try_recv() {
                 dispatcher.apply(report);
             }
@@ -644,13 +670,14 @@ impl<'a> Reporter<'a> {
     }
 }
 
-/// Free space once `warns` no longer holds for it, or after [`FREED_WAIT`],
-/// starting from `free`. Frees can show late, and a part at a time: on ZFS,
-/// once their transaction group syncs, and a large file over several.
-/// Measured outside the port: how often it measures depends on timing.
+/// Free space once `warns` no longer holds for it, after [`FREED_WAIT`] or
+/// once a stop is requested, starting from `free`. Frees can show late, and a
+/// part at a time: on ZFS, once their transaction group syncs, and a large
+/// file over several. Measured outside the port: how often it measures
+/// depends on timing.
 fn wait_for_frees(cache_branch: &Branch, mut free: u64, warns: impl Fn(u64) -> bool) -> u64 {
     let deadline = Instant::now() + freed_wait();
-    while warns(free) && Instant::now() < deadline {
+    while warns(free) && Instant::now() < deadline && !stop::requested() {
         thread::sleep(FREED_POLL);
         match FsStat::of(cache_branch.fd.as_fd()) {
             Ok(stat) => free = stat.free,
@@ -658,6 +685,63 @@ fn wait_for_frees(cache_branch: &Branch, mut free: u64, warns: impl Fn(u64) -> b
         }
     }
     free
+}
+
+/// Removes each directory in `dirs`, relpaths on the cache branch, if it is
+/// empty, then its parent if that is empty in turn, and so on up to the cache
+/// branch root. Each of them held a move unit or a directory when the run
+/// started, so a directory that was empty before the run is never removed.
+/// Neither is an excluded one: the walk never enters those.
+fn remove_emptied_dirs(
+    fs: &dyn FsOps,
+    cache_branch: &Branch,
+    exclude: &Exclusions,
+    dirs: &[PathBuf],
+) {
+    let mut dirs: Vec<&Path> = dirs.iter().map(PathBuf::as_path).collect();
+    // Deepest first, so that a parent comes after its children.
+    dirs.sort_by_key(|dir| (std::cmp::Reverse(dir.components().count()), *dir));
+    dirs.dedup();
+    for dir in dirs {
+        for dir in dir.ancestors().filter(|dir| !dir.as_os_str().is_empty()) {
+            if exclude.excludes(dir, true) {
+                break;
+            }
+            let (parent, name) = split(dir);
+            // Opened component by component, so that no symlink leads out of
+            // the cache branch.
+            let removed = open_dirs(fs, &cache_branch.fd, parent)
+                .and_then(|parent| fs.rmdir(parent.as_fd(), name));
+            match removed {
+                Ok(()) => {}
+                // Not empty, or removed already as another's parent.
+                Err(e)
+                    if matches!(
+                        e.raw_os_error(),
+                        Some(libc::ENOTEMPTY | libc::EEXIST | libc::ENOENT)
+                    ) =>
+                {
+                    break;
+                }
+                Err(e) => {
+                    eprintln!(
+                        "cachy: warning: cannot remove emptied directory {}: {e}",
+                        cache_branch.path.join(dir).display()
+                    );
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// Whether a stop was requested, as the run notes in `outcome`.
+fn stopping(outcome: &mut Outcome) -> bool {
+    if stop::requested() && !outcome.stopped {
+        eprintln!("cachy: warning: run stopped early: cachy was asked to stop");
+        outcome.stopped = true;
+    }
+    outcome.stopped
 }
 
 /// Notes that a check found no work.
@@ -762,6 +846,9 @@ struct Tally {
     moved: usize,
     skipped: usize,
     failed: usize,
+    /// The cache-branch directories, by relpath, that moved move units left,
+    /// which may now be empty. The cache branch root is not among them.
+    left_dirs: Vec<PathBuf>,
 }
 
 impl Tally {
@@ -772,6 +859,12 @@ impl Tally {
             match outcome {
                 Ok(MoveOutcome::Moved(Moved { hash, stale_copies })) => {
                     self.moved += 1;
+                    self.left_dirs.extend(
+                        rels.iter()
+                            .filter_map(|rel| rel.parent())
+                            .filter(|dir| !dir.as_os_str().is_empty())
+                            .map(Path::to_owned),
+                    );
                     eprintln!("cachy: moved {rel} to {} (xxh3 {hash})", branch.display());
                     for (path, fate) in stale_copies {
                         let done = match fate {

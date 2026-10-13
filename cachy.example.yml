@@ -5,6 +5,12 @@
 # The fast branch that cachy drains: the first branch of the cache pool.
 cache_branch: /mnt/cache
 
+# Where cachy keeps the instance lock of each cache branch, which lets only
+# one run at a time drain it: a second run started meanwhile, by a timer or by
+# hand, refuses to run (exit code 1). Holds nothing else. Default:
+# /var/lib/cachy.
+state_dir: /var/lib/cachy
+
 # The cache pool: the mergerfs mount over the cache branch and the backing
 # branches. cachy reads its branches, with their modes and minfreespace, from
 # mergerfs's runtime interface (<cache pool>/.mergerfs), and refuses to run
@@ -112,3 +118,11 @@ exclude:
   - /snapraid.content
   - /snapraid.parity
   - /.snapraid/
+
+# After a run, the cache-branch directories that its moves emptied are
+# removed, and then their parents while those are empty in turn. Directories
+# that were already empty before the run, and excluded ones, are kept. Set
+# this to true to keep every directory, such as for a path-preserving create
+# policy, which creates new files only where their directory already exists.
+# Default: false.
+keep_empty_dirs: false

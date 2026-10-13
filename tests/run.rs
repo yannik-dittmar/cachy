@@ -190,7 +190,7 @@ fn many_small_files_move_without_waiting_for_each_retire() {
 
     assert!(err.contains("20 moved"), "stderr:\n{err}");
     assert!(took < Duration::from_secs(5), "20 moves took {took:?}");
-    assert_eq!(Fixture::tree(fx.cache_branch.path()), ["small"]);
+    assert!(Fixture::tree(fx.cache_branch.path()).is_empty());
     fx.assert_no_staging_directories();
 }
 
@@ -238,10 +238,7 @@ fn successful_run_leaves_no_staging_directory() {
             "two.bin"
         ]
     );
-    assert_eq!(
-        Fixture::tree(fx.cache_branch.path()),
-        ["deep", "deep/er", "old"]
-    );
+    assert!(Fixture::tree(fx.cache_branch.path()).is_empty());
 }
 
 /// A backing file at a moved relpath is a stale copy, hidden behind the

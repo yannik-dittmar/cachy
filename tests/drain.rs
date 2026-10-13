@@ -28,10 +28,7 @@ fn drain_moves_every_eligible_move_unit_although_free_space_is_above_the_thresho
     assert!(err.contains("in-use.bin: in use"), "stderr:\n{err}");
     assert_eq!(fs::read(fx.on_backing_branch("a.bin")).unwrap(), b"a");
     assert_eq!(fs::read(fx.on_backing_branch("deep/b.bin")).unwrap(), b"b");
-    assert_eq!(
-        Fixture::tree(fx.cache_branch.path()),
-        ["deep", "in-use.bin"]
-    );
+    assert_eq!(Fixture::tree(fx.cache_branch.path()), ["in-use.bin"]);
     fx.assert_no_staging_directories();
 }
 

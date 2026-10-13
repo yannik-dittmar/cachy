@@ -58,7 +58,7 @@ const MAX_RETIRING: usize = 128;
 pub const RETIRING_POLL: Duration = Duration::from_millis(10);
 const COPY_BUF: usize = 1 << 20;
 pub const DIR_MODE: u32 = 0o755;
-const STAGING_MODE: u32 = 0o700;
+pub const STAGING_MODE: u32 = 0o700;
 const TEMP_MODE: u32 = 0o600;
 
 /// [`RETIRE_WAIT`], unless a fault-injection build is told otherwise.
@@ -186,6 +186,16 @@ impl fmt::Display for Skip {
     }
 }
 
+/// How a move copies a regular file's content.
+#[derive(Clone, Copy)]
+pub struct Copying {
+    pub verify: Verify,
+    /// Copy every byte, holes included as zeros, rather than ask the cache
+    /// branch where the source's holes are: for filesystems whose answer
+    /// cannot be trusted.
+    pub dense: bool,
+}
+
 /// What keeps a move away from move units that are in use.
 pub struct Guard {
     /// The lease held on the source during a move. Any open that conflicts
@@ -219,7 +229,7 @@ pub struct Mover<'a> {
     other_branches: Vec<&'a BackingBranch>,
     guard: &'a Guard,
     allowed_losses: AllowedLosses,
-    verify: Verify,
+    copying: Copying,
     /// Directories that moves created on the backing branch, by relpath.
     created_dirs: Vec<PathBuf>,
     retiring: VecDeque<Retiring<'a>>,
@@ -248,7 +258,7 @@ impl<'a> Mover<'a> {
         index: usize,
         guard: &'a Guard,
         allowed_losses: AllowedLosses,
-        verify: Verify,
+        copying: Copying,
     ) -> Mover<'a> {
         Mover {
             fs,
@@ -262,7 +272,7 @@ impl<'a> Mover<'a> {
                 .collect(),
             guard,
             allowed_losses,
-            verify,
+            copying,
             created_dirs: Vec::new(),
             retiring: VecDeque::new(),
             finished: Vec::new(),
@@ -733,7 +743,7 @@ impl<'a> Mover<'a> {
     fn stage(&mut self, source: &Source, temp: &OwnedFd, rel: &Path) -> Result<Hash, Abort> {
         let fs = self.fs;
         let hash = self.copy(source, temp)?;
-        if self.verify == Verify::Readback {
+        if self.copying.verify == Verify::Readback {
             // Before the metadata: reading the copy changes its atime.
             fs.fsync(temp.as_fd()).context("fsync temp file")?;
             self.read_back(source, temp, hash)?;
@@ -752,10 +762,10 @@ impl<'a> Mover<'a> {
         Ok(hash)
     }
 
-    /// Copies the source into `dst`, leaving its holes as holes, and returns
-    /// the hash of its content (holes read as zeros). Aborts as soon as the
-    /// source's lease breaks. Retiring moves are serviced between chunks, so
-    /// a long copy does not hold them up.
+    /// Copies the source into `dst`, leaving its holes as holes unless the
+    /// copy is dense, and returns the hash of its content (holes read as
+    /// zeros). Aborts as soon as the source's lease breaks. Retiring moves
+    /// are serviced between chunks, so a long copy does not hold them up.
     fn copy(&mut self, src: &Source, dst: &OwnedFd) -> Result<Hash, Abort> {
         let fs = self.fs;
         let size = src.stat.st_size.max(0) as u64;
@@ -763,16 +773,21 @@ impl<'a> Mover<'a> {
         let mut buf = vec![0; COPY_BUF];
         let mut offset = 0;
         while offset < size {
-            let data = fs
-                .seek_data(src.file.as_fd(), offset)
-                .context("copy: find data in source")?;
-            let Some(data) = data.filter(|&data| data < size) else {
-                break;
+            let (data, hole) = if self.copying.dense {
+                (offset, size)
+            } else {
+                let data = fs
+                    .seek_data(src.file.as_fd(), offset)
+                    .context("copy: find data in source")?;
+                let Some(data) = data.filter(|&data| data < size) else {
+                    break;
+                };
+                let hole = fs
+                    .seek_hole(src.file.as_fd(), data)
+                    .context("copy: find hole in source")?
+                    .min(size);
+                (data, hole)
             };
-            let hole = fs
-                .seek_hole(src.file.as_fd(), data)
-                .context("copy: find hole in source")?
-                .min(size);
             hash_zeros(&mut hasher, data - offset);
             offset = data;
             while offset < hole {

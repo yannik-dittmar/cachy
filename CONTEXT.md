@@ -71,15 +71,19 @@ The step of a move, after publishing, that removes the move unit from the cache 
 _Avoid_: delete, clean up
 
 **Staging directory**:
-cachy's own directory at the root of each filesystem it writes to, holding the temp files and retired sources of unfinished moves, and the directories that cachy is creating; anything left in it after a crash belongs to an unfinished move or directory creation and nothing else.
+cachy's own directory at the root of each filesystem it writes to, holding the temp files and retired sources of unfinished moves, the directories that cachy is creating, and the capability probe's scratch files; anything left in it after a crash belongs to an unfinished move, directory creation or probe and nothing else.
 _Avoid_: temp dir, journal
 
 **Leftover**:
 A temp file or retired source (a regular file or a symlink) that an unfinished move left in a staging directory, or an empty directory that an unfinished directory creation left there.
 _Avoid_: orphan
 
+**Capability probe**:
+The first step of every invocation of cachy, which tries on scratch files in each staging directory what cachy's guarantees depend on (leases, no-replace and exchange renames, hole reporting), and refuses to run if a filesystem lacks a lease or rename, or cannot be probed for any reason but a lack of space.
+_Avoid_: self-test, startup check
+
 **Recovery**:
-The first step of every invocation of cachy, before the check, which resolves each leftover against its published counterpart (deleting it if it is redundant, renaming a retired source back otherwise) and then removes empty staging directories.
+The step of every invocation of cachy after the capability probe and before the check, which resolves each leftover against its published counterpart (deleting it if it is redundant, renaming a retired source back otherwise) and then removes empty staging directories.
 _Avoid_: cleanup, orphan cleaning
 
 ### Checks and runs

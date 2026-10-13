@@ -292,7 +292,9 @@ fn branches_take_one_move_at_a_time_and_move_in_parallel() {
     }
 }
 
-/// The regular files below `dir`, which may vanish while it is listed.
+/// The regular files below the staging directory `dir`, which may vanish
+/// while it is listed. Its own `.cachy-staging`, with the capability probe's
+/// scratch files and the directories being created, holds no temp file.
 #[cfg(feature = "fault-injection")]
 fn temp_files(dir: &Path) -> usize {
     let Ok(entries) = fs::read_dir(dir) else {
@@ -300,6 +302,7 @@ fn temp_files(dir: &Path) -> usize {
     };
     entries
         .flatten()
+        .filter(|entry| entry.file_name() != common::STAGING)
         .map(|entry| match entry.file_type() {
             Ok(t) if t.is_dir() => temp_files(&entry.path()),
             Ok(t) if t.is_file() => 1,

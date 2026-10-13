@@ -25,9 +25,10 @@ pub struct Config {
     pub threshold: FreeSpace,
     #[serde(deserialize_with = "free_space")]
     pub target: FreeSpace,
-    /// The timestamp that decides which move units a run moves first.
+    /// The timestamp that decides which move units a run moves first;
+    /// [`Order::Atime`] if unset.
     #[serde(default)]
-    pub order: Order,
+    pub order: Option<Order>,
     #[serde(default = "default_minimum_age", deserialize_with = "duration")]
     pub minimum_age: Duration,
     /// Move units unchanged for longer than this count as work for any check,

@@ -237,15 +237,15 @@ impl Fixture {
     /// it a later sync could change free space between this measurement and
     /// cachy's. `syncfs` does not sync it on ZFS; `zpool sync` does, as root.
     pub fn cache_branch_free(&self) -> u64 {
-        let dir = fs::File::open(self.cache_branch.path()).unwrap();
-        rustix::fs::syncfs(&dir).unwrap();
-        if self.cache_branch_fs == FsKind::Zfs {
-            let dataset = zfs_dataset(self.cache_branch.path());
-            let pool = dataset.split('/').next().unwrap();
-            sudo(&[OsStr::new("zpool"), OsStr::new("sync"), OsStr::new(pool)])
-                .unwrap_or_else(|e| panic!("sync the cache branch's zpool: {e}"));
-        }
+        sync(self.cache_branch.path(), self.cache_branch_fs);
         free_bytes(&statvfs(self.cache_branch.path()).unwrap())
+    }
+
+    /// Syncs the backing branch's filesystem, so that `st_blocks` of the
+    /// files on it shows their space, which ZFS shows only once their
+    /// transaction group has synced.
+    pub fn sync_backing_branch(&self) {
+        sync(self.backing_branch.path(), self.backing_branch_fs);
     }
 
     /// A valid config for this fixture's branches with the given threshold and
@@ -668,6 +668,19 @@ pub fn write_file(path: &Path, content: &[u8], mtime: i64) {
         rustix::fs::AtFlags::empty(),
     )
     .unwrap();
+}
+
+/// Syncs the filesystem of `kind` at `path`: with `syncfs`, and on ZFS, which
+/// it does not sync, with `zpool sync` as root.
+fn sync(path: &Path, kind: FsKind) {
+    let dir = fs::File::open(path).unwrap();
+    rustix::fs::syncfs(&dir).unwrap();
+    if kind == FsKind::Zfs {
+        let dataset = zfs_dataset(path);
+        let pool = dataset.split('/').next().unwrap();
+        sudo(&[OsStr::new("zpool"), OsStr::new("sync"), OsStr::new(pool)])
+            .unwrap_or_else(|e| panic!("sync zpool {pool}: {e}"));
+    }
 }
 
 fn free_bytes(s: &StatVfs) -> u64 {

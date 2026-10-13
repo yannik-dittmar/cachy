@@ -231,16 +231,23 @@ pub fn run(fs: &dyn FsOps, config: &Config, options: Options) -> Result<Outcome>
     }
     match stat_fs(fs, &cache_branch) {
         Ok(stat) => {
-            let free = wait_for_frees(&cache_branch, stat.free, free_before, moved_bytes);
-            if below_threshold && !options.drain && free < target {
+            let freed = |free: u64| free.saturating_sub(free_before);
+            let target_missed = |free: u64| below_threshold && !options.drain && free < target;
+            let frees_missing = |free: u64| freed(free) < moved_bytes / FREED_DIVISOR;
+            // Waiting helps the target only while some moved bytes have yet
+            // to show as free.
+            let free = wait_for_frees(&cache_branch, stat.free, |free| {
+                (target_missed(free) && freed(free) < moved_bytes) || frees_missing(free)
+            });
+            if target_missed(free) {
                 eprintln!(
                     "cachy: warning: target not reached: {free} bytes free, target {target} bytes"
                 );
             }
-            let freed = free.saturating_sub(free_before);
-            if freed < moved_bytes / FREED_DIVISOR {
+            if frees_missing(free) {
                 eprintln!(
-                    "cachy: warning: free space grew by only {freed} bytes, but the moves took up {moved_bytes} bytes on it; snapshots of the cache branch may be holding the space"
+                    "cachy: warning: free space grew by only {} bytes, but the moves took up {moved_bytes} bytes on it; snapshots of the cache branch may be holding the space",
+                    freed(free)
                 );
             }
         }
@@ -578,13 +585,13 @@ impl<'a> Reporter<'a> {
     }
 }
 
-/// Free space once it has grown by enough of `moved_bytes` since
-/// `free_before`, or after [`FREED_WAIT`], starting from `free`. Measured
-/// outside the port: how often it measures depends on timing.
-fn wait_for_frees(cache_branch: &Branch, mut free: u64, free_before: u64, moved_bytes: u64) -> u64 {
-    let enough = |free: u64| free.saturating_sub(free_before) >= moved_bytes / FREED_DIVISOR;
+/// Free space once `warns` no longer holds for it, or after [`FREED_WAIT`],
+/// starting from `free`. Frees can show late, and a part at a time: on ZFS,
+/// once their transaction group syncs, and a large file over several.
+/// Measured outside the port: how often it measures depends on timing.
+fn wait_for_frees(cache_branch: &Branch, mut free: u64, warns: impl Fn(u64) -> bool) -> u64 {
     let deadline = Instant::now() + freed_wait();
-    while !enough(free) && Instant::now() < deadline {
+    while warns(free) && Instant::now() < deadline {
         thread::sleep(FREED_POLL);
         match FsStat::of(cache_branch.fd.as_fd()) {
             Ok(stat) => free = stat.free,

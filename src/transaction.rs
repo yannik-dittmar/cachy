@@ -322,8 +322,8 @@ impl<'a> Mover<'a> {
     /// scanner lists them) from the cache branch to the backing branch, unless
     /// the guard finds it in use; skips it if it is a special file or a partly
     /// excluded hardlink group, or if a stop was requested. The outcome is
-    /// reported by
-    /// [`Mover::finished`], possibly only after later moves have started.
+    /// reported by [`Mover::finished`], possibly only after later moves have
+    /// started.
     ///
     /// A skipped move, or one that fails before publish, leaves the source
     /// where it was and no copy behind.
@@ -1095,8 +1095,6 @@ impl fmt::Display for Unswapped {
     }
 }
 
-/// Whether the staged name of a move that stopped with `abort` holds nothing
-/// but the move's own temp file, which it may then delete.
 /// Aborts a move that is copying, comparing or reading back once a stop is
 /// requested.
 fn check_stop() -> Result<(), Abort> {
@@ -1107,6 +1105,8 @@ fn check_stop() -> Result<(), Abort> {
     }
 }
 
+/// Whether the staged name of a move that stopped with `abort` holds nothing
+/// but the move's own temp file, which it may then delete.
 fn staged_is_own(abort: &Abort) -> bool {
     match abort {
         Abort::Skip(_) => true,

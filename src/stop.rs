@@ -8,8 +8,10 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
+/// Set once a stop is requested.
 static REQUESTED: AtomicBool = AtomicBool::new(false);
 
+/// The handler of the signals that request a stop.
 extern "C" fn request(_signal: libc::c_int) {
     REQUESTED.store(true, Ordering::Relaxed);
 }

@@ -1,9 +1,9 @@
 //! The instance lock: one run per cache branch at a time.
 //!
-//! The lock is an `flock` on a file in the state directory, named after the
-//! cache branch's canonical path. The kernel releases it when the process
-//! exits, however it exits, so a crash never leaves it held. The file itself
-//! stays: deleting it could let two runs lock two different files.
+//! The instance lock is an `flock` on a file in the state directory, named
+//! after the cache branch's canonical path. The kernel releases it when the
+//! process exits, however it exits, so a crash never leaves it held. The file
+//! itself stays: deleting it could let two runs lock two different files.
 
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io;
@@ -14,7 +14,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use rustix::fs::{FlockOperation, flock};
 
+/// The mode of the state directory, if cachy creates it.
 const STATE_DIR_MODE: u32 = 0o755;
+/// The mode of the files that hold instance locks.
 const LOCK_MODE: u32 = 0o644;
 
 /// The instance lock on a cache branch, held until dropped.
@@ -41,7 +43,7 @@ impl InstanceLock {
             .truncate(false)
             .mode(LOCK_MODE)
             .open(&path)
-            .with_context(|| format!("cannot open lock file {}", path.display()))?;
+            .with_context(|| format!("cannot open instance lock {}", path.display()))?;
         match flock(&file, FlockOperation::NonBlockingLockExclusive) {
             Ok(()) => Ok(InstanceLock { _file: file }),
             Err(e) if io::Error::from(e).kind() == io::ErrorKind::WouldBlock => bail!(
@@ -54,9 +56,10 @@ impl InstanceLock {
     }
 }
 
-/// The lock file of the cache branch at the canonical path `cache_branch`:
-/// the path escaped as systemd escapes paths, so that distinct paths never
-/// share a lock file. `/mnt/cache` becomes `mnt-cache.lock`.
+/// The file that holds the instance lock of the cache branch at the canonical
+/// path `cache_branch`, named after the path escaped as systemd escapes
+/// paths, so that distinct paths never share one. `/mnt/cache` becomes
+/// `mnt-cache.lock`.
 fn lock_path(state_dir: &Path, cache_branch: &Path) -> PathBuf {
     let bytes = cache_branch.as_os_str().as_bytes();
     let trimmed = bytes.strip_prefix(b"/").unwrap_or(bytes);
@@ -89,7 +92,7 @@ mod tests {
     }
 
     #[test]
-    fn lock_files_are_named_after_the_escaped_path() {
+    fn instance_locks_are_named_after_the_escaped_path() {
         assert_eq!(name("/mnt/cache"), "mnt-cache.lock");
         assert_eq!(name("/"), "-.lock");
         assert_eq!(name("/mnt/my-cache"), "mnt-my\\x2dcache.lock");

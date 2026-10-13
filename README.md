@@ -159,7 +159,7 @@ The property tests (`tests/properties.rs`) generate random cache-branch trees, w
 PROPTEST_CASES=500 cargo test --features fault-injection --test properties
 ```
 
-The Quality reports workflow publishes test coverage (`cargo-llvm-cov`) and mutation testing (`cargo-mutants`) of the move transaction, recovery and exclusions as job summaries and artifacts; neither fails the build. A pull request tests the mutants in its own diff, and a weekly run tests them all. To run the same locally:
+The Quality reports workflow publishes test coverage (`cargo-llvm-cov`) and mutation testing (`cargo-mutants`) of the move transaction, recovery and exclusions as job summaries and artifacts; neither fails the build. A pull request tests the mutants in its own diff; running the workflow manually tests them all. To run the same locally:
 
 ```sh
 cargo llvm-cov --features fault-injection --html

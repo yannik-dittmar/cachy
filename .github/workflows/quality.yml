@@ -7,10 +7,8 @@ on:
   push:
     branches: [main]
   pull_request:
-  # Every mutant takes a run of the test suite, so main is tested in full
-  # once a week rather than on each push.
-  schedule:
-    - cron: "17 3 * * 1"
+  # Every mutant takes a run of the test suite, so all of them are tested
+  # only on demand, not on each push.
   workflow_dispatch:
 
 env:
@@ -21,7 +19,6 @@ jobs:
   # build, as a job summary, an HTML report and an lcov file.
   coverage:
     name: coverage report
-    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
@@ -64,8 +61,7 @@ jobs:
 
   # Mutation testing of the move transaction, recovery and exclusions: which
   # changes to them the test suite misses. A pull request tests the mutants
-  # in its own diff; the weekly run (or a manual one) tests all of them, in
-  # shards.
+  # in its own diff; a manual run tests all of them, in shards.
   mutants:
     name: mutation report (shard ${{ matrix.shard }})
     if: github.event_name != 'push'

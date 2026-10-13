@@ -42,6 +42,8 @@ mod fault_injection {
     use std::sync::{Condvar, LazyLock, Mutex};
     use std::thread;
 
+    use tempfile::TempDir;
+
     use super::*;
 
     const MIB: usize = 1 << 20;
@@ -593,6 +595,144 @@ mod fault_injection {
                 assert_eq!(out.status.code(), Some(0), "{context}");
                 assert_group_exactly_once(&fx, &context, true);
                 assert_no_staging_directories(&fx, &context);
+                true
+            });
+        }
+    }
+
+    /// Move units with stale copies, with their content: one whose differing
+    /// stale copy is replaced, one whose identical stale copy is kept, one
+    /// whose stale copy is on another branch, and a hardlink group with a
+    /// stale copy at its second name.
+    const STALE_SOURCES: [(&str, &[u8]); 5] = [
+        ("replaced.bin", b"replaces its stale copy"),
+        ("kept.bin", b"identical to its stale copy"),
+        ("elsewhere/removed.bin", b"its stale copy is elsewhere"),
+        ("group/a.bin", b"group"),
+        ("group/b.bin", b"group"),
+    ];
+    const STALE_SOURCES_MTIME: i64 = 2_000;
+
+    /// A fixture holding [`STALE_SOURCES`] and their stale copies, the second
+    /// backing branch that holds one of them, and the config of a run that
+    /// moves them all to the fixture's backing branch: the second one has no
+    /// room, so moves to one branch only keep the operation numbers apart
+    /// from timing.
+    fn create_stale_copies() -> (Fixture, TempDir, String) {
+        let fx = Fixture::new();
+        let full = fx.extra_backing_branch();
+        for (rel, content) in &STALE_SOURCES[..3] {
+            fx.cache_branch_file(rel, content, STALE_SOURCES_MTIME);
+        }
+        let (group, content) = (["group/a.bin", "group/b.bin"], STALE_SOURCES[3].1);
+        fx.cache_branch_hardlinks(&group, content, STALE_SOURCES_MTIME);
+        fx.backing_branch_file("replaced.bin", b"stale", 1_000);
+        fx.backing_branch_file("kept.bin", STALE_SOURCES[1].1, STALE_SOURCES_MTIME);
+        common::write_file(&full.path().join("elsewhere/removed.bin"), b"stale", 1_000);
+        fx.backing_branch_file(group[1], b"stale", 1_000);
+        let config = fx.layout_config(&format!(
+            "backing_branches:\n  - {}\n  - {}=RW,1000T\n",
+            fx.backing_branch.path().display(),
+            full.path().display()
+        ));
+        (fx, full, config)
+    }
+
+    /// Each of [`STALE_SOURCES`] shows with its content through a cache pool
+    /// over the cache branch, the backing branch and `full`, in that order.
+    fn assert_stale_sources_show(fx: &Fixture, full: &TempDir, context: &str) {
+        for (rel, content) in STALE_SOURCES {
+            let shown = [
+                fx.on_cache_branch(rel),
+                fx.on_backing_branch(rel),
+                full.path().join(rel),
+            ]
+            .iter()
+            .find_map(|path| fs::read(path).ok());
+            assert!(
+                shown.as_deref() == Some(content),
+                "{context}: {rel} shows as {:?}",
+                shown.map(|c| String::from_utf8_lossy(&c).into_owned())
+            );
+        }
+    }
+
+    /// Each of [`STALE_SOURCES`] exists only on the backing branch, with its
+    /// content and mtime, the group as one inode, and no staging directory
+    /// is left.
+    fn assert_stale_sources_moved(fx: &Fixture, full: &TempDir, context: &str) {
+        for (rel, content) in STALE_SOURCES {
+            let copies: Vec<_> = [
+                fx.on_cache_branch(rel),
+                fx.on_backing_branch(rel),
+                full.path().join(rel),
+            ]
+            .into_iter()
+            .filter(|p| p.exists())
+            .collect();
+            assert_eq!(copies, [fx.on_backing_branch(rel)], "{context}");
+            assert_eq!(fs::read(&copies[0]).unwrap(), content, "{context}: {rel}");
+            let mtime = fs::metadata(&copies[0]).unwrap().mtime();
+            assert_eq!(mtime, STALE_SOURCES_MTIME, "{context}: {rel}");
+        }
+        let a = fs::metadata(fx.on_backing_branch("group/a.bin")).unwrap();
+        let b = fs::metadata(fx.on_backing_branch("group/b.bin")).unwrap();
+        assert_eq!((a.ino(), a.nlink()), (b.ino(), 2), "{context}");
+        assert_no_staging_directories(fx, context);
+        assert!(
+            !full.path().join(common::STAGING).exists(),
+            "{context}: a staging directory is left"
+        );
+    }
+
+    #[test]
+    fn crash_at_every_operation_of_moves_with_stale_copies_is_recovered_by_the_next_run() {
+        for_every_operation(|n| {
+            let (fx, full, config) = create_stale_copies();
+
+            let (out, reached) =
+                run_with_faults(with_short_retire_wait(&fx, &config), &format!("kill@{n}"));
+            if !reached {
+                assert_exit(&out, 0);
+                return false;
+            }
+            assert_stale_sources_show(&fx, &full, &format!("killed at operation {n}"));
+            let out = common::output(&mut with_short_retire_wait(&fx, &config)).unwrap();
+
+            let context = format!(
+                "killed at operation {n}, then ran again; stderr:\n{}",
+                common::stderr(&out)
+            );
+            assert_eq!(out.status.code(), Some(0), "{context}");
+            assert_stale_sources_moved(&fx, &full, &context);
+            true
+        });
+    }
+
+    #[test]
+    fn error_at_every_operation_of_moves_with_stale_copies_loses_nothing() {
+        for errno in ["eio", "enospc"] {
+            for_every_operation(|n| {
+                let (fx, full, config) = create_stale_copies();
+
+                let fault = format!("{errno}@{n}");
+                let (out, reached) = run_with_faults(with_short_retire_wait(&fx, &config), &fault);
+                if !reached {
+                    assert_exit(&out, 0);
+                    return false;
+                }
+                let context = format!("{fault}; stderr:\n{}", common::stderr(&out));
+                assert!(
+                    matches!(out.status.code(), Some(0 | 2)),
+                    "{context}\nexit: {:?}",
+                    out.status
+                );
+                assert_stale_sources_show(&fx, &full, &context);
+
+                let out = common::output(&mut with_short_retire_wait(&fx, &config)).unwrap();
+                let context = format!("{fault}, then ran again; stderr:\n{}", common::stderr(&out));
+                assert_eq!(out.status.code(), Some(0), "{context}");
+                assert_stale_sources_moved(&fx, &full, &context);
                 true
             });
         }

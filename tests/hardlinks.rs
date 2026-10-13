@@ -140,14 +140,15 @@ fn group_open_for_writing_through_any_name_is_skipped_as_in_use() {
     );
 }
 
-/// A stale copy at any name fails the publish, which leaves the group whole
-/// on the cache branch and nothing of it on the backing branch.
+/// A stale copy that a move must not replace, here because it is newer than
+/// the source, at any name fails the move, which leaves the group whole on
+/// the cache branch and nothing of it on the backing branch.
 #[test]
-fn group_with_a_stale_copy_at_a_later_name_fails_and_is_rolled_back() {
+fn group_with_a_newer_stale_copy_at_a_later_name_fails_and_stays_whole() {
     let fx = Fixture::new();
     let names = ["a/file.bin", "b/link.bin", "c/link.bin"];
     fx.cache_branch_hardlinks(&names, b"content", 1_000);
-    fx.backing_branch_file(names[1], b"stale", 500);
+    fx.backing_branch_file(names[1], b"stale", 2_000);
 
     let err = assert_exit(&fx.run(&fx.move_everything_config()), 2);
 

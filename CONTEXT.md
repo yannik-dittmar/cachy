@@ -60,7 +60,7 @@ A move unit is in use while any process has it open for writing (or open at all,
 _Avoid_: busy, locked, open (by default, a file open only for reading is not in use)
 
 **Stale copy**:
-A file on a backing branch at the same relative path as a file on the cache branch, hidden from applications by the cache branch's copy; a move replaces it.
+A file on a backing branch at the same relative path as a file on the cache branch, hidden from applications by the cache branch's copy; a move replaces it, keeps it if it is identical, or removes it if it is on a branch the move does not go to. A move never replaces or removes one that is newer than the cache branch's copy, or that is on a branch that takes no new files.
 _Avoid_: conflict, duplicate, shadow
 
 **Publish**:

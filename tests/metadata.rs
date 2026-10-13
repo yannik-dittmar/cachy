@@ -269,29 +269,36 @@ fn existing_backing_directories_keep_their_metadata() {
     assert_eq!(xattrs(&existing), xattrs_before);
 }
 
-/// A file at the destination with the source's content is adopted as the
-/// published copy only if its metadata matches too; otherwise the move would
-/// lose the source's metadata.
+/// A stale copy with the source's content is kept as the published copy
+/// only if its metadata matches too; otherwise keeping it would lose the
+/// source's metadata, so it is replaced.
 #[test]
-fn existing_backing_file_with_other_metadata_is_not_adopted() {
+fn stale_copy_with_other_metadata_is_replaced_not_kept() {
     let fx = Fixture::new();
     fx.cache_branch_file("same.bin", b"content", 1_000);
     fx.backing_branch_file("same.bin", b"content", 1_000);
     fx.cache_branch_file("other-mtime.bin", b"content", 1_000);
-    fx.backing_branch_file("other-mtime.bin", b"content", 2_000);
+    fx.backing_branch_file("other-mtime.bin", b"content", 500);
 
-    let err = assert_exit(&fx.run(&fx.move_everything_config()), 2);
+    let err = assert_exit(&fx.run(&fx.move_everything_config()), 0);
 
     assert!(
-        err.contains("move of other-mtime.bin failed"),
+        err.contains(&format!(
+            "kept identical stale copy {}",
+            fx.on_backing_branch("same.bin").display()
+        )),
         "stderr:\n{err}"
     );
-    assert!(!err.contains("move of same.bin failed"), "stderr:\n{err}");
-    assert!(!fx.on_cache_branch("same.bin").exists());
-    assert_eq!(
-        fs::read(fx.on_cache_branch("other-mtime.bin")).unwrap(),
-        b"content"
+    assert!(
+        err.contains(&format!(
+            "replaced stale copy {}",
+            fx.on_backing_branch("other-mtime.bin").display()
+        )),
+        "stderr:\n{err}"
     );
-    let kept = fs::metadata(fx.on_backing_branch("other-mtime.bin")).unwrap();
-    assert_eq!(kept.mtime(), 2_000);
+    for rel in ["same.bin", "other-mtime.bin"] {
+        assert!(!fx.on_cache_branch(rel).exists());
+        let moved = fs::metadata(fx.on_backing_branch(rel)).unwrap();
+        assert_eq!(moved.mtime(), 1_000, "{rel}");
+    }
 }

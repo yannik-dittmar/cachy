@@ -219,34 +219,6 @@ fn move_unit_with_a_stale_copy_lands_on_the_branch_that_holds_it() {
 }
 
 #[test]
-fn move_unit_with_a_stale_copy_on_a_branch_it_cannot_move_to_fails() {
-    let fx = Fixture::new();
-    let no_create = fx.extra_backing_branch();
-    common::write_file(&no_create.path().join("media/a.bin"), b"old", 1_000);
-    fx.cache_branch_file("media/a.bin", b"new", 1_000);
-    let config = fx.layout_config(&layout(&[
-        spec(fx.backing_branch.path(), ""),
-        spec(no_create.path(), "=NC"),
-    ]));
-
-    let err = assert_exit(&fx.run(&config), 2);
-
-    assert!(
-        err.contains(&format!(
-            "move of media/a.bin failed: a stale copy of media/a.bin on backing branch {}",
-            no_create.path().display()
-        )),
-        "stderr:\n{err}"
-    );
-    assert_eq!(fs::read(fx.on_cache_branch("media/a.bin")).unwrap(), b"new");
-    assert_eq!(
-        fs::read(no_create.path().join("media/a.bin")).unwrap(),
-        b"old"
-    );
-    assert!(Fixture::tree(fx.backing_branch.path()).is_empty());
-}
-
-#[test]
 fn space_of_a_move_unit_that_does_not_move_is_given_back() {
     let fx = Fixture::new();
     let Some(small) = TmpfsBranch::mount("4M") else {

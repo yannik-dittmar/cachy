@@ -241,26 +241,34 @@ fn successful_run_leaves_no_staging_directory() {
     );
 }
 
+/// A backing file at a moved relpath is a stale copy, hidden behind the
+/// cache branch's file: publish replaces it, and nothing else.
 #[test]
-fn publish_never_replaces_an_existing_backing_file() {
+fn publish_replaces_only_a_stale_copy() {
     let _lock = free_space_lock();
     let fx = Fixture::new();
     populate(&fx);
-    fx.backing_branch_file("two.bin", b"already here", 42);
+    fx.backing_branch_file("two.bin", b"stale copy", 42);
+    fx.backing_branch_file("unrelated.bin", b"backing file", 42);
     let free = fx.cache_branch_free();
     let config = fx.config(&(free + 1).to_string(), &(free + 100 * MIB).to_string());
 
-    let err = assert_exit(&fx.run(&config), 2);
+    let err = assert_exit(&fx.run(&config), 0);
 
-    assert!(err.contains("two.bin"), "stderr:\n{err}");
-    assert_eq!(fs::read(fx.on_cache_branch("two.bin")).unwrap(), content(1));
-    assert_eq!(
-        fs::read(fx.on_backing_branch("two.bin")).unwrap(),
-        b"already here"
+    assert!(
+        err.contains(&format!(
+            "replaced stale copy {}",
+            fx.on_backing_branch("two.bin").display()
+        )),
+        "stderr:\n{err}"
     );
-    for i in [0, 2, 3, 4] {
+    for i in 0..FILES.len() {
         assert_moved(&fx, i);
     }
+    assert_eq!(
+        fs::read(fx.on_backing_branch("unrelated.bin")).unwrap(),
+        b"backing file"
+    );
     fx.assert_no_staging_directories();
 }
 

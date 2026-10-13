@@ -18,7 +18,7 @@ use crate::placement::{Placement, Unplaced};
 use crate::recovery::recover;
 use crate::scan::{Entry, Kind, scan};
 use crate::transaction::{
-    Branch, Guard, MoveOutcome, Mover, RETIRING_POLL, STAGING, Skip, would_skip,
+    Branch, Fate, Guard, MoveOutcome, Moved, Mover, RETIRING_POLL, STAGING, Skip, would_skip,
 };
 
 pub struct Outcome {
@@ -198,12 +198,14 @@ pub fn run(fs: &dyn FsOps, config: &Config, options: Options) -> Result<Outcome>
 
     let movers = backing_branches
         .iter()
-        .map(|backing| {
+        .enumerate()
+        .map(|(index, backing)| {
             backing.takes_new_files().then(|| {
                 Mover::new(
                     fs,
                     &cache_branch,
-                    &backing.branch,
+                    &backing_branches,
+                    index,
                     &guard,
                     allowed_losses,
                     config.verify,
@@ -709,9 +711,17 @@ impl Tally {
         for (rels, outcome) in finished {
             let rel = names(rels);
             match outcome {
-                Ok(MoveOutcome::Moved(hash)) => {
+                Ok(MoveOutcome::Moved(Moved { hash, stale_copies })) => {
                     self.moved += 1;
                     eprintln!("cachy: moved {rel} to {} (xxh3 {hash})", branch.display());
+                    for (path, fate) in stale_copies {
+                        let done = match fate {
+                            Fate::Kept => "kept identical",
+                            Fate::Replaced => "replaced",
+                            Fate::Removed => "removed",
+                        };
+                        eprintln!("cachy: {done} stale copy {}", path.display());
+                    }
                 }
                 Ok(MoveOutcome::Skipped(reason)) => {
                     self.skipped += 1;

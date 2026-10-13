@@ -107,6 +107,15 @@ pub trait FsOps: Sync {
         to_dir: BorrowedFd,
         to: &Path,
     ) -> io::Result<()>;
+    /// Atomically swaps `from` and `to`, which must both exist; either may
+    /// be of any type.
+    fn rename_exchange(
+        &self,
+        from_dir: BorrowedFd,
+        from: &Path,
+        to_dir: BorrowedFd,
+        to: &Path,
+    ) -> io::Result<()>;
     /// Creates `to` relative to `to_dir` as a hard link to `from` relative
     /// to `from_dir`, without following a final symlink; fails if `to`
     /// exists.
@@ -246,6 +255,22 @@ impl FsOps for RealFs {
             to_dir,
             to,
             RenameFlags::NOREPLACE,
+        )?)
+    }
+
+    fn rename_exchange(
+        &self,
+        from_dir: BorrowedFd,
+        from: &Path,
+        to_dir: BorrowedFd,
+        to: &Path,
+    ) -> io::Result<()> {
+        Ok(rustix::fs::renameat_with(
+            from_dir,
+            from,
+            to_dir,
+            to,
+            RenameFlags::EXCHANGE,
         )?)
     }
 

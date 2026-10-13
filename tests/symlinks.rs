@@ -96,48 +96,6 @@ fn moved_symlink_keeps_its_owner_and_group() {
     assert_ne!(fs::metadata("/etc/hostname").unwrap().uid(), 1234);
 }
 
-#[test]
-fn symlink_is_never_published_over_an_existing_file() {
-    let fx = Fixture::new();
-    fs::create_dir_all(fx.on_cache_branch("dir")).unwrap();
-    fx.backing_branch_file("dir/file-there", b"stale copy", 1_000);
-    fs::create_dir_all(fx.on_backing_branch("dir")).unwrap();
-    symlink("elsewhere", fx.on_backing_branch("dir/other-link-there")).unwrap();
-    for rel in ["dir/file-there", "dir/other-link-there"] {
-        symlink("target", fx.on_cache_branch(rel)).unwrap();
-        set_times(&fx.on_cache_branch(rel), 1_000, 1_000);
-    }
-
-    let err = assert_exit(&fx.run(&fx.move_everything_config()), 2);
-
-    assert!(
-        err.contains("move of dir/file-there failed: publish"),
-        "stderr:\n{err}"
-    );
-    assert!(
-        err.contains("move of dir/other-link-there failed: publish"),
-        "stderr:\n{err}"
-    );
-    assert!(
-        err.contains("0 moved, 0 skipped, 2 failed"),
-        "stderr:\n{err}"
-    );
-    assert_eq!(link_text(&fx.on_cache_branch("dir/file-there")), "target");
-    assert_eq!(
-        link_text(&fx.on_cache_branch("dir/other-link-there")),
-        "target"
-    );
-    assert_eq!(
-        fs::read(fx.on_backing_branch("dir/file-there")).unwrap(),
-        b"stale copy"
-    );
-    assert_eq!(
-        link_text(&fx.on_backing_branch("dir/other-link-there")),
-        "elsewhere"
-    );
-    fx.assert_no_staging_directories();
-}
-
 /// A run interrupted between publish and retire leaves the symlink on both
 /// branches; the next move of it adopts the published one.
 #[test]

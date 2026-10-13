@@ -256,6 +256,17 @@ impl FsOps for FaultyFs {
         RealFs.rename_noreplace(from_dir, from, to_dir, to)
     }
 
+    fn rename_exchange(
+        &self,
+        from_dir: BorrowedFd,
+        from: &Path,
+        to_dir: BorrowedFd,
+        to: &Path,
+    ) -> io::Result<()> {
+        self.count_op("rename_exchange")?;
+        RealFs.rename_exchange(from_dir, from, to_dir, to)
+    }
+
     fn link(
         &self,
         from_dir: BorrowedFd,

@@ -3,8 +3,10 @@ mod exclude;
 #[cfg(feature = "fault-injection")]
 mod fault;
 mod fsops;
+mod hook;
 mod layout;
 mod lock;
+mod log;
 mod metadata;
 mod placement;
 mod probe;
@@ -13,6 +15,7 @@ mod recovery;
 mod run;
 mod scan;
 mod stop;
+mod summary;
 mod transaction;
 
 use std::path::PathBuf;
@@ -31,7 +34,7 @@ const EXIT_REFUSED: u8 = 1;
 const EXIT_MOVE_FAILED: u8 = 2;
 
 #[derive(Parser)]
-#[command(about)]
+#[command(about, version)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -118,11 +121,20 @@ fn main() -> ExitCode {
                 Ok(config)
             });
             let options = Options { dry_run, drain };
-            match config.and_then(|c| run(&fs()?, &probe_fs()?, &c, options)) {
+            let ran = config.and_then(|config| {
+                let outcome = run(&fs()?, &probe_fs()?, &config, options)?;
+                // After the run has released the instance lock, so that a
+                // slow hook never holds up the next run.
+                if let (Some(hook), Some(summary)) = (&config.run_hook, &outcome.summary) {
+                    hook::call(hook, summary);
+                }
+                Ok(outcome)
+            });
+            match ran {
                 Ok(outcome) if outcome.succeeded() => ExitCode::SUCCESS,
                 Ok(_) => ExitCode::from(EXIT_MOVE_FAILED),
                 Err(e) => {
-                    eprintln!("cachy: error: {e:#}");
+                    log::error!("{e:#}");
                     ExitCode::from(EXIT_REFUSED)
                 }
             }

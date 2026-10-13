@@ -14,6 +14,7 @@ use rustix::fs::FileType;
 use crate::config::Order;
 use crate::exclude::Exclusions;
 use crate::fsops::{FsOps, Stat};
+use crate::log;
 use crate::transaction::{Branch, STAGING, time_since};
 
 /// What the walk found: a move unit, or files that a run skips.
@@ -212,10 +213,7 @@ impl Walk<'_> {
 
     /// Warns that the walk skips `rel`.
     fn warn(&self, rel: &Path, e: io::Error) {
-        eprintln!(
-            "cachy: warning: skipping {}: {e}",
-            self.root.join(rel).display()
-        );
+        log::warning!("skipping {}: {e}", self.root.join(rel).display());
     }
 }
 

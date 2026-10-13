@@ -35,6 +35,7 @@ use anyhow::{Context, Result};
 
 use crate::fsops::{FsOps, Lease};
 use crate::layout::BackingBranch;
+use crate::log;
 use crate::metadata::AllowedLosses;
 use crate::transaction::{
     Branch, STAGING, identical, identical_symlinks, make_dirs_like, open_dirs, split,
@@ -69,8 +70,8 @@ pub fn recover(
             // cachy never writes to it, not even to recover.
             let staging = backing.branch.path.join(STAGING);
             if staging.symlink_metadata().is_ok() {
-                eprintln!(
-                    "cachy: warning: {} holds leftovers of an unfinished move, which recovery leaves alone while the branch takes no new files",
+                log::warning!(
+                    "{} holds leftovers of an unfinished move, which recovery leaves alone while the branch takes no new files",
                     staging.display()
                 );
             }
@@ -162,7 +163,7 @@ impl Recovery<'_> {
                         Leftover::TempFile => self.resolve_temp_file(dir, &rel),
                     };
                     match resolved {
-                        Ok(how) => eprintln!("cachy: recovery: {}: {how}", staged(&rel).display()),
+                        Ok(how) => log::info!("recovery: {}: {how}", staged(&rel).display()),
                         Err(e) => self.unresolved(&staged(&rel), e),
                     }
                 }
@@ -271,9 +272,6 @@ impl Recovery<'_> {
 
     fn unresolved(&mut self, path: &Path, e: anyhow::Error) {
         self.unresolved += 1;
-        eprintln!(
-            "cachy: error: cannot resolve staging leftover {}: {e:#}",
-            path.display()
-        );
+        log::error!("cannot resolve staging leftover {}: {e:#}", path.display());
     }
 }

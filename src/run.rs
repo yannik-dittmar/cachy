@@ -15,15 +15,17 @@ use crate::exclude::Exclusions;
 use crate::fsops::{FsOps, FsStat, Lease};
 use crate::layout::{self, BackingBranch};
 use crate::lock::InstanceLock;
+use crate::log;
 use crate::metadata::AllowedLosses;
 use crate::placement::{Placement, Unplaced};
 use crate::probe::probe;
 use crate::recovery::recover;
 use crate::scan::{Entry, Kind, scan};
 use crate::stop;
+use crate::summary::{FailedUnit, MovedUnit, Reason, SkippedUnit, StaleCopy, Summary};
 use crate::transaction::{
-    Branch, Copying, Fate, Guard, InUseGuard, MoveOutcome, Moved, Mover, RETIRING_POLL, STAGING,
-    Skip, open_dirs, split, would_skip,
+    Branch, Copying, Fate, Finished, Guard, InUseGuard, MoveOutcome, Moved, Mover, RETIRING_POLL,
+    STAGING, Skip, open_dirs, split, would_skip,
 };
 
 pub struct Outcome {
@@ -39,12 +41,37 @@ pub struct Outcome {
     pub stopped: bool,
     /// The in-use guard that the run's moves used.
     pub open_file_guard: OpenFileGuard,
+    /// The summary of the run, for the run hook; `None` for a dry run, and
+    /// when the check found no work and nothing failed.
+    pub summary: Option<Summary>,
 }
 
 impl Outcome {
     /// Every attempted move succeeded and the run was not cut short.
     pub fn succeeded(&self) -> bool {
         self.failed == 0 && self.unresolved == 0 && self.undated_dirs == 0 && !self.stopped
+    }
+
+    /// Completes `summary` with this outcome and keeps it, unless it is of a
+    /// dry run, or of an invocation that did not run (`ran`) and failed in
+    /// nothing. The run started at `started`, and moved for `moving`.
+    fn summarise(
+        mut self,
+        mut summary: Summary,
+        options: Options,
+        ran: bool,
+        started: Instant,
+        moving: Duration,
+    ) -> Outcome {
+        if options.dry_run || !(ran || !self.succeeded()) {
+            return self;
+        }
+        summary.stopped = self.stopped;
+        summary.unresolved_leftovers = self.unresolved;
+        summary.undated_dirs = self.undated_dirs;
+        summary.finish(self.succeeded(), started.elapsed(), moving);
+        self.summary = Some(summary);
+        self
     }
 }
 
@@ -92,8 +119,15 @@ pub fn run(
     config: &Config,
     options: Options,
 ) -> Result<Outcome> {
+    let started = Instant::now();
     let cache_branch = Branch::open(&config.cache_branch)
         .with_context(|| format!("cannot open cache branch {}", config.cache_branch.display()))?;
+    let reason = if options.drain {
+        Reason::Drain
+    } else {
+        Reason::Manual
+    };
+    let mut summary = Summary::new(reason, &cache_branch.path);
     // Before anything writes: another run's moves would look like leftovers
     // to recovery.
     let _lock = InstanceLock::acquire(&config.state_dir, &cache_branch.path)?;
@@ -149,34 +183,39 @@ pub fn run(
         undated_dirs: 0,
         stopped: false,
         open_file_guard: config.open_file_guard,
+        summary: None,
+    };
+    let unran = |outcome: Outcome, summary| {
+        outcome.summarise(summary, options, false, started, Duration::ZERO)
     };
     if stopping(&mut outcome) {
-        return Ok(outcome);
+        return Ok(unran(outcome, summary));
     }
     let free_before = match free_before {
         Ok(stat) => stat.free,
         Err(e) => {
-            eprintln!("cachy: error: run stopped: {e:#}");
+            log::error!("run stopped: {e:#}");
             outcome.stopped = true;
-            return Ok(outcome);
+            return Ok(unran(outcome, summary));
         }
     };
+    summary.free_before = Some(free_before);
     let below_threshold = free_before < threshold;
     if !options.drain && !below_threshold && config.max_age.is_none() {
         no_work(free_before, threshold, options);
-        return Ok(outcome);
+        return Ok(unran(outcome, summary));
     }
 
     let order = match config.order {
         None | Some(Order::Atime) if cache_fs.noatime => {
-            eprintln!(
-                "cachy: warning: the cache branch is mounted noatime, so move units are ordered by mtime instead of atime"
+            log::warning!(
+                "the cache branch is mounted noatime, so move units are ordered by mtime instead of atime"
             );
             Order::Mtime
         }
         None if capabilities.cache_branch_on_zfs => {
-            eprintln!(
-                "cachy: warning: the cache branch is on ZFS, where atime=off does not always show as a mount option, so the atimes that move units are ordered by may never change; set `order` to atime or mtime"
+            log::warning!(
+                "the cache branch is on ZFS, where atime=off does not always show as a mount option, so the atimes that move units are ordered by may never change; set `order` to atime or mtime"
             );
             Order::Atime
         }
@@ -185,16 +224,16 @@ pub fn run(
     let entries = match scan(fs, &cache_branch, &config.exclude, order) {
         Ok(entries) => entries,
         Err(e) => {
-            eprintln!(
-                "cachy: error: run stopped: cannot scan cache branch {}: {e}",
+            log::error!(
+                "run stopped: cannot scan cache branch {}: {e}",
                 cache_branch.path.display()
             );
             outcome.stopped = true;
-            return Ok(outcome);
+            return Ok(unran(outcome, summary));
         }
     };
     if stopping(&mut outcome) {
-        return Ok(outcome);
+        return Ok(unran(outcome, summary));
     }
     // Move units past the max age first, each part still in order.
     let (mut entries, rest): (Vec<_>, Vec<_>) = entries.into_iter().partition(|entry| {
@@ -205,26 +244,27 @@ pub fn run(
     let past_max_age = entries.len();
     entries.extend(rest);
     if let Some(max_age) = config.max_age {
-        eprintln!("cachy: move units past the max age of {max_age:?}: {past_max_age}");
+        log::info!("move units past the max age of {max_age:?}: {past_max_age}");
     }
 
     let budget = if options.drain {
-        eprintln!("cachy: draining: moving every eligible move unit");
+        log::info!("draining: moving every eligible move unit");
         None
     } else if below_threshold {
-        eprintln!(
-            "cachy: free space {free_before} bytes is below the threshold {threshold} bytes; moving until {target} bytes are free"
+        log::info!(
+            "free space {free_before} bytes is below the threshold {threshold} bytes; moving until {target} bytes are free"
         );
         Some(target - free_before)
     } else if past_max_age > 0 {
-        eprintln!(
-            "cachy: free space {free_before} bytes is at or above the threshold {threshold} bytes; moving the move units past the max age"
+        log::info!(
+            "free space {free_before} bytes is at or above the threshold {threshold} bytes; moving the move units past the max age"
         );
         Some(0)
     } else {
         no_work(free_before, threshold, options);
-        return Ok(outcome);
+        return Ok(unran(outcome, summary));
     };
+    summary.byte_budget = budget;
 
     let stop = Stop {
         past_max_age,
@@ -262,10 +302,12 @@ pub fn run(
         })
         .collect();
     let mut tally = Tally::default();
+    let moving = Instant::now();
     let (moved_bytes, undated) = move_units(movers, &entries, stop, &mut placement, &mut tally);
+    let moving = moving.elapsed();
     for (path, e) in &undated {
-        eprintln!(
-            "cachy: error: cannot set the times of created directory {}: {e:#}",
+        log::error!(
+            "cannot set the times of created directory {}: {e:#}",
             path.display()
         );
     }
@@ -285,7 +327,7 @@ pub fn run(
     }
     match stat_fs(fs, &cache_branch) {
         // A stop leaves the target missed; the frees are not worth waiting for.
-        Ok(_) if stopped => {}
+        Ok(stat) if stopped => summary.free_after = Some(stat.free),
         Ok(stat) => {
             let freed = |free: u64| free.saturating_sub(free_before);
             let target_missed = |free: u64| below_threshold && !options.drain && free < target;
@@ -295,32 +337,32 @@ pub fn run(
             let free = wait_for_frees(&cache_branch, stat.free, |free| {
                 (target_missed(free) && freed(free) < moved_bytes) || frees_missing(free)
             });
+            summary.free_after = Some(free);
             if target_missed(free) {
-                eprintln!(
-                    "cachy: warning: target not reached: {free} bytes free, target {target} bytes"
-                );
+                log::warning!("target not reached: {free} bytes free, target {target} bytes");
             }
             if frees_missing(free) {
-                eprintln!(
-                    "cachy: warning: free space grew by only {} bytes, but the moves took up {moved_bytes} bytes on it; snapshots of the cache branch may be holding the space",
+                log::warning!(
+                    "free space grew by only {} bytes, but the moves took up {moved_bytes} bytes on it; snapshots of the cache branch may be holding the space",
                     freed(free)
                 );
             }
         }
-        Err(e) => eprintln!("cachy: warning: {e:#}"),
+        Err(e) => log::warning!("{e:#}"),
     }
-    let Tally {
-        moved,
-        skipped,
-        failed,
-        ..
-    } = tally;
-    eprintln!(
-        "cachy: run finished: {moved} moved, {skipped} skipped, {failed} failed; in-use guard: {}",
+    log::info!(
+        "run finished: {} moved, {} skipped, {} failed; in-use guard: {}",
+        tally.moved.len(),
+        tally.skipped.len(),
+        tally.failed.len(),
         outcome.open_file_guard
     );
-    outcome.failed = failed;
-    Ok(outcome)
+    outcome.failed = tally.failed.len();
+    summary.moved = tally.moved;
+    summary.skipped = tally.skipped;
+    summary.failed = tally.failed;
+    summary.stale_copies = tally.stale_copies;
+    Ok(outcome.summarise(summary, options, true, started, moving))
 }
 
 /// How moves tell that a move unit is in use, as the configuration sets it.
@@ -335,8 +377,8 @@ fn in_use(config: &Config) -> InUseGuard {
         OpenFileGuard::Lease => InUseGuard::Lease(Lease::Write),
         OpenFileGuard::Proc => InUseGuard::Proc { writers_only },
         OpenFileGuard::Off => {
-            eprintln!(
-                "cachy: warning: open_file_guard is off: NOTHING GUARDS FILES IN USE; files are moved while applications have them open, and a write to one during its move can be lost"
+            log::warning!(
+                "open_file_guard is off: NOTHING GUARDS FILES IN USE; files are moved while applications have them open, and a write to one during its move can be lost"
             );
             InUseGuard::Off
         }
@@ -360,10 +402,8 @@ enum Report<'a> {
         allocated: u64,
         /// [`Mover::retiring`].
         retiring: bool,
-        finished: Vec<(&'a [PathBuf], Result<MoveOutcome>)>,
-        /// The sizes (`st_size`) of the finished move units that did not
-        /// move.
-        unmoved: u64,
+        /// Each finished move, with the size (`st_size`) of its move unit.
+        finished: Vec<(Finished<'a>, u64)>,
     },
     /// The worker for the backing branch `index` has stopped: once its queue
     /// has ended, or by panicking.
@@ -517,7 +557,6 @@ impl<'a> Dispatcher<'_, 'a, '_> {
                 allocated,
                 retiring,
                 finished,
-                unmoved,
             } => {
                 let worker = self.workers[index].as_mut().expect("a worker reports");
                 if started {
@@ -525,6 +564,12 @@ impl<'a> Dispatcher<'_, 'a, '_> {
                 }
                 worker.allocated = allocated;
                 worker.retiring = retiring;
+                // Move units that did not move give their space back.
+                let unmoved = finished
+                    .iter()
+                    .filter(|(finished, _)| !matches!(finished.outcome, Ok(MoveOutcome::Moved(_))))
+                    .map(|(_, size)| size)
+                    .sum();
                 self.tally.record(&worker.path, finished);
                 self.placement.release(index, unmoved);
             }
@@ -646,26 +691,22 @@ impl<'a> Reporter<'a> {
             return;
         }
         self.last = state;
-        let unmoved = finished
-            .iter()
-            .map(|(rels, outcome)| {
+        let finished = finished
+            .into_iter()
+            .map(|finished| {
                 let size = self
                     .sizes
-                    .remove(&rels.as_ptr())
+                    .remove(&finished.rels.as_ptr())
                     .expect("a finished move unit has started");
-                match outcome {
-                    Ok(MoveOutcome::Moved(_)) => 0,
-                    _ => size,
-                }
+                (finished, size)
             })
-            .sum();
+            .collect();
         let _ = self.reports.send(Report::State {
             index: self.index,
             started,
             allocated: state.0,
             retiring: state.1,
             finished,
-            unmoved,
         });
     }
 }
@@ -724,8 +765,8 @@ fn remove_emptied_dirs(
                     break;
                 }
                 Err(e) => {
-                    eprintln!(
-                        "cachy: warning: cannot remove emptied directory {}: {e}",
+                    log::warning!(
+                        "cannot remove emptied directory {}: {e}",
                         cache_branch.path.join(dir).display()
                     );
                     break;
@@ -738,7 +779,7 @@ fn remove_emptied_dirs(
 /// Whether a stop was requested, as the run notes in `outcome`.
 fn stopping(outcome: &mut Outcome) -> bool {
     if stop::requested() && !outcome.stopped {
-        eprintln!("cachy: warning: run stopped early: cachy was asked to stop");
+        log::warning!("run stopped early: cachy was asked to stop");
         outcome.stopped = true;
     }
     outcome.stopped
@@ -746,8 +787,8 @@ fn stopping(outcome: &mut Outcome) -> bool {
 
 /// Notes that a check found no work.
 fn no_work(free: u64, threshold: u64, options: Options) {
-    eprintln!(
-        "cachy: free space {free} bytes is at or above the threshold {threshold} bytes; nothing to do"
+    log::info!(
+        "free space {free} bytes is at or above the threshold {threshold} bytes; nothing to do"
     );
     if options.dry_run {
         println!("byte budget: none (free space is at or above the threshold)");
@@ -814,13 +855,13 @@ fn dry_run(
                 skips += 1;
             }
             Err(e) => {
-                eprintln!("cachy: error: {rel}: {e:#}");
+                log::error!("{rel}: {e:#}");
                 failed += 1;
             }
         }
     }
-    eprintln!(
-        "cachy: dry run finished: {moves} would move ({planned} bytes), {skips} would skip, {failed} failed; in-use guard: {open_file_guard}"
+    log::info!(
+        "dry run finished: {moves} would move ({planned} bytes), {skips} would skip, {failed} failed; in-use guard: {open_file_guard}"
     );
     failed
 }
@@ -832,20 +873,22 @@ fn warn_of_leftovers(cache_branch: &Branch, backing_branches: &[BackingBranch]) 
     for branch in std::iter::once(cache_branch).chain(backing) {
         let staging = branch.path.join(STAGING);
         if staging.symlink_metadata().is_ok() {
-            eprintln!(
-                "cachy: warning: {} holds leftovers of an unfinished move, which the next run will recover",
+            log::warning!(
+                "{} holds leftovers of an unfinished move, which the next run will recover",
                 staging.display()
             );
         }
     }
 }
 
-/// Counts finished moves by outcome, logging skips and failures.
+/// Records finished moves by outcome for the run summary, logging each.
 #[derive(Default)]
 struct Tally {
-    moved: usize,
-    skipped: usize,
-    failed: usize,
+    moved: Vec<MovedUnit>,
+    skipped: Vec<SkippedUnit>,
+    failed: Vec<FailedUnit>,
+    /// The stale copies that moves dealt with.
+    stale_copies: Vec<StaleCopy>,
     /// The cache-branch directories, by relpath, that moved move units left,
     /// which may now be empty. The cache branch root is not among them.
     left_dirs: Vec<PathBuf>,
@@ -853,50 +896,49 @@ struct Tally {
 
 impl Tally {
     /// Records the outcomes of moves to the backing branch at `branch`.
-    fn record(&mut self, branch: &Path, finished: Vec<(&[PathBuf], Result<MoveOutcome>)>) {
-        for (rels, outcome) in finished {
-            let rel = names(rels);
-            match outcome {
-                Ok(MoveOutcome::Moved(Moved { hash, stale_copies })) => {
-                    self.moved += 1;
+    fn record(&mut self, branch: &Path, finished: Vec<(Finished, u64)>) {
+        for (finished, size) in finished {
+            let rels = finished.rels;
+            match finished.outcome {
+                Ok(MoveOutcome::Moved(Moved { hash })) => {
+                    self.moved.push(MovedUnit::new(rels, branch, size));
                     self.left_dirs.extend(
                         rels.iter()
                             .filter_map(|rel| rel.parent())
                             .filter(|dir| !dir.as_os_str().is_empty())
                             .map(Path::to_owned),
                     );
-                    eprintln!("cachy: moved {rel} to {} (xxh3 {hash})", branch.display());
-                    for (path, fate) in stale_copies {
-                        let done = match fate {
-                            Fate::Kept => "kept identical",
-                            Fate::Replaced => "replaced",
-                            Fate::Removed => "removed",
-                        };
-                        eprintln!("cachy: {done} stale copy {}", path.display());
-                    }
+                    log::info!(
+                        "moved {} to {} (xxh3 {hash})",
+                        names(rels),
+                        branch.display()
+                    );
                 }
-                Ok(MoveOutcome::Skipped(reason)) => {
-                    self.skipped += 1;
-                    eprintln!("cachy: skipped {rel}: {reason}");
-                }
-                Err(e) => {
-                    self.failed += 1;
-                    eprintln!("cachy: error: move of {rel} failed: {e:#}");
-                }
+                Ok(MoveOutcome::Skipped(reason)) => self.skip(rels, reason),
+                Err(e) => self.fail(rels, &format!("{e:#}")),
+            }
+            for (path, fate) in finished.stale_copies {
+                let done = match fate {
+                    Fate::Kept => "kept identical",
+                    Fate::Replaced => "replaced",
+                    Fate::Removed => "removed",
+                };
+                log::info!("{done} stale copy {}", path.display());
+                self.stale_copies.push(StaleCopy::new(&path, fate));
             }
         }
     }
 
-    /// Records a move unit whose move failed before it started.
+    /// Records a move unit whose move failed.
     fn fail(&mut self, rels: &[PathBuf], e: &dyn std::fmt::Display) {
-        self.failed += 1;
-        eprintln!("cachy: error: move of {} failed: {e}", names(rels));
+        log::error!("move of {} failed: {e}", names(rels));
+        self.failed.push(FailedUnit::new(rels, e.to_string()));
     }
 
-    /// Records a move unit that was skipped without a move.
+    /// Records a move unit that was skipped.
     fn skip(&mut self, rels: &[PathBuf], reason: Skip) {
-        self.skipped += 1;
-        eprintln!("cachy: skipped {}: {reason}", names(rels));
+        log::info!("skipped {}: {reason}", names(rels));
+        self.skipped.push(SkippedUnit::new(rels, reason));
     }
 }
 

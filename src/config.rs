@@ -8,6 +8,7 @@ use serde::Deserialize;
 
 use crate::exclude::Exclusions;
 use crate::layout::BranchSpec;
+use crate::summary::RunOutcome;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -57,6 +58,25 @@ pub struct Config {
     /// remove them.
     #[serde(default)]
     pub keep_empty_dirs: bool,
+    /// A command that cachy executes after each run, handing it the run
+    /// summary.
+    #[serde(default)]
+    pub run_hook: Option<RunHook>,
+}
+
+/// The run hook: a shell command that receives the run summary on stdin.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunHook {
+    /// Executed by `/bin/sh -c`.
+    pub command: String,
+    /// The outcomes of the runs after which the hook is executed; every
+    /// outcome if unset.
+    #[serde(default = "every_outcome")]
+    pub on: Vec<RunOutcome>,
+    /// How long the hook may take before it is killed.
+    #[serde(default = "default_hook_timeout", deserialize_with = "duration")]
+    pub timeout: Duration,
 }
 
 /// An amount of free space on the cache branch: a byte size, or a percentage
@@ -222,6 +242,18 @@ fn default_state_dir() -> PathBuf {
     PathBuf::from("/var/lib/cachy")
 }
 
+fn every_outcome() -> Vec<RunOutcome> {
+    vec![
+        RunOutcome::Moved,
+        RunOutcome::NothingMoved,
+        RunOutcome::Failed,
+    ]
+}
+
+fn default_hook_timeout() -> Duration {
+    Duration::from_secs(60)
+}
+
 fn default_minimum_age() -> Duration {
     Duration::from_secs(15 * 60)
 }
@@ -254,6 +286,11 @@ impl Config {
             );
         }
         config.check_max_age()?;
+        if let Some(hook) = &config.run_hook
+            && hook.timeout.is_zero()
+        {
+            bail!("run_hook: timeout must be above 0s");
+        }
         Ok(config)
     }
 

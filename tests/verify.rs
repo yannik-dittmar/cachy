@@ -74,12 +74,9 @@ mod fault_injection {
         let fx = one_file();
         let out = common::output(fx.command(&config(&fx)).env("CACHY_FAULT_TRACE", "1")).unwrap();
         let err = assert_exit(&out, 0);
-        err.lines()
-            .find_map(|line| {
-                let op = line.strip_prefix("cachy: trace: operation ")?;
-                let (n, name) = op.split_once(' ')?;
-                (name == "(write_at)").then(|| n.parse().unwrap())
-            })
+        common::traced_operations(&err)
+            .into_iter()
+            .find_map(|(n, name)| (name == "(write_at)").then_some(n))
             .unwrap_or_else(|| panic!("no write traced; stderr:\n{err}"))
     }
 

@@ -16,14 +16,14 @@ const MAX_AGE: &str = "max_age: 1s\n";
 const MIB: usize = 1 << 20;
 
 /// Waits until files written before the call are past [`MAX_AGE`].
-fn let_age() {
+fn wait_past_max_age() {
     thread::sleep(Duration::from_millis(1_500));
 }
 
 /// `overdue.bin`, past the max age, then `fresh.bin`, which is not.
 fn overdue_and_fresh(fx: &Fixture) {
     fx.cache_branch_file("overdue.bin", b"overdue", 1_000);
-    let_age();
+    wait_past_max_age();
     fx.cache_branch_file("fresh.bin", b"fresh", 1_000);
 }
 
@@ -94,8 +94,8 @@ fn move_units_past_the_max_age_are_moved_first_and_all_of_them_beyond_the_byte_b
         fx.cache_branch_file(rel, content(rel).as_bytes(), 1_000);
         set_times(&fx.on_cache_branch(rel), 9_000, 1_000);
     }
-    let_age();
-    fx.cache_branch_file("young.bin", b"young", 1_000);
+    wait_past_max_age();
+    fx.cache_branch_file("fresh.bin", b"fresh", 1_000);
     let free = fx.cache_branch_free();
     // A byte budget that the first move consumes.
     let config = fx.config(&(free + 1).to_string(), &(free + 2).to_string()) + MAX_AGE;
@@ -118,7 +118,7 @@ fn move_units_past_the_max_age_are_moved_first_and_all_of_them_beyond_the_byte_b
             content(rel).as_bytes()
         );
     }
-    assert_eq!(fs::read(fx.on_cache_branch("young.bin")).unwrap(), b"young");
+    assert_eq!(fs::read(fx.on_cache_branch("fresh.bin")).unwrap(), b"fresh");
 }
 
 #[test]
@@ -203,12 +203,13 @@ fn invalid_command_line_max_age_is_refused() {
 mod walk {
     use super::*;
 
+    /// The names of the operations that a run with `config` traces.
     fn traced_operations(fx: &Fixture, config: &str) -> Vec<String> {
         let out = output(fx.command(config).env("CACHY_FAULT_TRACE", "1")).unwrap();
         let err = assert_exit(&out, 0);
-        err.lines()
-            .filter_map(|line| line.strip_prefix("cachy: trace: operation "))
-            .map(|op| op.split_once(' ').unwrap().1.to_owned())
+        common::traced_operations(&err)
+            .into_iter()
+            .map(|(_, name)| name.to_owned())
             .collect()
     }
 

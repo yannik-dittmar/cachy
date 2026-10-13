@@ -35,7 +35,7 @@ pub struct Entry {
 impl Entry {
     /// Whether it is a move unit that has not changed for longer than
     /// `max_age`.
-    pub fn is_past(&self, max_age: Duration) -> bool {
+    pub fn is_past_max_age(&self, max_age: Duration) -> bool {
         matches!(self.kind, Kind::Regular | Kind::Symlink)
             && time_since(self.changed).is_some_and(|age| age > max_age)
     }
@@ -195,6 +195,7 @@ impl Walk<'_> {
         }
     }
 
+    /// Walks the subdirectory `name` of `dir`, at `rel`.
     fn subdir(&self, dir: BorrowedFd, name: &OsStr, rel: &Path, found: &mut Vec<Found>) {
         match self.fs.open_dir(dir, Path::new(name)) {
             Ok(subdir) => self.dir(subdir.as_fd(), rel, found),
@@ -202,6 +203,7 @@ impl Walk<'_> {
         }
     }
 
+    /// Warns that the walk skips `rel`.
     fn warn(&self, rel: &Path, e: io::Error) {
         eprintln!(
             "cachy: warning: skipping {}: {e}",
@@ -211,6 +213,7 @@ impl Walk<'_> {
 }
 
 impl Found {
+    /// A file at `rel` with the given `stat`, not following symlinks.
     fn new(rel: PathBuf, kind: Kind, stat: &Stat) -> Found {
         let mtime = (stat.st_mtime, stat.st_mtime_nsec);
         let ctime = (stat.st_ctime, stat.st_ctime_nsec);

@@ -65,8 +65,8 @@ fn freed_wait() -> Duration {
 /// Recovers from unfinished moves, then performs a check and, if free space
 /// is below the threshold or move units are past the max age, a run. The run
 /// moves the move units past the max age first, and stops once they are moved
-/// and its byte budget is consumed. A drain skips the check and has no byte budget; a dry run only
-/// prints what a run would do. An error means cachy refused to run; once
+/// and its byte budget is consumed. A drain skips the check and has no byte
+/// budget; a dry run only prints what a run would do. An error means cachy refused to run; once
 /// recovery has started, errors are reported in the outcome instead.
 pub fn run(fs: &dyn FsOps, config: &Config, options: Options) -> Result<Outcome> {
     let cache_branch = Branch::open(&config.cache_branch)
@@ -154,9 +154,11 @@ pub fn run(fs: &dyn FsOps, config: &Config, options: Options) -> Result<Outcome>
         }
     };
     // Move units past the max age first, each part still in order.
-    let (mut entries, rest): (Vec<_>, Vec<_>) = entries
-        .into_iter()
-        .partition(|entry| config.max_age.is_some_and(|max_age| entry.is_past(max_age)));
+    let (mut entries, rest): (Vec<_>, Vec<_>) = entries.into_iter().partition(|entry| {
+        config
+            .max_age
+            .is_some_and(|max_age| entry.is_past_max_age(max_age))
+    });
     let past_max_age = entries.len();
     entries.extend(rest);
     if let Some(max_age) = config.max_age {
@@ -181,8 +183,12 @@ pub fn run(fs: &dyn FsOps, config: &Config, options: Options) -> Result<Outcome>
         return Ok(outcome);
     };
 
+    let stop = Stop {
+        past_max_age,
+        budget,
+    };
     if options.dry_run {
-        outcome.failed = dry_run(fs, &cache_branch, &guard, &entries, past_max_age, budget);
+        outcome.failed = dry_run(fs, &cache_branch, &guard, &entries, stop);
         return Ok(outcome);
     }
 
@@ -195,14 +201,13 @@ pub fn run(fs: &dyn FsOps, config: &Config, options: Options) -> Result<Outcome>
         allowed_losses,
         config.verify,
     );
-    let consumed = |mover: &Mover| budget.is_some_and(|budget| mover.allocated_bytes() >= budget);
     for (i, entry) in entries.iter().enumerate() {
         tally.record(mover.finished());
-        if i >= past_max_age && consumed(&mover) {
+        if stop.before(i, mover.allocated_bytes()) {
             // A retiring move that is rolled back hands its bytes back.
             mover.finish();
             tally.record(mover.finished());
-            if consumed(&mover) {
+            if stop.before(i, mover.allocated_bytes()) {
                 break;
             }
         }
@@ -277,25 +282,39 @@ fn no_work(free: u64, threshold: u64, options: Options) {
     }
 }
 
+/// When a run stops: once it has moved the move units past the max age, which
+/// come first, and its byte budget, if it has one, is consumed.
+#[derive(Clone, Copy)]
+struct Stop {
+    /// How many entries, from the first, are past the max age.
+    past_max_age: usize,
+    budget: Option<u64>,
+}
+
+impl Stop {
+    /// Whether the run stops before entry `i`, having moved `bytes`.
+    fn before(self, i: usize, bytes: u64) -> bool {
+        i >= self.past_max_age && self.budget.is_some_and(|budget| bytes >= budget)
+    }
+}
+
 /// Prints the byte budget, then the move units that a run would move, in
-/// order, and every skip with its reason, until the byte budget is consumed
-/// and the first `past_max_age` entries are done. Returns the number of move
-/// units that could not be checked.
+/// order, and every skip with its reason, until the run would stop. Returns
+/// the number of move units that could not be checked.
 fn dry_run(
     fs: &dyn FsOps,
     cache_branch: &Branch,
     guard: &Guard,
     entries: &[Entry],
-    past_max_age: usize,
-    budget: Option<u64>,
+    stop: Stop,
 ) -> usize {
-    match budget {
+    match stop.budget {
         Some(budget) => println!("byte budget: {budget} bytes"),
         None => println!("byte budget: unlimited (drain)"),
     }
     let (mut planned, mut moves, mut skips, mut failed) = (0, 0, 0, 0);
     for (i, entry) in entries.iter().enumerate() {
-        if i >= past_max_age && budget.is_some_and(|budget| planned >= budget) {
+        if stop.before(i, planned) {
             break;
         }
         let rel = names(&entry.rels);

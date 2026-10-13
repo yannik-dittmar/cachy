@@ -43,6 +43,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
+use serde::Serialize;
 use xxhash_rust::xxh3::{Xxh3, xxh3_128};
 
 use crate::config::Verify;
@@ -139,12 +140,23 @@ pub enum MoveOutcome {
 pub struct Moved {
     /// The hash of the move unit's content.
     pub hash: Hash,
+}
+
+/// A move that has finished, whatever its outcome.
+pub struct Finished<'a> {
+    /// The move unit's names.
+    pub rels: &'a [PathBuf],
+    pub outcome: Result<MoveOutcome>,
     /// The stale copies of the move unit that the move dealt with, by path.
+    /// A move that was skipped or failed after replacing or removing stale
+    /// copies cannot bring them back, so it lists those too.
     pub stale_copies: Vec<(PathBuf, Fate)>,
 }
 
-/// What a move did with a stale copy of its move unit.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// What a move did with a stale copy of its move unit. Serialized as the run
+/// summary's code for it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Fate {
     /// It was identical to the source, so it became the published copy.
     Kept,
@@ -165,8 +177,9 @@ impl fmt::Display for Hash {
     }
 }
 
-/// Why a move unit was skipped.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Why a move unit was skipped. Serialized as the run summary's reason code.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Skip {
     /// The in-use guard found another process with it open so that it is in
     /// use, before or during the move.
@@ -271,7 +284,7 @@ pub struct Mover<'a> {
     /// Directories that moves created on the backing branch, by relpath.
     created_dirs: Vec<PathBuf>,
     retiring: VecDeque<Retiring<'a>>,
-    finished: Vec<(&'a [PathBuf], Result<MoveOutcome>)>,
+    finished: Vec<Finished<'a>>,
     /// Space on the cache branch that moved move units took up.
     moved_bytes: u64,
 }
@@ -284,6 +297,8 @@ struct Retiring<'a> {
     retired_parents: Vec<OwnedFd>,
     published: Published<'a>,
     moved: Moved,
+    /// The stale copies that the move dealt with.
+    stale_copies: Vec<(PathBuf, Fate)>,
     retired_at: Instant,
 }
 
@@ -329,6 +344,7 @@ impl<'a> Mover<'a> {
     /// where it was and no copy behind.
     pub fn start(&mut self, rels: &'a [PathBuf], kind: Kind) {
         self.service();
+        let mut stale_copies = Vec::new();
         let finished = match kind {
             _ if stop::requested() => Some(Err(Abort::Skip(Skip::Stopping))),
             Kind::Regular => {
@@ -337,15 +353,34 @@ impl<'a> Mover<'a> {
                     self.service();
                 }
                 // A move that reaches its retire finishes once serviced.
-                self.transact(rels).err().map(Err)
+                self.transact(rels, &mut stale_copies).err().map(Err)
             }
-            Kind::Symlink => Some(self.transact_symlink(rels)),
+            Kind::Symlink => Some(self.transact_symlink(rels, &mut stale_copies)),
             Kind::Special => Some(Err(Abort::Skip(Skip::SpecialFile))),
             Kind::PartlyExcluded => Some(Err(Abort::Skip(Skip::PartlyExcluded))),
         };
         if let Some(result) = finished {
-            self.finished.push((rels, outcome(result)));
+            self.report(rels, result, stale_copies);
         }
+    }
+
+    /// Reports the move of `rels`, which ended with `result` having dealt
+    /// with `stale_copies`.
+    fn report(
+        &mut self,
+        rels: &'a [PathBuf],
+        result: Result<Moved, Abort>,
+        mut stale_copies: Vec<(PathBuf, Fate)>,
+    ) {
+        if result.is_err() {
+            // A move that does not finish leaves a kept stale copy in place.
+            stale_copies.retain(|&(_, fate)| fate != Fate::Kept);
+        }
+        self.finished.push(Finished {
+            rels,
+            outcome: outcome(result),
+            stale_copies,
+        });
     }
 
     /// Space on the cache branch (`st_blocks`) that the moves so far free:
@@ -398,7 +433,7 @@ impl<'a> Mover<'a> {
     }
 
     /// The outcomes of the moves that finished since the last call.
-    pub fn finished(&mut self) -> Vec<(&'a [PathBuf], Result<MoveOutcome>)> {
+    pub fn finished(&mut self) -> Vec<Finished<'a>> {
         std::mem::take(&mut self.finished)
     }
 
@@ -408,41 +443,43 @@ impl<'a> Mover<'a> {
     /// to it was added or its content written meanwhile, which would keep it
     /// on the cache branch. Never waits.
     pub fn service(&mut self) {
-        for retiring in std::mem::take(&mut self.retiring) {
-            let rels = retiring.source.rels;
-            let finished = match retiring.source.check_lease() {
-                Err(abort) => Some(retiring.roll_back(self.fs).and_then(|()| Err(abort))),
-                Ok(()) if retiring.retired_at.elapsed() >= retire_wait() => {
-                    let source = &retiring.source;
-                    match source
-                        .check_in_use()
-                        .and_then(|()| source.check_unchanged())
-                    {
-                        Ok(()) => {
-                            let allocated = retiring.source.allocated;
-                            let unlinked = retiring.unlink(self.fs);
-                            if unlinked.is_ok() {
-                                self.moved_bytes += allocated;
-                            }
-                            Some(unlinked)
-                        }
-                        Err(abort) => Some(retiring.roll_back(self.fs).and_then(|()| Err(abort))),
-                    }
-                }
+        for mut retiring in std::mem::take(&mut self.retiring) {
+            let source = &retiring.source;
+            let checked = match source.check_lease() {
+                Err(abort) => Err(abort),
+                Ok(()) if retiring.retired_at.elapsed() >= retire_wait() => source
+                    .check_in_use()
+                    .and_then(|()| source.check_unchanged()),
                 Ok(()) => {
                     self.retiring.push_back(retiring);
-                    None
+                    continue;
                 }
             };
-            if let Some(result) = finished {
-                self.finished.push((rels, outcome(result)));
-            }
+            let rels = source.rels;
+            let allocated = source.allocated;
+            let stale_copies = std::mem::take(&mut retiring.stale_copies);
+            let result = match checked {
+                Ok(()) => {
+                    let unlinked = retiring.unlink(self.fs);
+                    if unlinked.is_ok() {
+                        self.moved_bytes += allocated;
+                    }
+                    unlinked
+                }
+                Err(abort) => retiring.roll_back(self.fs).and_then(|()| Err(abort)),
+            };
+            self.report(rels, result, stale_copies);
         }
     }
 
     /// Runs a move of the regular file or hardlink group `rels` up to its
     /// retire, after which it waits in the queue of retiring moves.
-    fn transact(&mut self, rels: &'a [PathBuf]) -> Result<(), Abort> {
+    /// Adds the stale copies that it deals with to `stale_copies`.
+    fn transact(
+        &mut self,
+        rels: &'a [PathBuf],
+        stale_copies: &mut Vec<(PathBuf, Fate)>,
+    ) -> Result<(), Abort> {
         let fs = self.fs;
         let source = Source::open(fs, self.cache_branch, rels, self.guard)?;
         let stale = self.find_stale_copies(rels, &source.stat)?;
@@ -455,7 +492,6 @@ impl<'a> Mover<'a> {
             Some((hash, copy)) => (self.keep(&source, copy)?, hash),
             None => self.copy_and_publish(&source, first)?,
         };
-        let mut stale_copies = Vec::new();
         if let Some(copy) = first {
             let fate = if kept.is_some() {
                 Fate::Kept
@@ -476,9 +512,9 @@ impl<'a> Mover<'a> {
                 }
             }
         }
-        remove_stale_copies(fs, &stale.elsewhere, &published, &mut stale_copies)?;
-        let moved = Moved { hash, stale_copies };
-        let retiring = retire(fs, source, published, moved)?;
+        remove_stale_copies(fs, &stale.elsewhere, &published, stale_copies)?;
+        let mut retiring = retire(fs, source, published, Moved { hash })?;
+        retiring.stale_copies = std::mem::take(stale_copies);
         self.retiring.push_back(retiring);
         Ok(())
     }
@@ -632,8 +668,13 @@ impl<'a> Mover<'a> {
     /// Moves the symlink `rels[0]`: recreates it with the same link text in
     /// the staging directory, gives it the source's owner and timestamps,
     /// publishes it and retires the source. Nothing can have a symlink open,
-    /// so the move needs no lease and no retire wait.
-    fn transact_symlink(&mut self, rels: &'a [PathBuf]) -> Result<Moved, Abort> {
+    /// so the move needs no lease and no retire wait. Adds the stale copies
+    /// that it deals with to `stale_copies`.
+    fn transact_symlink(
+        &mut self,
+        rels: &'a [PathBuf],
+        stale_copies: &mut Vec<(PathBuf, Fate)>,
+    ) -> Result<Moved, Abort> {
         let fs = self.fs;
         let rel = &rels[0];
         let (parent, name) = split(rel);
@@ -679,7 +720,6 @@ impl<'a> Mover<'a> {
         remove_empty_dirs(fs, &backing_staging, parent);
 
         let published = published?;
-        let mut stale_copies = Vec::new();
         if let Some(copy) = here {
             let fate = if published.names[0].adopted {
                 Fate::Kept
@@ -688,12 +728,12 @@ impl<'a> Mover<'a> {
             };
             stale_copies.push((copy.path(), fate));
         }
-        remove_stale_copies(fs, &stale.elsewhere, &published, &mut stale_copies)?;
+        remove_stale_copies(fs, &stale.elsewhere, &published, stale_copies)?;
         let hash = Hash(xxh3_128(source.target.as_encoded_bytes()));
         let allocated = source.stat.st_blocks.max(0) as u64 * 512;
         source.retire(published)?;
         self.moved_bytes += allocated;
-        Ok(Moved { hash, stale_copies })
+        Ok(Moved { hash })
     }
 
     /// The stale copies of the move unit `rels` whose source is as `source`
@@ -1238,6 +1278,7 @@ fn retire<'a>(
         retired_parents: Vec::new(),
         published,
         moved,
+        stale_copies: Vec::new(),
         retired_at: Instant::now(),
     };
     // From here on, every way out either unlinks the retired names or puts

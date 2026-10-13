@@ -41,6 +41,7 @@ use anyhow::{Context, Result, bail};
 
 use crate::fsops::{FsOps, Lease};
 use crate::layout::BackingBranch;
+use crate::log;
 use crate::proc_scan;
 use crate::transaction::{Branch, InUseGuard, STAGING, STAGING_MODE};
 
@@ -147,14 +148,14 @@ pub fn probe(
                     ));
                 }
                 if findings.hidden_processes > 0 {
-                    eprintln!(
-                        "cachy: warning: cannot read the open descriptors of {} processes (not permitted, or a descriptor cannot be statted), so open_file_guard: proc moves files that only they have open; run cachy as root, or with CAP_SYS_PTRACE",
+                    log::warning!(
+                        "cannot read the open descriptors of {} processes (not permitted, or a descriptor cannot be statted), so open_file_guard: proc moves files that only they have open; run cachy as root, or with CAP_SYS_PTRACE",
                         findings.hidden_processes
                     );
                 }
             }
-            Err(e) if from_lack_of_space(&e) => eprintln!(
-                "cachy: warning: cannot probe {role} {path}: no space for its scratch files ({e:#}); a move that needs what the branch lacks fails instead"
+            Err(e) if from_lack_of_space(&e) => log::warning!(
+                "cannot probe {role} {path}: no space for its scratch files ({e:#}); a move that needs what the branch lacks fails instead"
             ),
             Err(e) => refusals.push(format!("cannot probe {role} {path}: {e:#}")),
         }
@@ -166,7 +167,7 @@ pub fn probe(
     let zfs_version = openzfs_version(cache_branch);
     dense.extend(zfs_version.as_ref().and_then(hole_bug));
     for why in &dense {
-        eprintln!("cachy: warning: {why}, so moves copy every byte and sparse files arrive dense");
+        log::warning!("{why}, so moves copy every byte and sparse files arrive dense");
     }
     Ok(Capabilities {
         dense_copies: !dense.is_empty(),

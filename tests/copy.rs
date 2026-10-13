@@ -89,14 +89,16 @@ fn every_moved_file_reports_the_hash_of_its_source() {
         ("empty", "99aa06d3014798d86001c324468d497f"),
     ] {
         assert!(
-            err.contains(&format!("cachy: moved {rel} to {branch} (xxh3 {hash})")),
+            err.contains(&format!(
+                "cachy: info: moved {rel} to {branch} (xxh3 {hash})"
+            )),
             "no hash for {rel}; stderr:\n{err}"
         );
     }
     let sparse_hash = format!("{:032x}", xxhash_rust::xxh3::xxh3_128(&sparse));
     assert!(
         err.contains(&format!(
-            "cachy: moved dir/disk.img to {branch} (xxh3 {sparse_hash})"
+            "cachy: info: moved dir/disk.img to {branch} (xxh3 {sparse_hash})"
         )),
         "no hash for the sparse file; stderr:\n{err}"
     );

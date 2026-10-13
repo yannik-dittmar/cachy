@@ -53,6 +53,10 @@ Where the cache branch has no leases, cachy refuses to run unless `open_file_gua
 
 Under either, the minimum age still applies. Each run's last line names the in-use guard it used.
 
+After each run, cachy executes the configured run hook, if there is one, and hands it the run summary on stdin: a JSON document that lists the moved, skipped and failed move units (files, hardlink groups and symlinks), with reason codes, the stale copies that moves replaced or removed, the free space before and after, the byte budget, the throughput and the duration. [`docs/run-summary.md`](docs/run-summary.md) documents its schema. An `on` filter limits the hook to runs with some outcomes, such as failed ones; a hook that fails, or that runs past its timeout (60 seconds by default) and is killed, is logged without changing the exit code.
+
+cachy logs to stderr, one line per event, each starting with `cachy: ` and its level: `error`, `warning` or `info`. Lines are never coloured. When systemd connects its stderr to the journal, cachy also gives each line its syslog priority, which journald records, so `journalctl -p warning` shows just the warnings and errors. `cachy --version` prints the version.
+
 ## Testing
 
 `cargo test` runs the integration tests with the cache branch on tmpfs (`/dev/shm`). Tests that need a mergerfs cache pool skip themselves when mergerfs or passwordless sudo is missing.

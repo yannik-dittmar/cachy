@@ -18,6 +18,7 @@ use rustix::fs::Timespec;
 
 use crate::config::MetadataKind;
 use crate::fsops::{FsOps, Stat};
+use crate::log;
 
 /// The xattrs that hold POSIX ACLs.
 const ACLS: [&str; 2] = ["system.posix_acl_access", "system.posix_acl_default"];
@@ -204,8 +205,8 @@ fn lose(name: &OsStr, e: io::Error, allowed: AllowedLosses, what: &Path) -> Resu
     if !allowed.allows(kind) {
         return Err(e).with_context(|| format!("copy {kind} {}", name.display()));
     }
-    eprintln!(
-        "cachy: warning: {}: {kind} {} not preserved, as allow_metadata_loss allows: {e}",
+    log::warning!(
+        "{}: {kind} {} not preserved, as allow_metadata_loss allows: {e}",
         what.display(),
         name.display()
     );

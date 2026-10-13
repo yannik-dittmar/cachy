@@ -109,7 +109,7 @@ mod fault_injection {
         let injected = err.matches("cachy: fault injection:").count();
         let reached = injected == faults.split(',').count();
         assert!(
-            reached || !err.contains("cachy: skipped"),
+            reached || !err.contains("cachy: info: skipped"),
             "{faults}: the run skipped a move unit; stderr:\n{err}"
         );
         (out, reached)

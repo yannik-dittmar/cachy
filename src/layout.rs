@@ -19,6 +19,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow, bail};
 
 use crate::config::{Config, parse_byte_size};
+use crate::log;
 use crate::transaction::Branch;
 
 /// The control file through which mergerfs serves its runtime interface.
@@ -178,8 +179,8 @@ fn read_cache_pool(
     let branches = match read_value(&control, "branches") {
         Ok(branches) => branches,
         Err(e) if config.backing_branches.is_some() => {
-            eprintln!(
-                "cachy: warning: cannot read the cache pool's branches from {}: {e}; using backing_branches from the config, without checking that the cache branch is the cache pool's first branch",
+            log::warning!(
+                "cannot read the cache pool's branches from {}: {e}; using backing_branches from the config, without checking that the cache branch is the cache pool's first branch",
                 control.display()
             );
             return Ok(None);
@@ -225,8 +226,8 @@ fn read_cache_pool(
 
     let cache_minfreespace = first.minfreespace.unwrap_or(minfreespace);
     if threshold < cache_minfreespace {
-        eprintln!(
-            "cachy: warning: the threshold ({threshold} bytes) is below the cache pool's minfreespace for the cache branch ({cache_minfreespace} bytes): mergerfs creates new files on the backing branches before a check finds work"
+        log::warning!(
+            "the threshold ({threshold} bytes) is below the cache pool's minfreespace for the cache branch ({cache_minfreespace} bytes): mergerfs creates new files on the backing branches before a check finds work"
         );
     }
     // Unreadable on old mergerfs versions, which then cannot be checked.
@@ -235,8 +236,8 @@ fn read_cache_pool(
         // policies never choose a branch that takes no new files.
         let enabled = !matches!(&moveonenospc[..], b"false" | b"erofs");
         if enabled && first.mode == Mode::ReadWrite {
-            eprintln!(
-                "cachy: warning: the cache pool has moveonenospc={}: when a write to a backing branch runs out of space, mergerfs can move the file back onto the cache branch; set moveonenospc=false",
+            log::warning!(
+                "the cache pool has moveonenospc={}: when a write to a backing branch runs out of space, mergerfs can move the file back onto the cache branch; set moveonenospc=false",
                 moveonenospc.escape_ascii()
             );
         }

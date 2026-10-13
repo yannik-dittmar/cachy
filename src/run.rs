@@ -3,6 +3,8 @@
 
 use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 
@@ -45,6 +47,20 @@ pub struct Options {
 /// Free space should grow by at least the bytes moved divided by this; less
 /// means that something, such as a snapshot, still holds the moved data.
 const FREED_DIVISOR: u64 = 2;
+/// How long a run waits at its end for the space its moves freed to show in
+/// free space. ZFS shows frees only once their transaction group syncs, by
+/// default within 5 s, or the one after; `syncfs` does not sync it.
+const FREED_WAIT: Duration = Duration::from_secs(15);
+const FREED_POLL: Duration = Duration::from_millis(100);
+
+/// [`FREED_WAIT`], unless a fault-injection build is told otherwise.
+fn freed_wait() -> Duration {
+    #[cfg(feature = "fault-injection")]
+    if let Some(wait) = crate::fault::freed_wait() {
+        return wait;
+    }
+    FREED_WAIT
+}
 
 /// Recovers from unfinished moves, then performs a check and, if free space
 /// is below the threshold, a run, which stops once its byte budget is
@@ -186,13 +202,9 @@ pub fn run(fs: &dyn FsOps, config: &Config, options: Options) -> Result<Outcome>
         // Fails harmlessly if the staging directory is absent or not empty.
         let _ = fs.rmdir(branch.fd.as_fd(), Path::new(STAGING));
     }
-    if moved_bytes > 0 {
-        // Best effort: only makes the frees show sooner.
-        let _ = fs.sync_fs(cache_branch.fd.as_fd());
-    }
     match stat_fs(fs, &cache_branch) {
         Ok(stat) => {
-            let free = stat.free;
+            let free = wait_for_frees(&cache_branch, stat.free, free_before, moved_bytes);
             if budget.is_some() && free < target {
                 eprintln!(
                     "cachy: warning: target not reached: {free} bytes free, target {target} bytes"
@@ -215,6 +227,22 @@ pub fn run(fs: &dyn FsOps, config: &Config, options: Options) -> Result<Outcome>
     eprintln!("cachy: run finished: {moved} moved, {skipped} skipped, {failed} failed");
     outcome.failed = failed;
     Ok(outcome)
+}
+
+/// Free space once it has grown by enough of `moved_bytes` since
+/// `free_before`, or after [`FREED_WAIT`], starting from `free`. Measured
+/// outside the port: how often it measures depends on timing.
+fn wait_for_frees(cache_branch: &Branch, mut free: u64, free_before: u64, moved_bytes: u64) -> u64 {
+    let enough = |free: u64| free.saturating_sub(free_before) >= moved_bytes / FREED_DIVISOR;
+    let deadline = Instant::now() + freed_wait();
+    while !enough(free) && Instant::now() < deadline {
+        thread::sleep(FREED_POLL);
+        match FsStat::of(cache_branch.fd.as_fd()) {
+            Ok(stat) => free = stat.free,
+            Err(_) => break,
+        }
+    }
+    free
 }
 
 /// Prints the byte budget, then the move units that a run would move, in

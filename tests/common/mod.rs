@@ -230,12 +230,19 @@ impl Fixture {
     }
 
     /// Free space of the cache branch as cachy measures it. The filesystem is
-    /// synced first: ZFS reports writes and frees only once their transaction
-    /// group has synced, so without it a later sync could change free space
-    /// between this measurement and cachy's.
+    /// synced first: ZFS reports writes and frees, in free space and in
+    /// `st_blocks`, only once their transaction group has synced, so without
+    /// it a later sync could change free space between this measurement and
+    /// cachy's. `syncfs` does not sync it on ZFS; `zpool sync` does, as root.
     pub fn cache_branch_free(&self) -> u64 {
         let dir = fs::File::open(self.cache_branch.path()).unwrap();
         rustix::fs::syncfs(&dir).unwrap();
+        if self.cache_branch_fs == FsKind::Zfs {
+            let dataset = zfs_dataset(self.cache_branch.path());
+            let pool = dataset.split('/').next().unwrap();
+            sudo(&[OsStr::new("zpool"), OsStr::new("sync"), OsStr::new(pool)])
+                .unwrap_or_else(|e| panic!("sync the cache branch's zpool: {e}"));
+        }
         free_bytes(&statvfs(self.cache_branch.path()).unwrap())
     }
 

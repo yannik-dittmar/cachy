@@ -335,3 +335,36 @@ fn group_consumes_the_byte_budget_once() {
     assert!(fx.on_backing_branch("next.bin").exists());
     assert!(fx.on_cache_branch("last.bin").exists());
 }
+
+/// Frees can show in free space only seconds after the moves, as on ZFS,
+/// where they show once their transaction group syncs; a run waits for them
+/// rather than warn.
+#[test]
+fn frees_that_show_late_cause_no_warning() {
+    let _lock = free_space_lock();
+    let fx = Fixture::new();
+    populate(&fx);
+    let readers: Vec<fs::File> = FILES
+        .iter()
+        .map(|(rel, _)| fs::File::open(fx.on_cache_branch(rel)).unwrap())
+        .collect();
+    let free = fx.cache_branch_free();
+    let config = fx.config(
+        &(free + 1).to_string(),
+        &(free + 2 * MIB + MIB / 2).to_string(),
+    );
+
+    let child = fx.spawn(&config);
+    for (rel, _) in &FILES[..3] {
+        while fx.on_cache_branch(rel).exists() || fx.staged_on_cache_branch(rel).exists() {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    // The run has measured free space by now, and found the frees missing.
+    std::thread::sleep(Duration::from_millis(500));
+    drop(readers);
+    let err = assert_exit(&child.wait_with_output().unwrap(), 0);
+
+    assert!(err.contains("3 moved"), "stderr:\n{err}");
+    assert!(!err.contains("warning"), "stderr:\n{err}");
+}

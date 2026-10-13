@@ -123,9 +123,6 @@ pub trait FsOps {
     fn list_dir(&self, dir: BorrowedFd) -> io::Result<Vec<OsString>>;
     /// The space and mount flags of `fd`'s filesystem.
     fn stat_fs(&self, fd: BorrowedFd) -> io::Result<FsStat>;
-    /// Writes out everything that `fd`'s filesystem holds in memory, so that
-    /// frees show in its free space (ZFS reports them only once synced).
-    fn sync_fs(&self, fd: BorrowedFd) -> io::Result<()>;
     /// Takes, changes or releases the lease on `fd`'s file. Fails with
     /// [`io::ErrorKind::WouldBlock`] if another open conflicts with it.
     fn set_lease(&self, fd: BorrowedFd, lease: Lease) -> io::Result<()>;
@@ -289,10 +286,6 @@ impl FsOps for RealFs {
 
     fn stat_fs(&self, fd: BorrowedFd) -> io::Result<FsStat> {
         FsStat::of(fd)
-    }
-
-    fn sync_fs(&self, fd: BorrowedFd) -> io::Result<()> {
-        Ok(rustix::fs::syncfs(fd)?)
     }
 
     fn set_lease(&self, fd: BorrowedFd, lease: Lease) -> io::Result<()> {

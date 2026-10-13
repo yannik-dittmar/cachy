@@ -143,24 +143,71 @@ mod simulated {
         );
     }
 
+    /// Leases are the guard unless the configuration chooses another, so
+    /// their failure refuses even where `/proc` could tell what is in use.
     #[test]
     fn lease_failure_refuses() {
-        for (lease_type, lease) in [("read", "read leases"), ("write", "write leases")] {
+        for guard in ["", "open_file_guard: lease\n"] {
+            for (lease_type, lease) in [("read", "read leases"), ("write", "write leases")] {
+                let fx = Fixture::new();
+                fx.cache_branch_file("file.bin", b"content", 1_000);
+                let config =
+                    fx.move_everything_config() + guard + &format!("lease_type: {lease_type}\n");
+
+                let out = with_probe_fault(fx.command(&config), "einval@set_lease");
+
+                let err = assert_refused_untouched(&fx, &out);
+                assert!(
+                    err.contains(&format!(
+                        "cache branch {} does not support {lease}",
+                        fx.cache_branch.path().display()
+                    )),
+                    "stderr:\n{err}"
+                );
+                assert!(err.contains("Invalid argument"), "stderr:\n{err}");
+                assert!(
+                    err.contains("unless open_file_guard is set to proc or off"),
+                    "stderr:\n{err}"
+                );
+            }
+        }
+    }
+
+    /// The probe checks that a scan of `/proc` finds a scratch file's opens;
+    /// only the proc guard's check stats an open scratch file.
+    #[test]
+    fn proc_scan_failure_refuses() {
+        let fx = Fixture::new();
+        fx.cache_branch_file("file.bin", b"content", 1_000);
+        let config = fx.move_everything_config() + "open_file_guard: proc\n";
+
+        let out = with_probe_fault(fx.command(&config), "eio@fstat");
+
+        let err = assert_refused_untouched(&fx, &out);
+        assert!(
+            err.contains(&format!(
+                "cache branch {} does not support finding open files in /proc",
+                fx.cache_branch.path().display()
+            )),
+            "stderr:\n{err}"
+        );
+    }
+
+    #[test]
+    fn explicit_proc_or_off_guard_runs_without_leases() {
+        for guard in ["proc", "off"] {
             let fx = Fixture::new();
             fx.cache_branch_file("file.bin", b"content", 1_000);
-            let config = fx.move_everything_config() + &format!("lease_type: {lease_type}\n");
+            let config = fx.move_everything_config() + &format!("open_file_guard: {guard}\n");
 
             let out = with_probe_fault(fx.command(&config), "einval@set_lease");
 
-            let err = assert_refused_untouched(&fx, &out);
-            assert!(
-                err.contains(&format!(
-                    "cache branch {} does not support {lease}",
-                    fx.cache_branch.path().display()
-                )),
-                "stderr:\n{err}"
+            let err = assert_exit(&out, 0);
+            assert!(err.contains("1 moved"), "stderr:\n{err}");
+            assert_eq!(
+                fs::read(fx.on_backing_branch("file.bin")).unwrap(),
+                b"content"
             );
-            assert!(err.contains("Invalid argument"), "stderr:\n{err}");
         }
     }
 

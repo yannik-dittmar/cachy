@@ -3,7 +3,13 @@
 //! afterwards it exists on exactly one of them.
 //!
 //! A regular file is held under a lease for the whole move, so a move unit
-//! that is in use is never moved. A hardlink group moves as one inode: it is
+//! that is in use is never moved. Without leases, the `proc` guard scans for
+//! opens instead, at the steps where a lease would be checked last: when the
+//! move starts, right before it publishes and at the end of the retire wait.
+//! A writer that opens the source in between is not stopped, so a move
+//! catches it only at the next scan, by its open or by the change to the
+//! source; one that opens the source after the last scan, through a lookup
+//! from before the retire, writes to a deleted file. A hardlink group moves as one inode: it is
 //! copied once, published under its first name and linked under the others,
 //! and all its names are retired together under the one lease, which any
 //! open through any name breaks. A symlink cannot be opened, so it is never
@@ -42,6 +48,7 @@ use crate::fsops::{FsOps, Lease, Stat};
 use crate::layout::BackingBranch;
 use crate::metadata::{self, AllowedLosses};
 use crate::placement::Unplaced;
+use crate::proc_scan;
 use crate::scan::Kind;
 
 /// Name of the staging directory at the root of each filesystem cachy writes to.
@@ -198,11 +205,24 @@ pub struct Copying {
 
 /// What keeps a move away from move units that are in use.
 pub struct Guard {
-    /// The lease held on the source during a move. Any open that conflicts
-    /// with it, before or during the move, makes the move unit in use.
-    pub lease: Lease,
+    pub in_use: InUse,
     /// Move units that changed more recently than this are never moved.
     pub minimum_age: Duration,
+}
+
+/// How a move tells that its move unit is in use.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InUse {
+    /// By a lease held on the source for the whole move: any open that
+    /// conflicts with it, before or during the move, makes the move unit in
+    /// use.
+    Lease(Lease),
+    /// By scans of `/proc` for other processes' opens of the source, when
+    /// the move starts, right before publish and at the end of the retire
+    /// wait. Only opens for writing count if `writers_only`.
+    Proc { writers_only: bool },
+    /// Never: nothing guards move units in use.
+    Off,
 }
 
 /// Why a move stopped short: a clean skip, or a failure.
@@ -364,15 +384,20 @@ impl<'a> Mover<'a> {
 
     /// Finishes retiring moves: one whose lease broke is rolled back at once,
     /// because the opener that broke it stays blocked until then; one whose
-    /// wait is over has its source unlinked, unless a link to it was added
-    /// meanwhile, which would keep it on the cache branch. Never waits.
+    /// wait is over has its source unlinked, unless it is in use, or a link
+    /// to it was added or its content written meanwhile, which would keep it
+    /// on the cache branch. Never waits.
     pub fn service(&mut self) {
         for retiring in std::mem::take(&mut self.retiring) {
             let rels = retiring.source.rels;
             let finished = match retiring.source.check_lease() {
                 Err(abort) => Some(retiring.roll_back(self.fs).and_then(|()| Err(abort))),
                 Ok(()) if retiring.retired_at.elapsed() >= retire_wait() => {
-                    match retiring.source.check_links() {
+                    let source = &retiring.source;
+                    match source
+                        .check_in_use()
+                        .and_then(|()| source.check_unchanged())
+                    {
                         Ok(()) => {
                             let allocated = retiring.source.allocated;
                             let unlinked = retiring.unlink(self.fs);
@@ -855,7 +880,7 @@ impl<'a> Mover<'a> {
 
 /// Why a move of the move unit of the given kind at `rels` would skip it if
 /// it started now, or `None` if it would move it. Leaves the files as they
-/// are: it only takes the guard's lease, and releases it.
+/// are: it only takes the guard's lease, if it has one, and releases it.
 pub fn would_skip(
     fs: &dyn FsOps,
     cache_branch: &Branch,
@@ -1359,7 +1384,8 @@ fn stale_copy<'a>(
     Ok(Some(copy))
 }
 
-/// The source of a move, held open under a lease for the whole move.
+/// The source of a move, held open for the whole move, under a lease if the
+/// guard takes one.
 struct Source<'a> {
     fs: &'a dyn FsOps,
     cache_branch: &'a Branch,
@@ -1369,8 +1395,8 @@ struct Source<'a> {
     dirs: Vec<OwnedFd>,
     /// The source, opened through its first name.
     file: OwnedFd,
-    lease: Lease,
-    /// The source as it was when the lease was taken.
+    in_use: InUse,
+    /// The source as it was when the lease was taken (or the move started).
     identity: Identity,
     /// Its metadata then, before the copy read it and changed its atime.
     stat: Stat,
@@ -1421,9 +1447,9 @@ pub fn time_since((secs, nanos): (i64, u64)) -> Option<Duration> {
 
 impl<'a> Source<'a> {
     /// Opens the regular file or hardlink group `rels` on the cache branch
-    /// and takes a lease on it. Skips it if another open conflicts with the
-    /// lease, if it is younger than the minimum age, or if `rels` are no
-    /// longer all of its names.
+    /// and takes the guard's lease on it, if it has one. Skips it if the
+    /// guard finds it in use, if it is younger than the minimum age, or if
+    /// `rels` are no longer all of its names.
     fn open(
         fs: &'a dyn FsOps,
         cache_branch: &'a Branch,
@@ -1433,16 +1459,18 @@ impl<'a> Source<'a> {
         let (parent, name) = split(&rels[0]);
         let dir = open_dirs(fs, &cache_branch.fd, parent).context("open source directory")?;
         let file = fs.open_read(dir.as_fd(), name).context("open source")?;
-        let lease = guard.lease;
-        match fs.set_lease(file.as_fd(), lease) {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                return Err(Abort::Skip(Skip::InUse));
+        if let InUse::Lease(lease) = guard.in_use {
+            match fs.set_lease(file.as_fd(), lease) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    return Err(Abort::Skip(Skip::InUse));
+                }
+                Err(e) => return Err(anyhow::Error::from(e).context("take lease").into()),
             }
-            Err(e) => return Err(anyhow::Error::from(e).context("take lease").into()),
         }
         let stat = fs.fstat(file.as_fd()).context("fstat source")?;
         let identity = Identity::of(&stat);
+        scan_for_opens(guard.in_use, &identity)?;
         if identity.is_younger_than(guard.minimum_age) {
             return Err(Abort::Skip(Skip::TooYoung));
         }
@@ -1469,7 +1497,7 @@ impl<'a> Source<'a> {
             rels,
             dirs,
             file,
-            lease,
+            in_use: guard.in_use,
             identity,
             allocated: stat.st_blocks.max(0) as u64 * 512,
             stat,
@@ -1477,11 +1505,11 @@ impl<'a> Source<'a> {
     }
 
     /// Checks, right before publishing, that the copy is still current: the
-    /// lease is held, the source is unchanged, and each of its relpaths,
+    /// source is not in use, it is unchanged, and each of its relpaths,
     /// looked up afresh from the cache branch root, still names it. An atomic
     /// save or a renamed directory during the copy fails the last check.
     fn revalidate(&self) -> Result<(), Abort> {
-        self.check_lease()?;
+        self.check_in_use()?;
         let now = self.fs.fstat(self.file.as_fd()).context("fstat source")?;
         if Identity::of(&now) != self.identity {
             return Err(Abort::Skip(Skip::Changed));
@@ -1493,24 +1521,54 @@ impl<'a> Source<'a> {
     }
 
     /// Skips the move as changed if the source has gained or lost a link
-    /// since it was opened. Adding a link does not break the lease.
-    fn check_links(&self) -> Result<(), Abort> {
+    /// since it was opened, which does not break a lease, or if its size or
+    /// mtime changed, which a writer that no guard stopped does. Its ctime
+    /// is not compared: retiring the source changes it.
+    fn check_unchanged(&self) -> Result<(), Abort> {
         let now = self.fs.fstat(self.file.as_fd()).context("fstat source")?;
-        if now.st_nlink != self.rels.len() as u64 {
+        let identity = Identity::of(&now);
+        if now.st_nlink != self.rels.len() as u64
+            || (identity.size, identity.mtime) != (self.identity.size, self.identity.mtime)
+        {
             return Err(Abort::Skip(Skip::Changed));
         }
         Ok(())
     }
 
     /// Skips the move as in use once a conflicting open has started to break
-    /// the lease. The opener stays blocked until the source is closed.
+    /// the lease, if the guard holds one. The opener stays blocked until the
+    /// source is closed. Cheap enough to call before every chunk of a copy.
     fn check_lease(&self) -> Result<(), Abort> {
+        let InUse::Lease(held) = self.in_use else {
+            return Ok(());
+        };
         let lease = self.fs.lease(self.file.as_fd()).context("query lease")?;
-        if lease != self.lease {
+        if lease != held {
             return Err(Abort::Skip(Skip::InUse));
         }
         Ok(())
     }
+
+    /// Skips the move as in use if the guard finds the source in use: by its
+    /// lease, or by a scan of `/proc`.
+    fn check_in_use(&self) -> Result<(), Abort> {
+        self.check_lease()?;
+        scan_for_opens(self.in_use, &self.identity)
+    }
+}
+
+/// Skips the move as in use if the guard scans `/proc` for opens and finds
+/// one of the source as `identity` describes it that makes it in use.
+fn scan_for_opens(in_use: InUse, identity: &Identity) -> Result<(), Abort> {
+    let InUse::Proc { writers_only } = in_use else {
+        return Ok(());
+    };
+    let opens = proc_scan::scan((identity.dev, identity.ino), false)
+        .context("scan /proc for opens of the source")?;
+    if opens.writing || (opens.reading && !writers_only) {
+        return Err(Abort::Skip(Skip::InUse));
+    }
+    Ok(())
 }
 
 /// Skips the move as changed unless `rel`, looked up afresh from the cache

@@ -3,7 +3,9 @@
 //! staging directory, so that a kernel or module upgrade cannot silently
 //! weaken them. It probes what cachy does on each filesystem:
 //!
-//! - On the cache branch: a lease of the configured type (the in-use guard),
+//! - On the cache branch: the in-use guard, which is a lease of the
+//!   configured type unless the configuration explicitly chooses a scan of
+//!   `/proc` (a scan that finds a scratch file's opens) or no guard at all,
 //!   a no-replace rename (retiring a source, and recovery renaming one back),
 //!   and hole reporting (`SEEK_DATA`/`SEEK_HOLE`, which sparse copies read).
 //! - On each backing branch that takes new files: a no-replace rename
@@ -11,7 +13,10 @@
 //!   cachy writes nothing to the other backing branches, not even scratch
 //!   files.
 //!
-//! A missing lease or rename refuses the run. Hole reporting that cannot be
+//! A missing lease, `/proc` scan or rename refuses the run, as does a lease
+//! failure whenever the configuration has not chosen another guard. A `/proc`
+//! scan that cannot read some processes' descriptors only warns: it does not
+//! see their opens. Hole reporting that cannot be
 //! trusted only makes moves copy every byte, with a warning, as does an
 //! OpenZFS module under the cache branch with the bug that reports data as
 //! holes. A filesystem without room for the scratch files is not probed, with
@@ -37,7 +42,8 @@ use anyhow::{Context, Result, bail};
 
 use crate::fsops::{FsOps, Lease};
 use crate::layout::BackingBranch;
-use crate::transaction::{Branch, STAGING, STAGING_MODE};
+use crate::proc_scan;
+use crate::transaction::{Branch, InUse, STAGING, STAGING_MODE};
 
 /// What the names of scratch files start with.
 const SCRATCH_PREFIX: &str = ".cachy-probe-";
@@ -84,32 +90,36 @@ const EXCHANGE: Capability = Capability {
 };
 const READ_LEASE: Capability = Capability {
     name: "read leases (F_SETLEASE with F_RDLCK)",
-    needed: "to tell which files are in use",
+    needed: "to tell which files are in use, unless open_file_guard is set to proc or off",
 };
 const WRITE_LEASE: Capability = Capability {
     name: "write leases (F_SETLEASE with F_WRLCK)",
-    needed: "to tell which files are in use",
+    needed: "to tell which files are in use, unless open_file_guard is set to proc or off",
+};
+const PROC_SCAN: Capability = Capability {
+    name: "finding open files in /proc",
+    needed: "to tell which files are in use with open_file_guard: proc",
 };
 
-/// Probes the cache branch, for leases of the type `lease`, and each backing
-/// branch that takes new files, and warns of what makes moves copy densely.
-/// Returns an error naming each filesystem and what it lacks if cachy must
-/// refuse to run.
+/// Probes the cache branch, for what the in-use guard `in_use` needs, and
+/// each backing branch that takes new files, and warns of what makes moves
+/// copy densely. Returns an error naming each filesystem and what it lacks if
+/// cachy must refuse to run.
 pub fn probe(
     fs: &dyn FsOps,
-    lease: Lease,
+    in_use: InUse,
     cache_branch: &Branch,
     backing_branches: &[BackingBranch],
 ) -> Result<Capabilities> {
     let cache_checks = Checks {
         role: "cache branch",
-        lease: Some(lease),
+        in_use,
         holes: true,
         exchange: false,
     };
     let backing_checks = Checks {
         role: "backing branch",
-        lease: None,
+        in_use: InUse::Off,
         holes: false,
         exchange: true,
     };
@@ -136,6 +146,12 @@ pub fn probe(
                     dense.push(format!(
                         "{role} {path}: hole reporting cannot be trusted ({why})"
                     ));
+                }
+                if findings.hidden_processes > 0 {
+                    eprintln!(
+                        "cachy: warning: cannot read the open descriptors of {} processes, so open_file_guard: proc moves files that only they have open; run cachy as root, or with CAP_SYS_PTRACE",
+                        findings.hidden_processes
+                    );
                 }
             }
             Err(e) if from_lack_of_space(&e) => eprintln!(
@@ -181,8 +197,9 @@ fn hole_bug(version: &io::Result<String>) -> Option<String> {
 struct Checks {
     /// What the branch is to cachy, as messages name it.
     role: &'static str,
-    /// Take and release a lease of this type.
-    lease: Option<Lease>,
+    /// Check what this in-use guard needs: take and release its lease, or
+    /// scan `/proc` for opens.
+    in_use: InUse,
     /// Check that data after a hole shows as data.
     holes: bool,
     /// Swap two files with an exchange rename.
@@ -196,6 +213,9 @@ struct Findings {
     missing: Vec<(&'static Capability, io::Error)>,
     /// Why moves cannot trust its hole reporting, if they cannot.
     unreliable_holes: Option<String>,
+    /// The number of processes whose open descriptors a `/proc` scan could
+    /// not read.
+    hidden_processes: usize,
 }
 
 impl Findings {
@@ -299,10 +319,16 @@ fn check(fs: &dyn FsOps, dir: &OwnedFd, checks: &Checks) -> Result<Findings> {
     if checks.holes {
         findings.unreliable_holes = check_holes(fs, &file)?;
     }
+    if let InUse::Proc { .. } = checks.in_use {
+        match check_proc_scan(fs, dir, &a, &file) {
+            Ok(hidden) => findings.hidden_processes = hidden,
+            Err(e) => findings.lacks(&PROC_SCAN, e)?,
+        }
+    }
     // A read lease conflicts with any open for writing, even cachy's own.
     drop(file);
 
-    if let Some(lease) = checks.lease {
+    if let InUse::Lease(lease) = checks.in_use {
         let file = fs.open_read(dir.as_fd(), &a).context("open scratch file")?;
         if let Err(e) = take_and_release(fs, &file, lease) {
             let capability = match lease {
@@ -341,6 +367,29 @@ fn check(fs: &dyn FsOps, dir: &OwnedFd, checks: &Checks) -> Result<Findings> {
         }
     }
     Ok(findings)
+}
+
+/// Opens the scratch file `name` in `dir` for reading too, beside its open
+/// for writing `file`, and checks that a scan of `/proc` finds both opens.
+/// Returns the number of processes whose descriptors the scan could not
+/// read.
+fn check_proc_scan(
+    fs: &dyn FsOps,
+    dir: &OwnedFd,
+    name: &Path,
+    file: &OwnedFd,
+) -> io::Result<usize> {
+    let stat = fs.fstat(file.as_fd())?;
+    let reader = fs.open_read(dir.as_fd(), name)?;
+    let opens = proc_scan::scan((stat.st_dev, stat.st_ino), true);
+    drop(reader);
+    let opens = opens?;
+    if !opens.writing || !opens.reading {
+        return Err(io::Error::other(format!(
+            "a scratch file's opens were not found: {opens:?}"
+        )));
+    }
+    Ok(opens.hidden)
 }
 
 /// Takes a lease of the type `lease` on `file`, checks that it holds, and

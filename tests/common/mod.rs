@@ -503,6 +503,20 @@ pub fn stderr(out: &Output) -> String {
     String::from_utf8_lossy(&out.stderr).into_owned()
 }
 
+/// The filesystem operations that a fault-injection build of cachy traced
+/// (with `CACHY_FAULT_TRACE=1`) in `stderr`, as `(number, name)`, such as
+/// `(7, "(write_at)")`.
+pub fn traced_operations(stderr: &str) -> Vec<(u64, &str)> {
+    stderr
+        .lines()
+        .filter_map(|line| {
+            let op = line.strip_prefix("cachy: trace: operation ")?;
+            let (n, name) = op.split_once(' ')?;
+            Some((n.parse().unwrap(), name))
+        })
+        .collect()
+}
+
 /// Asserts the exit code and returns stderr, showing it on failure.
 pub fn assert_exit(out: &Output, code: i32) -> String {
     let err = stderr(out);

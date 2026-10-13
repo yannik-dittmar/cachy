@@ -972,17 +972,16 @@ impl Identity {
     /// Whether the source changed (by its later of mtime and ctime) less than
     /// `minimum_age` ago, or claims to have changed in the future.
     fn is_younger_than(&self, minimum_age: Duration) -> bool {
-        let (secs, nanos) = self.mtime.max(self.ctime);
-        // Times before the epoch are old enough either way.
-        let since_epoch = Duration::new(secs.max(0) as u64, nanos as u32);
-        match UNIX_EPOCH.checked_add(since_epoch) {
-            Some(last_change) => match SystemTime::now().duration_since(last_change) {
-                Ok(age) => age < minimum_age,
-                Err(_) => true,
-            },
-            None => true,
-        }
+        time_since(self.mtime.max(self.ctime)).is_none_or(|age| age < minimum_age)
     }
+}
+
+/// The time since `change` (seconds and nanoseconds since the epoch), or
+/// `None` if it lies in the future. Times before the epoch count from it.
+pub fn time_since((secs, nanos): (i64, u64)) -> Option<Duration> {
+    let since_epoch = Duration::new(secs.max(0) as u64, nanos as u32);
+    let change = UNIX_EPOCH.checked_add(since_epoch)?;
+    SystemTime::now().duration_since(change).ok()
 }
 
 impl<'a> Source<'a> {

@@ -6,9 +6,10 @@ mod common;
 
 use std::ffi::OsStr;
 use std::fs;
-use std::path::Path;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 
-use common::{Fixture, assert_exit, root_available, sudo};
+use common::{Fixture, assert_exit, root_available, skip, sudo};
 
 fn config_excluding(fx: &Fixture, patterns: &[&str]) -> String {
     let mut config = fx.move_everything_config() + "exclude:\n";
@@ -120,45 +121,41 @@ fn nested_patterns_behave_like_gitignore() {
     assert_kept(&fx, "a/b/.cache/z");
 }
 
-/// Creates `depth` nested directories with 200-byte names under `dir`, so
-/// that the deepest one's path is longer than `PATH_MAX`. Reading the
-/// deepest one by path fails, even as root, so a walk that enters the tree
-/// warns about it.
-fn too_deep_tree(dir: &Path, depth: usize) {
-    let name = "d".repeat(200);
-    let mut fd = rustix::fs::open(
-        dir,
-        rustix::fs::OFlags::DIRECTORY | rustix::fs::OFlags::RDONLY,
-        rustix::fs::Mode::empty(),
-    )
-    .unwrap();
-    for _ in 0..depth {
-        rustix::fs::mkdirat(&fd, name.as_str(), rustix::fs::Mode::from_raw_mode(0o755)).unwrap();
-        fd = rustix::fs::openat(
-            &fd,
-            name.as_str(),
-            rustix::fs::OFlags::DIRECTORY | rustix::fs::OFlags::RDONLY,
-            rustix::fs::Mode::empty(),
-        )
-        .unwrap();
+/// Removes all permissions from a directory, so that a walk that enters it
+/// cannot read it and warns; restores them on drop, so that the fixture can
+/// remove it.
+struct Unreadable(PathBuf);
+
+impl Unreadable {
+    fn new(dir: PathBuf) -> Unreadable {
+        fs::create_dir_all(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o000)).unwrap();
+        Unreadable(dir)
+    }
+}
+
+impl Drop for Unreadable {
+    fn drop(&mut self) {
+        let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o755));
     }
 }
 
 #[test]
 fn excluded_directories_are_not_traversed() {
-    let populate = |fx: &Fixture| {
-        fs::create_dir(fx.on_cache_branch("excluded")).unwrap();
-        too_deep_tree(&fx.on_cache_branch("excluded"), 24);
-        fx.cache_branch_file("movie.mkv", b"movie", 1_000);
-    };
-    // Without the exclusion, the walk enters the tree and warns.
+    if rustix::process::geteuid().is_root() {
+        skip("root reads unreadable directories");
+        return;
+    }
+    // Without the exclusion, the walk enters the directory and warns.
     let control = Fixture::new();
-    populate(&control);
+    control.cache_branch_file("movie.mkv", b"movie", 1_000);
+    let _locked = Unreadable::new(control.on_cache_branch("excluded/locked"));
     let err = assert_exit(&control.run(&control.move_everything_config()), 0);
     assert!(err.contains("warning: skipping"), "stderr:\n{err}");
 
     let fx = Fixture::new();
-    populate(&fx);
+    fx.cache_branch_file("movie.mkv", b"movie", 1_000);
+    let _locked = Unreadable::new(fx.on_cache_branch("excluded/locked"));
 
     let err = assert_exit(&fx.run(&config_excluding(&fx, &["excluded/"])), 0);
 

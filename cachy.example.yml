@@ -29,6 +29,13 @@ order: atime
 # Files changed more recently than this are never moved. Default: 15m.
 minimum_age: 15m
 
+# Optional. Files unchanged for longer than this are moved by every run,
+# whatever the free space, and before any other file, so that nothing stays
+# on the cache branch for longer than this. A check then walks the cache
+# branch; without a max age, it only reads the free space. Must be above the
+# minimum age. `cachy run --max-age <duration>` overrides it. Default: none.
+# max_age: 7d
+
 # What makes a file in use, so that it is not moved:
 #   read  - it is open for writing (default)
 #   write - it is open at all, even for reading only

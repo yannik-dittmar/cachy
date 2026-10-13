@@ -194,7 +194,9 @@ fn example_config_is_valid() {
     let fx = Fixture::new();
     let config = example
         .replace("/mnt/cache", fx.cache_branch.path().to_str().unwrap())
-        .replace("/mnt/storage", fx.backing_branch.path().to_str().unwrap());
+        .replace("/mnt/storage", fx.backing_branch.path().to_str().unwrap())
+        .replace("/var/lib/cachy", fx.state_dir().to_str().unwrap());
+    assert!(!config.contains("/var/lib/cachy"));
 
     assert_exit(&fx.run(&config), 0);
 }

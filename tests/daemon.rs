@@ -40,7 +40,10 @@ fn a_daemon_without_schedules_refuses_to_start() {
     ] {
         let out = common::output(&mut fx.daemon_command(&config)).unwrap();
         let err = assert_exit(&out, 1);
-        assert!(err.contains("daemon.schedules"), "stderr:\n{err}");
+        assert!(
+            err.contains("set daemon.schedules or daemon.wake_trigger"),
+            "stderr:\n{err}"
+        );
     }
 }
 
@@ -551,4 +554,331 @@ fn sigterm_at_the_wake_gate_stops_the_daemon() {
         !err.contains("the backing disks are awake"),
         "stderr:\n{err}"
     );
+}
+
+/// `config` with the daemon's backing disks set to [`DISKS`] and a wake
+/// trigger that looks at them every ten minutes.
+#[cfg(feature = "fault-injection")]
+fn triggered(config: String) -> String {
+    let mut config = config + "daemon:\n  backing_disks:\n";
+    for disk in DISKS {
+        config += &format!("    - id: {disk}\n");
+    }
+    config + "  wake_trigger:\n    check_interval: 10m\n"
+}
+
+/// The line that the daemon logs as a wake-triggered check starts.
+#[cfg(feature = "fault-injection")]
+const TRIGGERED: &str = "info: wake-triggered check:";
+
+/// Starts a daemon of `fx` under `config`, at 01:00, whose disk state is
+/// scripted in `disks`.
+#[cfg(feature = "fault-injection")]
+fn triggered_daemon(fx: &Fixture, config: &str, disks: &std::path::Path) -> common::Daemon {
+    let env = [("CACHY_DISK_STATE", disks.to_str().unwrap())];
+    fx.start_daemon_with(config, "2026-01-01T01:00:00Z", &env)
+}
+
+/// The times at which the daemon looked at the scripted disk state in
+/// `disks`, as the fake records them.
+#[cfg(feature = "fault-injection")]
+fn looks(disks: &std::path::Path) -> Vec<String> {
+    let mut path = disks.as_os_str().to_owned();
+    path.push(".looks");
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Waits until the daemon has looked at the scripted disk state in `disks`
+/// `n` times. It does one thing at a time: the looks before the last one,
+/// and their checks, are over.
+#[cfg(feature = "fault-injection")]
+fn wait_for_looks(daemon: &common::Daemon, disks: &std::path::Path, n: usize) {
+    use std::time::{Duration, Instant};
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while looks(disks).len() < n {
+        assert!(
+            !daemon.exited() && Instant::now() < deadline,
+            "fewer than {n} looks at the disks: {:?}; stderr:\n{}",
+            looks(disks),
+            daemon.stderr()
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn while_the_backing_disks_are_awake_the_wake_trigger_checks_every_check_interval() {
+    let fx = Fixture::new();
+    let dir = tempfile::tempdir().unwrap();
+    let disks = dir.path().join("disks");
+    set_disks(&disks, &DISKS);
+    let config = triggered(fx.no_work_config());
+
+    let daemon = triggered_daemon(&fx, &config, &disks);
+    wait_for_looks(&daemon, &disks, 1);
+    // Not yet a check interval since.
+    daemon.set_clock("2026-01-01T01:05:00Z");
+    daemon.set_clock("2026-01-01T01:10:00Z");
+    wait_for_looks(&daemon, &disks, 2);
+    // One disk falls asleep.
+    set_disks(&disks, &DISKS[1..]);
+    daemon.set_clock("2026-01-01T01:20:00Z");
+    wait_for_looks(&daemon, &disks, 3);
+    daemon.set_clock("2026-01-01T01:30:00Z");
+    wait_for_looks(&daemon, &disks, 4);
+    set_disks(&disks, &DISKS);
+    daemon.set_clock("2026-01-01T01:40:00Z");
+    wait_for_looks(&daemon, &disks, 5);
+    daemon.set_clock("2026-01-01T01:45:00Z");
+    daemon.wait_for_lines("nothing to do", 3);
+
+    let (status, err) = daemon.stop();
+    assert_eq!(status.code(), Some(0), "stderr:\n{err}");
+    assert_eq!(
+        looks(&disks),
+        [
+            "2026-01-01T01:00:00Z",
+            "2026-01-01T01:10:00Z",
+            "2026-01-01T01:20:00Z",
+            "2026-01-01T01:30:00Z",
+            "2026-01-01T01:40:00Z",
+        ]
+    );
+    assert_eq!(err.matches(TRIGGERED).count(), 3, "stderr:\n{err}");
+    assert_eq!(err.matches("nothing to do").count(), 3, "stderr:\n{err}");
+}
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn a_wake_triggered_check_that_finds_work_starts_a_run_with_reason_wake_trigger() {
+    let fx = Fixture::new();
+    let dir = tempfile::tempdir().unwrap();
+    let summaries_path = dir.path().join("summaries");
+    let disks = dir.path().join("disks");
+    set_disks(&disks, &DISKS);
+    fx.cache_branch_file("a.txt", b"a", 1_000);
+    let config = triggered(hooked_config(&fx, &summaries_path, ""));
+
+    let daemon = triggered_daemon(&fx, &config, &disks);
+    wait_for_looks(&daemon, &disks, 1);
+    // The check of the first look is over at the next one, which finds the
+    // disks asleep.
+    set_disks(&disks, &[]);
+    daemon.set_clock("2026-01-01T01:10:00Z");
+    wait_for_looks(&daemon, &disks, 2);
+
+    assert!(fx.on_backing_branch("a.txt").exists());
+    assert!(!fx.on_cache_branch("a.txt").exists());
+    let summaries = summaries(&summaries_path);
+    assert_eq!(summaries.len(), 1, "{summaries:?}");
+    assert_eq!(summaries[0]["reason"], "wake_trigger");
+    assert_eq!(summaries[0]["outcome"], "moved");
+    let (status, err) = daemon.stop();
+    assert_eq!(status.code(), Some(0), "stderr:\n{err}");
+}
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn a_wake_triggered_check_above_the_threshold_with_nothing_past_the_max_age_starts_no_run() {
+    let fx = Fixture::new();
+    let dir = tempfile::tempdir().unwrap();
+    let summaries_path = dir.path().join("summaries");
+    let disks = dir.path().join("disks");
+    set_disks(&disks, &DISKS);
+    fx.cache_branch_file("a.txt", b"a", 1_000);
+    // a.txt is not past the max age.
+    let config = triggered(hooked_config(&fx, &summaries_path, "")).replace(
+        "threshold: 1T\ntarget: 2T",
+        "threshold: 0\ntarget: 1\nmax_age: 100000d",
+    );
+
+    let daemon = triggered_daemon(&fx, &config, &disks);
+    wait_for_looks(&daemon, &disks, 1);
+    daemon.set_clock("2026-01-01T01:10:00Z");
+    wait_for_looks(&daemon, &disks, 2);
+
+    let (status, err) = daemon.stop();
+    assert_eq!(status.code(), Some(0), "stderr:\n{err}");
+    assert_eq!(err.matches(TRIGGERED).count(), 2, "stderr:\n{err}");
+    assert!(err.contains("nothing to do"), "stderr:\n{err}");
+    assert!(fx.on_cache_branch("a.txt").exists());
+    assert!(summaries(&summaries_path).is_empty());
+}
+
+/// Sets what the scripted disk state in `path` reports: every disk of
+/// [`DISKS`] awake, with `requests` completed.
+#[cfg(feature = "fault-injection")]
+fn set_disk_io(path: &std::path::Path, requests: u64) {
+    let mut text = String::new();
+    for disk in DISKS {
+        text += &format!("{disk} awake {requests}\n");
+    }
+    let staged = path.with_extension("new");
+    std::fs::write(&staged, &text).unwrap();
+    std::fs::rename(&staged, path).unwrap();
+}
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn cachys_own_io_does_not_keep_the_wake_trigger_firing() {
+    let fx = Fixture::new();
+    let dir = tempfile::tempdir().unwrap();
+    let summaries_path = dir.path().join("summaries");
+    let disks = dir.path().join("disks");
+    set_disk_io(&disks, 100);
+    fx.cache_branch_file("a.txt", b"a", 1_000);
+    // A run's moves are I/O on the backing disks: the hook, which the check
+    // executes before it is over, makes their counters change.
+    let own_io = dir.path().join("own-io");
+    set_disk_io(&own_io, 150);
+    let config = triggered(hooked_config(
+        &fx,
+        &summaries_path,
+        &format!("; cp {} {}", own_io.display(), disks.display()),
+    ));
+
+    let daemon = triggered_daemon(&fx, &config, &disks);
+    wait_for_looks(&daemon, &disks, 1);
+    daemon.set_clock("2026-01-01T01:10:00Z");
+    wait_for_looks(&daemon, &disks, 2);
+    daemon.set_clock("2026-01-01T01:20:00Z");
+    wait_for_looks(&daemon, &disks, 3);
+    // Others use the disks.
+    set_disk_io(&disks, 160);
+    daemon.set_clock("2026-01-01T01:30:00Z");
+    wait_for_looks(&daemon, &disks, 4);
+    daemon.set_clock("2026-01-01T01:40:00Z");
+    wait_for_looks(&daemon, &disks, 5);
+    daemon.set_clock("2026-01-01T01:50:00Z");
+    wait_for_looks(&daemon, &disks, 6);
+
+    let (status, err) = daemon.stop();
+    assert_eq!(status.code(), Some(0), "stderr:\n{err}");
+    // At 01:00, and at 01:30, after the I/O of others; not at 01:10 or
+    // 01:20, after cachy's own, nor at 01:40 or 01:50, after the check at
+    // 01:30.
+    // Each of them a run, as free space is below the threshold.
+    assert_eq!(summaries(&summaries_path).len(), 2);
+    assert_eq!(err.matches(TRIGGERED).count(), 2, "stderr:\n{err}");
+    assert!(
+        err.contains("awake only by cachy's own I/O"),
+        "stderr:\n{err}"
+    );
+}
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn the_check_interval_is_five_minutes_unless_the_config_sets_one() {
+    let fx = Fixture::new();
+    let dir = tempfile::tempdir().unwrap();
+    let disks = dir.path().join("disks");
+    set_disks(&disks, &[]);
+    let config = triggered(fx.no_work_config()).replace("    check_interval: 10m\n", "");
+    let config = config.replace("  wake_trigger:\n", "  wake_trigger: {}\n");
+
+    let daemon = triggered_daemon(&fx, &config, &disks);
+    wait_for_looks(&daemon, &disks, 1);
+    daemon.set_clock("2026-01-01T01:05:00Z");
+    wait_for_looks(&daemon, &disks, 2);
+
+    let (status, err) = daemon.stop();
+    assert_eq!(status.code(), Some(0), "stderr:\n{err}");
+    assert!(
+        err.contains("wake trigger: a check every 5m while the backing disks are awake"),
+        "stderr:\n{err}"
+    );
+    assert_eq!(
+        looks(&disks),
+        ["2026-01-01T01:00:00Z", "2026-01-01T01:05:00Z"]
+    );
+}
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn a_scheduled_check_stands_in_for_the_wake_triggered_check_due_with_it() {
+    let fx = Fixture::new();
+    let dir = tempfile::tempdir().unwrap();
+    let disks = dir.path().join("disks");
+    set_disks(&disks, &DISKS);
+    let config = scheduled_config(&fx, &["0 3 * * *"], &dir.path().join("summaries"))
+        .replace("threshold: 1T\ntarget: 2T", "threshold: 0\ntarget: 1");
+    let config = triggered(config).replace("\ndaemon:\n  backing_disks:", "\n  backing_disks:");
+    let env = [("CACHY_DISK_STATE", disks.to_str().unwrap())];
+
+    let daemon = fx.start_daemon_with(&config, "2026-01-01T02:50:00Z", &env);
+    wait_for_looks(&daemon, &disks, 1);
+    daemon.set_clock("2026-01-01T03:00:00Z");
+    daemon.wait_for_lines(&format!("{WAITING} 2026-01-02 03:00"), 1);
+    daemon.set_clock("2026-01-01T03:10:00Z");
+    wait_for_looks(&daemon, &disks, 2);
+
+    let (status, err) = daemon.stop();
+    assert_eq!(status.code(), Some(0), "stderr:\n{err}");
+    assert_eq!(
+        looks(&disks),
+        ["2026-01-01T02:50:00Z", "2026-01-01T03:10:00Z"]
+    );
+    assert_eq!(err.matches(TRIGGERED).count(), 2, "stderr:\n{err}");
+    assert_eq!(
+        err.matches("scheduled check (`").count(),
+        1,
+        "stderr:\n{err}"
+    );
+    // Logged once each.
+    assert_eq!(err.matches(WAITING).count(), 2, "stderr:\n{err}");
+}
+
+#[test]
+fn an_invalid_check_interval_is_a_config_error() {
+    let fx = Fixture::new();
+    let disks = format!("  backing_disks:\n    - id: {}\n", DISKS[0]);
+    for (trigger, error) in [
+        (
+            "  wake_trigger:\n    check_interval: 5 minutes\n",
+            "invalid duration `5 minutes`",
+        ),
+        (
+            "  wake_trigger:\n    check_interval: 0s\n",
+            "daemon.wake_trigger: check_interval must be above 0s",
+        ),
+        ("  wake_trigger:\n    every: 5m\n", "unknown field `every`"),
+    ] {
+        let config = fx.move_everything_config() + "daemon:\n" + &disks + trigger;
+
+        let err = assert_exit(&common::output(&mut fx.daemon_command(&config)).unwrap(), 1);
+
+        assert!(err.contains("invalid config"), "stderr:\n{err}");
+        assert!(err.contains(error), "{trigger}stderr:\n{err}");
+    }
+}
+
+#[test]
+fn a_wake_trigger_without_backing_disks_is_a_config_error() {
+    let fx = Fixture::new();
+    let config = fx.move_everything_config() + "daemon:\n  wake_trigger:\n    check_interval: 5m\n";
+
+    let err = assert_exit(&common::output(&mut fx.daemon_command(&config)).unwrap(), 1);
+
+    assert!(
+        err.contains("daemon.wake_trigger needs daemon.backing_disks"),
+        "stderr:\n{err}"
+    );
+}
+
+/// A config of `fx` that moves everything, with a run hook that appends each
+/// run summary, one per line, to `summaries`, then executes `then`.
+#[cfg(feature = "fault-injection")]
+fn hooked_config(fx: &Fixture, summaries: &std::path::Path, then: &str) -> String {
+    fx.move_everything_config()
+        + &format!(
+            "run_hook:\n  command: 'cat >> {}; echo >> {}{then}'\n",
+            summaries.display(),
+            summaries.display()
+        )
 }

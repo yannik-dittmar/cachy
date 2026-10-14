@@ -82,6 +82,10 @@ pub struct Daemon {
     /// Holds each scheduled check until the backing disks are awake.
     #[serde(default)]
     pub wake_gate: Option<WakeGate>,
+    /// Performs a check every check interval while the backing disks are
+    /// awake.
+    #[serde(default)]
+    pub wake_trigger: Option<WakeTrigger>,
 }
 
 /// Where the stable IDs of disks are.
@@ -108,6 +112,16 @@ pub struct WakeGate {
     /// it goes on only if free space is below the threshold.
     #[serde(deserialize_with = "duration")]
     pub time_limit: Duration,
+}
+
+/// The wake trigger's settings.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WakeTrigger {
+    /// How often the wake trigger looks at the backing disks, and so how
+    /// often it performs a check while they are awake.
+    #[serde(default = "default_check_interval", deserialize_with = "duration")]
+    pub check_interval: Duration,
 }
 
 /// The run hook: a shell command that receives the run summary on stdin.
@@ -300,6 +314,10 @@ fn default_hook_timeout() -> Duration {
     Duration::from_secs(60)
 }
 
+fn default_check_interval() -> Duration {
+    Duration::from_secs(5 * 60)
+}
+
 fn default_minimum_age() -> Duration {
     Duration::from_secs(15 * 60)
 }
@@ -345,6 +363,16 @@ impl Config {
             }
             if gate.time_limit.is_zero() {
                 bail!("daemon.wake_gate: time_limit must be above 0s");
+            }
+        }
+        if let Some(daemon) = &config.daemon
+            && let Some(trigger) = &daemon.wake_trigger
+        {
+            if daemon.backing_disks.is_empty() {
+                bail!("daemon.wake_trigger needs daemon.backing_disks, the disks it looks at");
+            }
+            if trigger.check_interval.is_zero() {
+                bail!("daemon.wake_trigger: check_interval must be above 0s");
             }
         }
         Ok(config)

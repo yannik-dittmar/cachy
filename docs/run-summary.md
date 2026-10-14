@@ -46,7 +46,7 @@ A check that finds no work is not a run, so it produces none, unless the invocat
 | --- | --- | --- |
 | `schema_version` | integer | The version of this schema: `1`. |
 | `cachy_version` | string | The version of cachy that ran, as `cachy --version` prints it. |
-| `reason` | string | How cachy was invoked: `manual` (`cachy run`), `drain` (`cachy run --drain`) or `schedule` (a scheduled check of `cachy daemon`). Later versions add `wake_trigger`. |
+| `reason` | string | How cachy was invoked: `manual` (`cachy run`), `drain` (`cachy run --drain`), `schedule` (a scheduled check of `cachy daemon`) or `wake_trigger` (a wake-triggered check of `cachy daemon`). |
 | `outcome` | string | How the run ended: `moved` (nothing failed, and at least one move unit moved), `nothing_moved` (nothing failed, and nothing moved) or `failed` (cachy exits with code 2). The run hook's `on` filter selects runs by this value. |
 | `cache_branch` | string | The cache branch's path. |
 | `free_before` | integer or null | The cache branch's free space, in bytes, when the run started; `null` if it could not be measured. |

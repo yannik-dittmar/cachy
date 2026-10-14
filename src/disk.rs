@@ -9,6 +9,11 @@
 //! falls back, for that disk alone, to the disk's I/O counters in
 //! `/sys/block/<disk>/stat` and its configured spindown timeout
 //! ([`IoActivity`]).
+//!
+//! The wake trigger asks a different question: whether the backing disks are
+//! awake on others' account. A disk that only cachy's own I/O keeps spun up
+//! is not, so that the trigger cannot keep itself firing; the disk's I/O
+//! counters tell when others use it again ([`OwnIo`]).
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
@@ -25,6 +30,15 @@ pub trait DiskState {
     /// The backing disks, by ID, that are not spun up at `now`; none means
     /// that the backing disks are awake.
     fn asleep(&self, now: Timestamp) -> Vec<PathBuf>;
+
+    /// Like [`DiskState::asleep`], but a disk that is spun up only by
+    /// cachy's own I/O, as told by [`DiskState::own_io`], counts as asleep
+    /// too; none means that the backing disks are awake on others' account.
+    fn asleep_but_for_own_io(&self, now: Timestamp) -> Vec<PathBuf>;
+
+    /// Tells that cachy did I/O on the backing disks until now: until they
+    /// do I/O of others, it is no sign that they are in use.
+    fn own_io(&self);
 }
 
 /// The real backing disks.
@@ -42,6 +56,14 @@ struct Disk {
     /// tell instead.
     power_mode: RefCell<bool>,
     activity: RefCell<IoActivity>,
+    own_io: RefCell<OwnIo>,
+}
+
+/// What a look at a disk tells.
+struct Look {
+    spun_up: bool,
+    /// Whether its I/O since cachy's own, if any, is others'.
+    others: bool,
 }
 
 impl SystemDisks {
@@ -88,10 +110,28 @@ impl Disk {
             stat: node.join("stat"),
             power_mode: RefCell::new(true),
             activity: RefCell::new(IoActivity::new(disk.spindown_timeout.unwrap_or_default())),
+            own_io: RefCell::new(OwnIo::default()),
         })
     }
 
-    fn awake(&self, now: Timestamp) -> bool {
+    fn look(&self, now: Timestamp) -> Look {
+        let counters = std::fs::read_to_string(&self.stat)
+            .ok()
+            .and_then(|text| Counters::parse(&text));
+        let others = {
+            let mut own_io = self.own_io.borrow_mut();
+            match counters {
+                Some(counters) => own_io.look(counters),
+                None => own_io.others(),
+            }
+        };
+        Look {
+            spun_up: self.spun_up(counters, now),
+            others,
+        }
+    }
+
+    fn spun_up(&self, counters: Option<Counters>, now: Timestamp) -> bool {
         if *self.power_mode.borrow() {
             match ata::check_power_mode(&self.dev) {
                 Answer::PowerMode(PowerMode::SpunUp(_)) => return true,
@@ -107,10 +147,7 @@ impl Disk {
                 }
             }
         }
-        match std::fs::read_to_string(&self.stat)
-            .ok()
-            .and_then(|text| Counters::parse(&text))
-        {
+        match counters {
             Some(counters) => self.activity.borrow_mut().awake(counters, now),
             None => {
                 log::warning!(
@@ -128,9 +165,26 @@ impl DiskState for SystemDisks {
     fn asleep(&self, now: Timestamp) -> Vec<PathBuf> {
         self.disks
             .iter()
-            .filter(|disk| !disk.awake(now))
+            .filter(|disk| !disk.look(now).spun_up)
             .map(|disk| disk.id.clone())
             .collect()
+    }
+
+    fn asleep_but_for_own_io(&self, now: Timestamp) -> Vec<PathBuf> {
+        self.disks
+            .iter()
+            .filter(|disk| {
+                let look = disk.look(now);
+                !(look.spun_up && look.others)
+            })
+            .map(|disk| disk.id.clone())
+            .collect()
+    }
+
+    fn own_io(&self) {
+        for disk in &self.disks {
+            disk.own_io.borrow_mut().did_io();
+        }
     }
 }
 
@@ -208,6 +262,52 @@ impl IoActivity {
     }
 }
 
+/// Whether a disk's I/O since cachy's own is others', as far as its I/O
+/// counters tell. cachy's I/O can reach the disk after cachy is done with
+/// it, such as when a filesystem writes its journal back, so the counters'
+/// changes up to the first look after it count as cachy's too.
+#[derive(Default)]
+pub struct OwnIo {
+    settled: Option<Settled>,
+}
+
+/// Where a disk's I/O counters were once the changes from cachy's own I/O
+/// had settled.
+enum Settled {
+    /// Not yet: the next look settles them.
+    No,
+    /// At this many requests completed.
+    At(u64),
+}
+
+impl OwnIo {
+    /// cachy did I/O on the disk, until now.
+    pub fn did_io(&mut self) {
+        self.settled = Some(Settled::No);
+    }
+
+    /// Looks at the disk's counters: whether its I/O since cachy's own, if
+    /// any, is others'.
+    pub fn look(&mut self, counters: Counters) -> bool {
+        match self.settled {
+            Some(Settled::No) => self.settled = Some(Settled::At(counters.requests)),
+            Some(Settled::At(requests))
+                if counters.requests != requests || counters.in_flight > 0 =>
+            {
+                self.settled = None;
+            }
+            _ => {}
+        }
+        self.others()
+    }
+
+    /// Whether the disk did I/O of others since cachy's own, or cachy did
+    /// none, as of the last look.
+    pub fn others(&self) -> bool {
+        self.settled.is_none()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -253,6 +353,41 @@ mod tests {
         assert!(disk.awake(requests(12), at(0) + Duration::from_secs(30)));
         // No I/O since: no longer recent.
         assert!(!disk.awake(requests(12), at(2)));
+    }
+
+    #[test]
+    fn io_is_others_until_cachy_does_some() {
+        let mut own_io = OwnIo::default();
+        assert!(own_io.others());
+        assert!(own_io.look(requests(10)));
+        assert!(own_io.look(requests(10)));
+    }
+
+    #[test]
+    fn cachys_own_io_and_what_follows_it_until_the_next_look_are_not_others() {
+        let mut own_io = OwnIo::default();
+        own_io.look(requests(10));
+        own_io.did_io();
+        assert!(!own_io.others());
+        // cachy's writes, and the filesystem's writeback after it.
+        assert!(!own_io.look(requests(500)));
+        assert!(!own_io.look(requests(500)));
+        assert!(!own_io.look(requests(500)));
+        // Others' I/O.
+        assert!(own_io.look(requests(501)));
+        assert!(own_io.look(requests(501)));
+    }
+
+    #[test]
+    fn io_in_flight_after_cachys_own_has_settled_is_others() {
+        let mut own_io = OwnIo::default();
+        own_io.did_io();
+        assert!(!own_io.look(requests(500)));
+        let busy = Counters {
+            requests: 500,
+            in_flight: 1,
+        };
+        assert!(own_io.look(busy));
     }
 
     #[test]

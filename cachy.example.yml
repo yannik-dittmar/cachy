@@ -183,3 +183,10 @@ keep_empty_dirs: false
 #   # Needs backing_disks.
 #   wake_gate:
 #     time_limit: 6h
+#   # Looks at the backing disks every check interval (5m if unset), and
+#   # performs a check whenever they are awake, with the normal threshold,
+#   # target and max age, so that the cache drains while the disks spin
+#   # anyway. cachy's own I/O does not count, so the trigger cannot keep the
+#   # disks spun up. Needs backing_disks; works with or without schedules.
+#   wake_trigger:
+#     check_interval: 5m

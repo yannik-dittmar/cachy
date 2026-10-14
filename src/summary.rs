@@ -52,6 +52,8 @@ pub enum Reason {
     Drain,
     /// `cachy daemon`: a scheduled check found work.
     Schedule,
+    /// `cachy daemon`: a wake-triggered check found work.
+    WakeTrigger,
 }
 
 /// How a run ended, which the run hook's `on` filter selects by.

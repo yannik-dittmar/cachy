@@ -866,12 +866,17 @@ impl Daemon {
         lines.iter().filter(|line| line.contains(text)).count()
     }
 
+    /// Whether the daemon has exited: its stderr is closed.
+    pub fn exited(&self) -> bool {
+        self.reader.as_ref().is_none_or(|r| r.is_finished())
+    }
+
     /// Waits until the daemon has logged `n` lines that contain `text`.
     pub fn wait_for_lines(&self, text: &str, n: usize) {
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
-            // Its stderr closed: the daemon exited, and logs nothing more.
-            let exited = self.reader.as_ref().is_none_or(|r| r.is_finished());
+            // It logs nothing more once it exited.
+            let exited = self.exited();
             if self.count(text) >= n {
                 return;
             }

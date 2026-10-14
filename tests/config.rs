@@ -245,6 +245,7 @@ fn example_config_with_its_optional_settings_is_valid() {
         "\n  backing_disks:\n",
         "\n      spindown_timeout: 20m\n",
         "\n    time_limit: 6h\n",
+        "\n  wake_trigger:\n    check_interval: 5m\n",
     ] {
         assert!(example.contains(setting), "not uncommented: {setting:?}");
     }

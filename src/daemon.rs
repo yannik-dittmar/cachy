@@ -7,6 +7,11 @@
 //! clock. At the gate's time limit, the check goes on only if free space is
 //! below the threshold; otherwise it is skipped.
 //!
+//! With a wake trigger, the daemon also looks at the state of the backing
+//! disks every check interval, and performs a check whenever they are awake.
+//! A disk that only cachy's own I/O keeps spun up does not count as awake to
+//! the trigger, so that its checks cannot keep it firing.
+//!
 //! A check that finds the instance lock held, such as by a manual run, is
 //! skipped with a warning, and one that cachy refuses for another reason is
 //! logged; either way, the daemon goes on to its next check.
@@ -60,37 +65,83 @@ pub struct Daemon<'a> {
 }
 
 impl Daemon<'_> {
-    /// Performs the scheduled checks until cachy is asked to stop. An error
-    /// means that the daemon refused to start.
+    /// Performs the scheduled and wake-triggered checks until cachy is asked
+    /// to stop. An error means that the daemon refused to start.
     pub fn serve(&self) -> Result<()> {
-        let (schedules, wake_gate) = match &self.config.daemon {
-            Some(daemon) if !daemon.schedules.is_empty() => {
-                (&daemon.schedules, daemon.wake_gate.as_ref())
-            }
-            _ => bail!("the daemon has nothing to do: set daemon.schedules in the config"),
+        let nothing_to_do = "the daemon has nothing to do: set daemon.schedules or daemon.wake_trigger in the config";
+        let Some(daemon) = &self.config.daemon else {
+            bail!(nothing_to_do);
         };
+        let schedules = &daemon.schedules;
+        let trigger = daemon.wake_trigger.as_ref().zip(self.disks);
+        if schedules.is_empty() && trigger.is_none() {
+            bail!(nothing_to_do);
+        }
         stop::install();
         warn_if_timer_enabled(&systemd_dir());
-        loop {
-            let Some((time, due)) = next_check(schedules, &self.clock.now()) else {
-                bail!("no schedule has a time left");
-            };
+        if let Some((trigger, _)) = trigger {
             log::info!(
-                "next scheduled check at {}",
-                time.strftime("%Y-%m-%d %H:%M %Z")
+                "wake trigger: a check every {} while the backing disks are awake",
+                minutes(trigger.check_interval)
             );
-            if !self.clock.sleep_until(time.timestamp()) {
+        }
+        // The next scheduled check, once known, and the time last logged.
+        let mut scheduled: Option<(Zoned, Vec<String>)> = None;
+        let mut announced: Option<Zoned> = None;
+        // When the wake trigger looks at the backing disks next: at once.
+        let mut next_look = trigger.map(|_| self.clock.now());
+        // The disks that kept the last look from a check, once logged.
+        let mut not_awake: Option<Vec<PathBuf>> = None;
+        loop {
+            if scheduled.is_none() {
+                scheduled = next_check(schedules, &self.clock.now());
+            }
+            if let Some((time, _)) = &scheduled
+                && announced.as_ref() != Some(time)
+            {
+                log::info!(
+                    "next scheduled check at {}",
+                    time.strftime("%Y-%m-%d %H:%M %Z")
+                );
+                announced = Some(time.clone());
+            }
+            let wake = match (scheduled.as_ref().map(|(time, _)| time), &next_look) {
+                (Some(time), Some(look)) => time.min(look).clone(),
+                (Some(time), None) => time.clone(),
+                (None, Some(look)) => look.clone(),
+                (None, None) => bail!("no schedule has a time left"),
+            };
+            if !self.clock.sleep_until(wake.timestamp()) {
                 break;
             }
-            log::info!("scheduled check ({})", due.join(", "));
-            let gate = match (wake_gate, self.disks) {
-                (Some(gate), Some(disks)) => self.wait_at_wake_gate(gate, disks),
-                _ => Gate::Open,
-            };
-            match gate {
-                Gate::Open => self.check(Reason::Schedule),
-                Gate::Skip => {}
-                Gate::Stop => break,
+            let now = self.clock.now();
+            if let Some((_, due)) = scheduled.take_if(|(time, _)| *time <= now) {
+                log::info!("scheduled check ({})", due.join(", "));
+                let gate = match (&daemon.wake_gate, self.disks) {
+                    (Some(gate), Some(disks)) => self.wait_at_wake_gate(gate, disks),
+                    _ => Gate::Open,
+                };
+                match gate {
+                    Gate::Open => self.check(Reason::Schedule),
+                    Gate::Skip => {}
+                    Gate::Stop => break,
+                }
+                // A look that came due meanwhile would be for a check that
+                // just happened.
+                let after = self.clock.now();
+                if let (Some((trigger, _)), Some(look)) = (trigger, &mut next_look)
+                    && *look <= after
+                {
+                    *look = after.checked_add(trigger.check_interval).unwrap_or(after);
+                }
+            } else if let Some((trigger, disks)) = trigger
+                && next_look.as_ref().is_some_and(|look| *look <= now)
+            {
+                next_look = Some(
+                    now.checked_add(trigger.check_interval)
+                        .unwrap_or(now.clone()),
+                );
+                self.look_for_wake_trigger(disks, &now, &mut not_awake);
             }
             if stop::requested() {
                 break;
@@ -98,6 +149,30 @@ impl Daemon<'_> {
         }
         log::info!("daemon stopped");
         Ok(())
+    }
+
+    /// Looks at the backing disks for the wake trigger, at `now`, and
+    /// performs a check if they are awake on others' account. Logs the
+    /// disks that keep it from a check when they differ from `not_awake`,
+    /// those it logged last.
+    fn look_for_wake_trigger(
+        &self,
+        disks: &dyn DiskState,
+        now: &Zoned,
+        not_awake: &mut Option<Vec<PathBuf>>,
+    ) {
+        let asleep = disks.asleep_but_for_own_io(now.timestamp());
+        if asleep.is_empty() {
+            *not_awake = None;
+            log::info!("wake-triggered check: the backing disks are awake");
+            self.check(Reason::WakeTrigger);
+        } else if not_awake.as_ref() != Some(&asleep) {
+            log::info!(
+                "no wake-triggered checks until the backing disks are awake; asleep, or awake only by cachy's own I/O: {}",
+                ids(&asleep)
+            );
+            *not_awake = Some(asleep);
+        }
     }
 
     /// Holds a scheduled check until the backing disks are awake, or until
@@ -185,6 +260,11 @@ impl Daemon<'_> {
             }
             Err(e) => log::error!("the {} refused to run: {e:#}", check_name(reason)),
         }
+        // Whatever cachy did on the backing disks, such as probing them, is
+        // no sign that they are in use.
+        if let Some(disks) = self.disks {
+            disks.own_io();
+        }
     }
 }
 
@@ -192,7 +272,18 @@ impl Daemon<'_> {
 fn check_name(reason: Reason) -> &'static str {
     match reason {
         Reason::Schedule => "scheduled check",
+        Reason::WakeTrigger => "wake-triggered check",
         Reason::Manual | Reason::Drain => "check",
+    }
+}
+
+/// `duration`, for the log, in whole minutes where it is.
+fn minutes(duration: Duration) -> String {
+    let secs = duration.as_secs();
+    if secs.is_multiple_of(60) {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{secs}s")
     }
 }
 

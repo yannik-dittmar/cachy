@@ -44,8 +44,9 @@
 //! field, the number of requests that the disk completed, such as
 //! `/dev/disk/by-id/ata-DISK1 spun_up 100`, gives it I/O counters, by which
 //! cachy tells its own I/O from others'; a disk without them does only I/O
-//! of others. Each look appends the daemon's time to `<file>.looks`, and
-//! each time cachy's own I/O settles, to `<file>.settles`.
+//! of others. Each look appends the daemon's time to `<file>.looks`, each
+//! time cachy tells of its own I/O, to `<file>.own_io`, and each time that
+//! I/O settles, to `<file>.settles`.
 
 use std::cell::RefCell;
 use std::ffi::{OsStr, OsString};
@@ -160,15 +161,20 @@ impl ScriptedDisks {
         }
         // Once the state is read, so that a test that sees the look can
         // change the state for the next one.
-        let mut looks = self.path.as_os_str().to_owned();
-        looks.push(suffix);
+        self.record(now, suffix);
+        disks
+    }
+
+    /// Appends `now` to the record next to the file with `suffix`.
+    fn record(&self, now: Timestamp, suffix: &str) {
+        let mut record = self.path.as_os_str().to_owned();
+        record.push(suffix);
         std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(&looks)
+            .open(&record)
             .and_then(|mut file| io::Write::write_all(&mut file, format!("{now}\n").as_bytes()))
-            .unwrap_or_else(|e| panic!("{DISK_STATE}: cannot record a look: {e}"));
-        disks
+            .unwrap_or_else(|e| panic!("{DISK_STATE}: cannot record to {}: {e}", record.display()));
     }
 }
 
@@ -205,10 +211,11 @@ impl DiskState for ScriptedDisks {
         asleep
     }
 
-    fn own_io(&self) {
+    fn own_io(&self, now: Timestamp) {
         for own_io in self.own_io.borrow_mut().iter_mut() {
             own_io.did_io();
         }
+        self.record(now, ".own_io");
     }
 
     fn own_io_settled(&self, now: Timestamp) {

@@ -159,7 +159,8 @@ impl Daemon<'_> {
             {
                 disks.own_io_settled(now.timestamp());
             }
-            let mut did_io = false;
+            // When cachy's own I/O of a check ended, if one reached the disks.
+            let mut own_io = None;
             if let Some((_, due)) = scheduled.take_if(|(time, _)| *time <= now) {
                 log::info!("scheduled check ({})", due.join(", "));
                 let gate = match (&daemon.wake_gate, self.disks) {
@@ -167,7 +168,7 @@ impl Daemon<'_> {
                     _ => Gate::Open,
                 };
                 match gate {
-                    Gate::Open => did_io = self.check(Check::Scheduled),
+                    Gate::Open => own_io = self.check(Check::Scheduled),
                     Gate::Skip => {}
                     Gate::Stop => break,
                 }
@@ -183,10 +184,12 @@ impl Daemon<'_> {
                 && next_look.as_ref().is_some_and(|look| *look <= now)
             {
                 next_look = Some(later(&now, trigger.check_interval));
-                did_io = self.look_for_wake_trigger(disks, &now, &mut not_awake);
+                own_io = self.look_for_wake_trigger(disks, &now, &mut not_awake);
             }
-            if did_io && trigger.is_some() {
-                settle = Some(later(&self.clock.now(), OWN_IO_SETTLE));
+            if let Some(end) = own_io
+                && trigger.is_some()
+            {
+                settle = Some(later(&end, OWN_IO_SETTLE));
             }
             if stop::requested() {
                 break;
@@ -197,16 +200,16 @@ impl Daemon<'_> {
     }
 
     /// Looks at the backing disks for the wake trigger, at `now`, and
-    /// performs a check if they are awake on others' account; whether that
-    /// check reached them, as [`Daemon::check`] tells. Logs the disks that
-    /// keep it from a check when they differ from `not_awake`, those it
-    /// logged last.
+    /// performs a check if they are awake on others' account; when that
+    /// check's own I/O on them ended, as [`Daemon::check`] tells. Logs the
+    /// disks that keep it from a check when they differ from `not_awake`,
+    /// those it logged last.
     fn look_for_wake_trigger(
         &self,
         disks: &dyn DiskState,
         now: &Zoned,
         not_awake: &mut Option<Vec<PathBuf>>,
-    ) -> bool {
+    ) -> Option<Zoned> {
         let asleep = disks.asleep_but_for_own_io(now.timestamp());
         if asleep.is_empty() {
             *not_awake = None;
@@ -220,7 +223,7 @@ impl Daemon<'_> {
             );
             *not_awake = Some(asleep);
         }
-        false
+        None
     }
 
     /// Holds a scheduled check until the backing disks are awake, or until
@@ -295,10 +298,11 @@ impl Daemon<'_> {
     }
 
     /// Performs `check` and, if it finds work, a run. Whatever happens is
-    /// logged; the daemon goes on either way. Whether the check reached the
-    /// backing disks: one that ran probed them, and one that was refused may
-    /// have; one that found the instance lock held did not.
-    fn check(&self, check: Check) -> bool {
+    /// logged; the daemon goes on either way. When the check's own I/O on
+    /// the backing disks ended, if it reached them: one that ran probed them,
+    /// and one that was refused may have; one that found the instance lock
+    /// held did not.
+    fn check(&self, check: Check) -> Option<Zoned> {
         let options = Options {
             dry_run: false,
             reason: check.reason(),
@@ -319,10 +323,16 @@ impl Daemon<'_> {
         };
         // What cachy did on the backing disks, such as probing them, is no
         // sign that they are in use.
-        if did_io && let Some(disks) = self.disks {
-            disks.own_io();
+        if !did_io {
+            return None;
         }
-        did_io
+        // The settle is measured from this time, which the disks are told,
+        // so that it does not depend on how long telling them takes.
+        let end = self.clock.now();
+        if let Some(disks) = self.disks {
+            disks.own_io(end.timestamp());
+        }
+        Some(end)
     }
 }
 

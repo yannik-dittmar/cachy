@@ -37,9 +37,9 @@ pub trait DiskState {
     /// too; none means that the backing disks are awake on others' account.
     fn asleep_but_for_own_io(&self, now: Timestamp) -> Vec<PathBuf>;
 
-    /// Tells that cachy did I/O on the backing disks until now: until they
+    /// Tells that cachy did I/O on the backing disks until `now`: until they
     /// do I/O of others, it is no sign that they are in use.
-    fn own_io(&self);
+    fn own_io(&self, now: Timestamp);
 
     /// Tells that cachy's own I/O has reached the backing disks by `now`, so
     /// that their I/O from here on is others'. Until then, or until the next
@@ -191,7 +191,7 @@ impl DiskState for SystemDisks {
             .collect()
     }
 
-    fn own_io(&self) {
+    fn own_io(&self, _now: Timestamp) {
         for disk in &self.disks {
             disk.own_io.borrow_mut().did_io();
         }

@@ -593,6 +593,13 @@ fn settles(disks: &std::path::Path) -> Vec<String> {
     records(disks, ".settles")
 }
 
+/// The times at which the daemon told the scripted disks in `disks` of its
+/// own I/O, as the fake records them.
+#[cfg(feature = "fault-injection")]
+fn own_ios(disks: &std::path::Path) -> Vec<String> {
+    records(disks, ".own_io")
+}
+
 /// The lines of the fake's record next to `disks` with `suffix`.
 #[cfg(feature = "fault-injection")]
 fn records(disks: &std::path::Path, suffix: &str) -> Vec<String> {
@@ -786,6 +793,24 @@ fn cachys_own_io_does_not_keep_the_wake_trigger_firing() {
 }
 
 /// Waits until the daemon has told the scripted disks in `disks` `n` times
+/// of its own I/O, that is, until its `n`th check that reached them is over.
+#[cfg(feature = "fault-injection")]
+fn wait_for_own_io(daemon: &common::Daemon, disks: &std::path::Path, n: usize) {
+    use std::time::{Duration, Instant};
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while own_ios(disks).len() < n {
+        assert!(
+            !daemon.exited() && Instant::now() < deadline,
+            "fewer than {n} reports of cachy's own I/O: {:?}; stderr:\n{}",
+            own_ios(disks),
+            daemon.stderr()
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// Waits until the daemon has told the scripted disks in `disks` `n` times
 /// that its own I/O had settled.
 #[cfg(feature = "fault-injection")]
 fn wait_for_settles(daemon: &common::Daemon, disks: &std::path::Path, n: usize) {
@@ -823,7 +848,9 @@ fn while_others_keep_the_backing_disks_busy_the_wake_trigger_checks_every_check_
     .into_iter()
     .enumerate()
     {
-        // A minute after a check, cachy's own I/O has settled.
+        // A minute after a check, cachy's own I/O has settled. The check
+        // must be over first: the minute counts from its end.
+        wait_for_own_io(&daemon, &disks, i + 1);
         daemon.set_clock(settled);
         wait_for_settles(&daemon, &disks, i + 1);
         // Others use the disks.

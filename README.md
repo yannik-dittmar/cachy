@@ -6,7 +6,7 @@ cachy is heavily inspired by [mergerfs-cache-mover](https://github.com/monstermu
 
 ## Status
 
-Early development. Do not use it on real data yet. `cachy run` moves files, skips files in use, recovers from a crash in the middle of a move, and preserves owner, group, mode, xattrs, ACLs and timestamps.
+Early development. Do not use it on real data yet. `cachy run` moves files, skips files in use, recovers from a crash in the middle of a move, and preserves owner, group, mode, xattrs, ACLs and timestamps. `cachy daemon` performs checks on schedules.
 
 ## How it works
 
@@ -74,7 +74,7 @@ Then install the binary, a configuration and the systemd units from [`packaging/
 ```sh
 sudo install -m 755 cachy /usr/local/bin/cachy
 sudo install -D -m 644 cachy.example.yml /etc/cachy/cachy.yml
-sudo install -m 644 packaging/systemd/cachy.service packaging/systemd/cachy.timer /etc/systemd/system/
+sudo install -m 644 packaging/systemd/cachy.service packaging/systemd/cachy.timer packaging/systemd/cachy-daemon.service /etc/systemd/system/
 sudoedit /etc/cachy/cachy.yml
 sudo /usr/local/bin/cachy run --config /etc/cachy/cachy.yml --dry-run
 sudo systemctl daemon-reload
@@ -82,6 +82,17 @@ sudo systemctl enable --now cachy.timer
 ```
 
 `cachy.service` runs `cachy run --config /etc/cachy/cachy.yml` once, as root, and has systemd create the state directory `/var/lib/cachy` (`StateDirectory=cachy`), the default `state_dir`. `cachy.timer` starts it every hour, and catches up on a run missed while the machine was off; a check that finds nothing to do only reads the cache branch's free space, unless a `max_age` makes it walk the cache branch. To run it more often, or only after the cache branch and pools are mounted, override the units with `systemctl edit cachy.timer` or `systemctl edit cachy.service` (such as `RequiresMountsFor=/mnt/cache /mnt/pool /mnt/storage` under `[Unit]`). cachy's log goes to the journal: `journalctl -u cachy`. Exit codes 1 and 2 mark the service failed, so `OnFailure=` catches refusals and failed moves alike.
+
+## Daemon
+
+The timer is the default, and all that most setups need. `cachy daemon` is the alternative: a long-running service that performs a check at each time of the schedules in the config's `daemon` section, and a run whenever a check finds work, just as `cachy run` does. Use it instead of the timer when one config file should hold every schedule, such as a frequent check by day and a nightly one. `cachy-daemon.service` runs it, and is not enabled on install. To switch from the timer to the daemon, set `daemon.schedules` in the config, then:
+
+```sh
+sudo systemctl disable --now cachy.timer
+sudo systemctl enable --now cachy-daemon.service
+```
+
+Schedules are cron expressions of five fields (minute, hour, day of month, month, day of week, with `*`, lists, ranges and steps), or nicknames such as `@hourly` and `@daily`, in the system's time zone. An invalid one is a configuration error. The daemon's checks take the instance lock like any other invocation: a scheduled check that finds a run in progress, such as a manual `cachy run`, is skipped with a warning, and a manual run during a scheduled run refuses to run. If `cachy.timer` is enabled too, the daemon warns at its start. On `SIGTERM` (`systemctl stop`), the daemon stops a run in progress as `cachy run` does and exits. Run summaries of its runs give the reason `schedule`. Its log goes to the journal: `journalctl -u cachy-daemon`.
 
 ## Configuration
 
@@ -105,6 +116,7 @@ cachy reads one YAML file, given with `--config`; [`cachy.example.yml`](cachy.ex
 | `exclude` | `[]` | Gitignore patterns for files and directories that stay on the cache branch. |
 | `keep_empty_dirs` | `false` | Keep the cache-branch directories that a run empties, rather than remove them. |
 | `run_hook` | none | A command to execute after each run, with the run summary on stdin. Its keys: `command` (required, executed by `/bin/sh -c`), `on` (the outcomes `moved`, `nothing_moved` and `failed` that call it; default all three) and `timeout` (default `60s`). |
+| `daemon` | none | What `cachy daemon` does; `cachy run` ignores it. Its key: `schedules` (the cron expressions of the times of its checks; see [Daemon](#daemon)). |
 
 ### Cache pool requirements
 
@@ -128,6 +140,8 @@ Run cachy as root, as the shipped service does. The in-use guard takes kernel fi
 
 A failing run hook never changes the exit code.
 
+`cachy daemon` exits with `0` once it is stopped, even during a run, and with `1` if it refuses to start, such as on an invalid configuration or one without `daemon.schedules`. Its checks do not end it: a refused or failed one is logged, and the daemon goes on to the next.
+
 ## Testing
 
 `cargo test` runs the integration tests with the cache branch on tmpfs (`/dev/shm`). Tests that need a mergerfs cache pool skip themselves when mergerfs or passwordless sudo is missing.
@@ -141,13 +155,13 @@ ci/test-filesystem-pairs.sh /tmp/cachy-fs
 
 `tests/common/mod.rs` documents the environment variables that select the filesystems.
 
-CI also installs the static binary with the shipped systemd units and runs it as `cachy.service`: a run, `systemctl stop` in the middle of a copy, a refusal, and the priorities that the journal records. The script needs systemd, cgroup v2 and passwordless sudo, and replaces any installed cachy and `/etc/cachy/cachy.yml`, so run it only on a disposable machine:
+CI also installs the static binary with the shipped systemd units and runs it as `cachy.service`: a run, `systemctl stop` in the middle of a copy, a refusal, and the priorities that the journal records; then it starts `cachy-daemon.service` with the timer enabled, for the warning, and stops it. The script needs systemd, cgroup v2 and passwordless sudo, and replaces any installed cachy and `/etc/cachy/cachy.yml`, so run it only on a disposable machine:
 
 ```sh
 ci/test-systemd-service.sh target/x86_64-unknown-linux-musl/release/cachy /tmp/cachy-service
 ```
 
-The crash tests kill cachy, or fail a syscall, at every filesystem operation of a run, and check that the next run recovers without losing anything. They need a test-only build of cachy with fault injection; in a normal build they are skipped:
+The crash tests kill cachy, or fail a syscall, at every filesystem operation of a run, and check that the next run recovers without losing anything. They need a test-only build of cachy with fault injection; in a normal build they are skipped. So do most daemon tests (`tests/daemon.rs`), which set the daemon's clock rather than wait for its schedules:
 
 ```sh
 cargo test --features fault-injection

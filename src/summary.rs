@@ -50,6 +50,8 @@ pub enum Reason {
     Manual,
     /// `cachy run --drain`.
     Drain,
+    /// `cachy daemon`: a scheduled check found work.
+    Schedule,
 }
 
 /// How a run ended, which the run hook's `on` filter selects by.

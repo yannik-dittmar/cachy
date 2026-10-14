@@ -20,9 +20,11 @@
 
 use std::ffi::OsStr;
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
-use std::sync::{Mutex, MutexGuard, RwLock};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use rustix::fs::{StatVfs, Timestamps, statvfs};
@@ -360,7 +362,35 @@ impl Fixture {
     /// Unless `config` sets a `state_dir`, the run keeps its state, the
     /// instance lock, in [`Fixture::state_dir`], rather than in the system's.
     pub fn command_waiting_for_frees(&self, config: &str) -> Command {
-        let path = self.scratch.path().join("cachy.yml");
+        self.cachy_command("run", "cachy.yml", config)
+    }
+
+    /// `cachy daemon --config <file>` with the given config file content, as
+    /// [`Fixture::command`] builds `cachy run`. The daemon's config file is
+    /// its own, so that runs started meanwhile do not replace it.
+    pub fn daemon_command(&self, config: &str) -> Command {
+        let mut command = self.cachy_command("daemon", "daemon.yml", config);
+        command.env(FREED_WAIT, "0");
+        command
+    }
+
+    /// Starts `cachy daemon` under `config`, with its schedules in UTC and its
+    /// clock set to `time`; see [`Daemon`].
+    pub fn start_daemon(&self, config: &str, time: &str) -> Daemon {
+        self.start_daemon_with(config, time, &[])
+    }
+
+    /// Like [`Fixture::start_daemon`], with the extra environment `env`.
+    pub fn start_daemon_with(&self, config: &str, time: &str, env: &[(&str, &str)]) -> Daemon {
+        let mut command = self.daemon_command(config);
+        command.envs(env.iter().copied());
+        Daemon::start(command, self.scratch.path(), time)
+    }
+
+    /// `cachy <subcommand> --config <file>`, with `config` written to the
+    /// scratch file `name`; see [`Fixture::command_waiting_for_frees`].
+    fn cachy_command(&self, subcommand: &str, name: &str, config: &str) -> Command {
+        let path = self.scratch.path().join(name);
         let config = if config.contains("state_dir:") {
             config.to_owned()
         } else {
@@ -369,7 +399,7 @@ impl Fixture {
         fs::write(&path, config).unwrap();
         let mut command = Command::new(env!("CARGO_BIN_EXE_cachy"));
         command
-            .args(["run", "--config", path.to_str().unwrap()])
+            .args([subcommand, "--config", path.to_str().unwrap()])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         command
@@ -784,4 +814,97 @@ pub fn set_times(path: &Path, atime: i64, mtime: i64) {
         rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
     )
     .unwrap();
+}
+
+/// A running `cachy daemon` whose clock the test sets: a fault-injection
+/// build reads the time from the file that `CACHY_CLOCK` names, instead of
+/// the system clock. The daemon's stderr is collected line by line as it
+/// comes, so that a test can wait for what it logs.
+pub struct Daemon {
+    child: Child,
+    clock: PathBuf,
+    lines: Arc<Mutex<Vec<String>>>,
+    reader: Option<JoinHandle<()>>,
+}
+
+impl Daemon {
+    fn start(mut command: Command, scratch: &Path, time: &str) -> Daemon {
+        let clock = scratch.join("clock");
+        write_clock(&clock, time);
+        command.env("CACHY_CLOCK", &clock).env("TZ", "UTC");
+        let mut child = spawn(&mut command).expect("spawn cachy daemon");
+        let stderr = child.stderr.take().expect("stderr is piped");
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let collected = Arc::clone(&lines);
+        let reader = thread::spawn(move || {
+            for line in BufReader::new(stderr).lines() {
+                let Ok(line) = line else { break };
+                collected.lock().unwrap().push(line);
+            }
+        });
+        Daemon {
+            child,
+            clock,
+            lines,
+            reader: Some(reader),
+        }
+    }
+
+    /// Sets the daemon's clock to `time`, such as `2026-01-01T03:00:00Z`.
+    pub fn set_clock(&self, time: &str) {
+        write_clock(&self.clock, time);
+    }
+
+    /// What the daemon logged so far.
+    pub fn stderr(&self) -> String {
+        self.lines.lock().unwrap().join("\n")
+    }
+
+    /// The number of lines logged so far that contain `text`.
+    pub fn count(&self, text: &str) -> usize {
+        let lines = self.lines.lock().unwrap();
+        lines.iter().filter(|line| line.contains(text)).count()
+    }
+
+    /// Waits until the daemon has logged `n` lines that contain `text`.
+    pub fn wait_for_lines(&self, text: &str, n: usize) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            // Its stderr closed: the daemon exited, and logs nothing more.
+            let exited = self.reader.as_ref().is_none_or(|r| r.is_finished());
+            if self.count(text) >= n {
+                return;
+            }
+            assert!(
+                !exited && Instant::now() < deadline,
+                "fewer than {n} lines with `{text}` in stderr:\n{}",
+                self.stderr()
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Asks the daemon to stop (`SIGTERM`), and returns how it exited and
+    /// what it logged.
+    pub fn stop(mut self) -> (ExitStatus, String) {
+        kill_process(Pid::from_child(&self.child), Signal::TERM).unwrap();
+        let status = self.child.wait().unwrap();
+        self.reader.take().unwrap().join().unwrap();
+        (status, self.stderr())
+    }
+}
+
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Replaces the clock file at `path` in one step, so that the daemon never
+/// reads half a time.
+fn write_clock(path: &Path, time: &str) {
+    let staged = path.with_extension("new");
+    fs::write(&staged, time).unwrap();
+    fs::rename(&staged, path).unwrap();
 }

@@ -209,19 +209,22 @@ fn example_config_is_valid() {
     assert_exit(&fx.run(&config), 0);
 }
 
-/// `example` with its commented-out `max_age` and `run_hook` settings
-/// enabled.
+/// `example` with its commented-out `max_age`, `run_hook` and `daemon`
+/// settings enabled.
 fn uncomment_optional_settings(example: &str) -> String {
     let mut out = String::new();
-    let mut in_hook = false;
+    let mut in_block = false;
     for line in example.lines() {
-        let line = if line.starts_with("# max_age:") || line.starts_with("# run_hook:") {
-            in_hook = line.starts_with("# run_hook:");
+        let line = if ["# max_age:", "# run_hook:", "# daemon:"]
+            .iter()
+            .any(|key| line.starts_with(key))
+        {
+            in_block = !line.starts_with("# max_age:");
             &line[2..]
-        } else if in_hook && line.starts_with("#   ") {
+        } else if in_block && line.starts_with("#   ") {
             &line[2..]
         } else {
-            in_hook = false;
+            in_block = false;
             line
         };
         out.push_str(line);
@@ -233,7 +236,13 @@ fn uncomment_optional_settings(example: &str) -> String {
 #[test]
 fn example_config_with_its_optional_settings_is_valid() {
     let example = uncomment_optional_settings(&example());
-    for setting in ["\nmax_age: 7d\n", "\nrun_hook:\n", "\n  timeout: 60s\n"] {
+    for setting in [
+        "\nmax_age: 7d\n",
+        "\nrun_hook:\n",
+        "\n  timeout: 60s\n",
+        "\ndaemon:\n",
+        "\n    - '0 3 * * *'\n",
+    ] {
         assert!(example.contains(setting), "not uncommented: {setting:?}");
     }
     let fx = Fixture::new();

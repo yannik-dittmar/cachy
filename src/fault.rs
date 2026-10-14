@@ -30,11 +30,17 @@
 //! that tests that run cachy hundreds of times do not wait each time.
 //! `CACHY_WRITE_DELAY_MS=<ms>` makes every write wait first, so that a test
 //! can watch moves while they copy.
+//!
+//! `CACHY_CLOCK=<file>` gives the daemon a [`ManualClock`]: the time is what
+//! the file holds, such as `2026-01-01T03:00:00Z`, read anew whenever the
+//! daemon looks at the clock, so that a test moves time on by rewriting the
+//! file. `CACHY_SYSTEMD_DIR=<dir>` makes the daemon look for an enabled
+//! `cachy.timer` in `<dir>` rather than in `/etc/systemd/system`.
 
 use std::ffi::{OsStr, OsString};
 use std::io;
 use std::os::fd::{BorrowedFd, OwnedFd};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -43,6 +49,10 @@ use anyhow::{Context, Result, bail};
 
 use rustix::fs::Timespec;
 
+use jiff::tz::TimeZone;
+use jiff::{Timestamp, Zoned};
+
+use crate::clock::{self, Clock, SystemClock};
 use crate::fsops::{FsOps, FsStat, Lease, RealFs, Stat};
 
 const FAULT: &str = "CACHY_FAULT";
@@ -52,6 +62,52 @@ const TRACE: &str = "CACHY_FAULT_TRACE";
 const RETIRE_WAIT: &str = "CACHY_RETIRE_WAIT_MS";
 const FREED_WAIT: &str = "CACHY_FREED_WAIT_MS";
 const WRITE_DELAY: &str = "CACHY_WRITE_DELAY_MS";
+const CLOCK: &str = "CACHY_CLOCK";
+const SYSTEMD_DIR: &str = "CACHY_SYSTEMD_DIR";
+
+/// How often a [`ManualClock`] that is waiting reads its file.
+const MANUAL_CLOCK_POLL: Duration = Duration::from_millis(5);
+
+/// A clock that tells the time that a file holds; see the module docs.
+pub struct ManualClock {
+    path: PathBuf,
+}
+
+impl ManualClock {
+    fn timestamp(&self) -> Timestamp {
+        let text = std::fs::read_to_string(&self.path)
+            .unwrap_or_else(|e| panic!("{CLOCK}: cannot read {}: {e}", self.path.display()));
+        text.trim()
+            .parse()
+            .unwrap_or_else(|e| panic!("{CLOCK}: `{text}` is not a time: {e}"))
+    }
+}
+
+impl Clock for ManualClock {
+    fn now(&self) -> Zoned {
+        self.timestamp().to_zoned(TimeZone::system())
+    }
+
+    fn sleep_until(&self, time: Timestamp) -> bool {
+        clock::sleep_until(time, MANUAL_CLOCK_POLL, || self.timestamp())
+    }
+}
+
+/// The daemon's clock: a [`ManualClock`] if `CACHY_CLOCK` is set, else the
+/// system's.
+pub fn clock() -> Box<dyn Clock> {
+    match std::env::var_os(CLOCK) {
+        Some(path) => Box::new(ManualClock {
+            path: PathBuf::from(path),
+        }),
+        None => Box::new(SystemClock),
+    }
+}
+
+/// The directory set by `CACHY_SYSTEMD_DIR`, if any.
+pub fn systemd_dir() -> Option<PathBuf> {
+    std::env::var_os(SYSTEMD_DIR).map(PathBuf::from)
+}
 
 /// The retire wait set by `CACHY_RETIRE_WAIT_MS`, if any.
 pub fn retire_wait() -> Option<Duration> {

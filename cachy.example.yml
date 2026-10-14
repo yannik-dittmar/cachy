@@ -148,3 +148,20 @@ keep_empty_dirs: false
 #   # logged, but never changes cachy's exit code.
 #   # Default: 60s.
 #   timeout: 60s
+
+# Optional. What `cachy daemon` does; `cachy run` ignores it. The daemon is an
+# alternative to cachy.timer, not enabled on install; see the README's Daemon
+# section.
+# daemon:
+#   # The times at which the daemon performs a check, which starts a run if it
+#   # finds work, as for `cachy run`. Each is a cron expression of five fields,
+#   #   minute hour day-of-month month day-of-week
+#   # with *, lists (1,15), ranges (1-5) and steps (*/10), or a nickname:
+#   # @hourly, @daily, @weekly, @monthly. Day of week 0 (or 7) is Sunday.
+#   # Times are in the system's time zone. A check that finds a run in
+#   # progress is skipped.
+#   schedules:
+#     # Every 15 minutes by day,
+#     - '*/15 8-22 * * *'
+#     # and once at night.
+#     - '0 3 * * *'

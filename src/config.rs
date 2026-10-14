@@ -8,6 +8,7 @@ use serde::Deserialize;
 
 use crate::exclude::Exclusions;
 use crate::layout::BranchSpec;
+use crate::schedule::Schedule;
 use crate::summary::RunOutcome;
 
 #[derive(Debug, Deserialize)]
@@ -62,6 +63,18 @@ pub struct Config {
     /// summary.
     #[serde(default)]
     pub run_hook: Option<RunHook>,
+    /// What `cachy daemon` does; `cachy run` ignores it.
+    #[serde(default)]
+    pub daemon: Option<Daemon>,
+}
+
+/// The daemon's settings.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Daemon {
+    /// The times of the scheduled checks.
+    #[serde(default, deserialize_with = "schedules")]
+    pub schedules: Vec<Schedule>,
 }
 
 /// The run hook: a shell command that receives the run summary on stdin.
@@ -393,6 +406,14 @@ fn duration<'de, D: serde::Deserializer<'de>>(de: D) -> Result<Duration, D::Erro
     }
 
     de.deserialize_str(DurationVisitor)
+}
+
+fn schedules<'de, D: serde::Deserializer<'de>>(de: D) -> Result<Vec<Schedule>, D::Error> {
+    Vec::<String>::deserialize(de)?
+        .iter()
+        .map(|text| Schedule::parse(text))
+        .collect::<Result<_, _>>()
+        .map_err(serde::de::Error::custom)
 }
 
 fn optional_duration<'de, D: serde::Deserializer<'de>>(

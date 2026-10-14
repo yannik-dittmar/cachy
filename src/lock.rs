@@ -5,19 +5,42 @@
 //! process exits, however it exits, so a crash never leaves it held. The file
 //! itself stays: deleting it could let two runs lock two different files.
 
+use std::fmt;
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use rustix::fs::{FlockOperation, flock};
 
 /// The mode of the state directory, if cachy creates it.
 const STATE_DIR_MODE: u32 = 0o755;
 /// The mode of the files that hold instance locks.
 const LOCK_MODE: u32 = 0o644;
+
+/// The error of an invocation that found the instance lock held by another,
+/// which the daemon tells apart from other refusals with
+/// `anyhow::Error::downcast_ref`.
+#[derive(Debug)]
+pub struct Held {
+    cache_branch: PathBuf,
+    lock_file: PathBuf,
+}
+
+impl fmt::Display for Held {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(
+            f,
+            "another cachy run on cache branch {} is in progress (it holds {})",
+            self.cache_branch.display(),
+            self.lock_file.display()
+        )
+    }
+}
+
+impl std::error::Error for Held {}
 
 /// The instance lock on a cache branch, held until dropped.
 pub struct InstanceLock {
@@ -26,7 +49,7 @@ pub struct InstanceLock {
 
 impl InstanceLock {
     /// Takes the lock on `cache_branch` in `state_dir`, creating the state
-    /// directory if needed. Fails if another run holds it.
+    /// directory if needed. Fails with [`Held`] if another run holds it.
     pub fn acquire(state_dir: &Path, cache_branch: &Path) -> Result<InstanceLock> {
         let canonical = fs::canonicalize(cache_branch)
             .with_context(|| format!("cannot resolve cache branch {}", cache_branch.display()))?;
@@ -46,11 +69,11 @@ impl InstanceLock {
             .with_context(|| format!("cannot open instance lock {}", path.display()))?;
         match flock(&file, FlockOperation::NonBlockingLockExclusive) {
             Ok(()) => Ok(InstanceLock { _file: file }),
-            Err(e) if io::Error::from(e).kind() == io::ErrorKind::WouldBlock => bail!(
-                "another cachy run on cache branch {} is in progress (it holds {})",
-                canonical.display(),
-                path.display()
-            ),
+            Err(e) if io::Error::from(e).kind() == io::ErrorKind::WouldBlock => Err(Held {
+                cache_branch: canonical,
+                lock_file: path,
+            }
+            .into()),
             Err(e) => Err(e).with_context(|| format!("cannot lock {}", path.display())),
         }
     }

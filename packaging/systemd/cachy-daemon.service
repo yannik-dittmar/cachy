@@ -1,0 +1,34 @@
+# The cachy daemon: performs a check at each time of the schedules in the
+# config's daemon section, and a run whenever one finds work. Not enabled on
+# install: use it instead of cachy.timer; see the README's Daemon section.
+[Unit]
+Description=cachy daemon: move files off the mergerfs cache branch on schedules
+Documentation=https://github.com/yannik-dittmar/cachy
+# The cache branch, cache pool and backing branches must be mounted. Add them
+# here, such as RequiresMountsFor=/mnt/cache /mnt/pool /mnt/storage, with
+# `systemctl edit cachy-daemon.service`.
+After=local-fs.target remote-fs.target
+
+[Service]
+Type=exec
+ExecStart=/usr/local/bin/cachy daemon --config /etc/cachy/cachy.yml
+# An invalid config makes the daemon exit with code 1 at its start; fix it and
+# restart the service. Anything else that stops it is retried.
+Restart=on-failure
+RestartSec=1min
+RestartPreventExitStatus=1
+# Creates /var/lib/cachy, the default state_dir, which holds the instance lock
+# that keeps the daemon's runs and any other cachy run apart.
+StateDirectory=cachy
+StateDirectoryMode=0700
+# cachy runs as root, so that it may take leases on, read and recreate the
+# files of every user. Moves yield to other work.
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+# systemctl stop sends SIGTERM: a run in progress aborts its copies, lets the
+# moves that already published finish, and the daemon exits within seconds.
+KillMode=mixed
+
+[Install]
+WantedBy=multi-user.target

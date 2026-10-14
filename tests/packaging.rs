@@ -63,6 +63,48 @@ fn timer_starts_the_service_on_a_schedule_once_enabled() {
     );
 }
 
+#[test]
+fn daemon_service_runs_the_daemon_with_the_documented_config() {
+    let service = shipped("packaging/systemd/cachy-daemon.service");
+
+    assert_eq!(
+        unit_values(&service, "Service", "ExecStart"),
+        [format!(
+            "/usr/local/bin/cachy daemon --config {CONFIG_PATH}"
+        )]
+    );
+    assert_eq!(
+        unit_values(&service, "Service", "StateDirectory"),
+        ["cachy"]
+    );
+    // Enabled only by hand, as the README explains.
+    assert_eq!(
+        unit_values(&service, "Install", "WantedBy"),
+        ["multi-user.target"]
+    );
+}
+
+#[test]
+fn readme_explains_when_to_enable_the_daemon_instead_of_the_timer() {
+    let readme = shipped("README.md");
+    let install = readme
+        .split("\n## Installation\n")
+        .nth(1)
+        .expect("README has an Installation section");
+    let install = install.split("\n## ").next().unwrap();
+    let daemon = readme
+        .split("\n## Daemon\n")
+        .nth(1)
+        .expect("README has a Daemon section");
+    let daemon = daemon.split("\n## ").next().unwrap();
+
+    // The default setup enables the timer, never the daemon.
+    assert!(install.contains("systemctl enable --now cachy.timer"));
+    assert!(!install.contains("enable --now cachy-daemon"));
+    assert!(daemon.contains("systemctl disable --now cachy.timer"));
+    assert!(daemon.contains("systemctl enable --now cachy-daemon.service"));
+}
+
 /// The keys that `cachy.example.yml` sets or shows commented out, such as
 /// `max_age` and the run hook's `timeout`.
 fn example_keys() -> Vec<String> {

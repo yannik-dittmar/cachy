@@ -8,6 +8,7 @@ use serde::Deserialize;
 
 use crate::exclude::Exclusions;
 use crate::layout::BranchSpec;
+use crate::schedule::Schedule;
 use crate::summary::RunOutcome;
 
 #[derive(Debug, Deserialize)]
@@ -62,6 +63,89 @@ pub struct Config {
     /// summary.
     #[serde(default)]
     pub run_hook: Option<RunHook>,
+    /// What `cachy daemon` does; `cachy run` ignores it.
+    #[serde(default)]
+    pub daemon: Option<DaemonConfig>,
+}
+
+/// The daemon's settings.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DaemonConfig {
+    /// The times of the scheduled checks.
+    #[serde(default, deserialize_with = "schedules")]
+    pub schedules: Vec<Schedule>,
+    /// The disks under the backing pool, all of which must be spun up for
+    /// the backing disks to be awake.
+    #[serde(default, deserialize_with = "backing_disks")]
+    pub backing_disks: Vec<BackingDisk>,
+    /// Holds each scheduled check until the backing disks are awake.
+    #[serde(default)]
+    pub wake_gate: Option<WakeGate>,
+    /// Performs a check every check interval while the backing disks are
+    /// awake.
+    #[serde(default)]
+    pub wake_trigger: Option<WakeTrigger>,
+}
+
+impl DaemonConfig {
+    /// Checks the setting `key`, if set, of something that watches the
+    /// backing disks (it `does` them): it needs backing disks, and its
+    /// duration `duration_key` must be above 0s.
+    fn check_disk_watcher(
+        &self,
+        key: &str,
+        does: &str,
+        duration_key: &str,
+        duration: Option<Duration>,
+    ) -> Result<()> {
+        let Some(duration) = duration else {
+            return Ok(());
+        };
+        if self.backing_disks.is_empty() {
+            bail!("daemon.{key} needs daemon.backing_disks, the disks it {does}");
+        }
+        if duration.is_zero() {
+            bail!("daemon.{key}: {duration_key} must be above 0s");
+        }
+        Ok(())
+    }
+}
+
+/// Where the stable IDs of disks are.
+pub const DISK_ID_DIR: &str = "/dev/disk/by-id/";
+
+/// A backing disk.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackingDisk {
+    /// The disk's stable ID: a path in [`DISK_ID_DIR`].
+    pub id: PathBuf,
+    /// How long the disk stays spun up after its last I/O, for when its
+    /// power mode cannot be read; if unset, only I/O since the previous look
+    /// means it is spun up.
+    #[serde(default, deserialize_with = "optional_duration")]
+    pub spindown_timeout: Option<Duration>,
+}
+
+/// The wake gate's settings.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WakeGate {
+    /// How long a scheduled check waits for the backing disks to wake. Then
+    /// it goes on only if free space is below the threshold.
+    #[serde(deserialize_with = "duration")]
+    pub time_limit: Duration,
+}
+
+/// The wake trigger's settings.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WakeTrigger {
+    /// How often the wake trigger looks at the backing disks, and so how
+    /// often it performs a check while they are awake.
+    #[serde(default = "default_check_interval", deserialize_with = "duration")]
+    pub check_interval: Duration,
 }
 
 /// The run hook: a shell command that receives the run summary on stdin.
@@ -254,6 +338,10 @@ fn default_hook_timeout() -> Duration {
     Duration::from_secs(60)
 }
 
+fn default_check_interval() -> Duration {
+    Duration::from_secs(5 * 60)
+}
+
 fn default_minimum_age() -> Duration {
     Duration::from_secs(15 * 60)
 }
@@ -290,6 +378,12 @@ impl Config {
             && hook.timeout.is_zero()
         {
             bail!("run_hook: timeout must be above 0s");
+        }
+        if let Some(daemon) = &config.daemon {
+            let gate = daemon.wake_gate.as_ref().map(|gate| gate.time_limit);
+            daemon.check_disk_watcher("wake_gate", "waits for", "time_limit", gate)?;
+            let trigger = daemon.wake_trigger.as_ref().map(|t| t.check_interval);
+            daemon.check_disk_watcher("wake_trigger", "looks at", "check_interval", trigger)?;
         }
         Ok(config)
     }
@@ -393,6 +487,37 @@ fn duration<'de, D: serde::Deserializer<'de>>(de: D) -> Result<Duration, D::Erro
     }
 
     de.deserialize_str(DurationVisitor)
+}
+
+fn schedules<'de, D: serde::Deserializer<'de>>(de: D) -> Result<Vec<Schedule>, D::Error> {
+    Vec::<String>::deserialize(de)?
+        .iter()
+        .map(|text| Schedule::parse(text))
+        .collect::<Result<_, _>>()
+        .map_err(serde::de::Error::custom)
+}
+
+fn backing_disks<'de, D: serde::Deserializer<'de>>(de: D) -> Result<Vec<BackingDisk>, D::Error> {
+    let disks = Vec::<BackingDisk>::deserialize(de)?;
+    for (i, disk) in disks.iter().enumerate() {
+        let id = disk.id.display();
+        let name = disk
+            .id
+            .to_str()
+            .and_then(|id| id.strip_prefix(DISK_ID_DIR))
+            .unwrap_or_default();
+        if name.is_empty() || name.contains('/') {
+            return Err(serde::de::Error::custom(format!(
+                "backing disk `{id}` is not a stable device ID: expected a path in {DISK_ID_DIR}"
+            )));
+        }
+        if disks[..i].iter().any(|other| other.id == disk.id) {
+            return Err(serde::de::Error::custom(format!(
+                "backing disk `{id}` is listed twice"
+            )));
+        }
+    }
+    Ok(disks)
 }
 
 fn optional_duration<'de, D: serde::Deserializer<'de>>(

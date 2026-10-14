@@ -10,12 +10,22 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 
-use crate::config::RunHook;
+use crate::config::{Config, RunHook};
 use crate::log;
+use crate::run::Outcome;
 use crate::stop;
 use crate::summary::Summary;
 
 const POLL: Duration = Duration::from_millis(20);
+
+/// Calls the configured run hook, if any, with the summary of `outcome`, if it
+/// has one. Call it after the run has released the instance lock, so that a
+/// slow hook never holds up the next run.
+pub fn after(config: &Config, outcome: &Outcome) {
+    if let (Some(hook), Some(summary)) = (&config.run_hook, &outcome.summary) {
+        call(hook, summary);
+    }
+}
 
 /// Executes `hook` with `summary` on its stdin, unless its `on` filter
 /// excludes the run's outcome, and waits for it to exit, or kills it once its

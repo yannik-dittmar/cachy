@@ -6,7 +6,9 @@
 #   - journald records each log line's priority;
 #   - systemctl stop mid-copy stops the run cleanly, with exit code 2, and the
 #     next run moves everything;
-#   - a refusal (exit code 1) marks the unit failed.
+#   - a refusal (exit code 1) marks the unit failed;
+#   - cachy-daemon.service warns that cachy.timer is enabled too, and stops
+#     cleanly, with exit code 0.
 # Replaces any installed cachy and its config. Needs systemd as PID 1, root
 # through passwordless sudo and cgroup v2; meant for a disposable CI runner.
 #
@@ -33,15 +35,16 @@ mark() {
   since=$(sudo journalctl --lines=1 --output=export | sed -n 's/^__CURSOR=//p')
 }
 
-# The messages of cachy.service since the last mark, at priority $1 or more
-# urgent.
+# The messages of unit $2 (default cachy.service) since the last mark, at
+# priority $1 or more urgent.
 journal() {
   sudo journalctl --sync
-  sudo journalctl --output=cat --priority="$1" --unit=cachy.service --after-cursor="$since"
+  sudo journalctl --output=cat --priority="$1" --unit="${2:-cachy.service}" --after-cursor="$since"
 }
 
+# The exit status of unit $1 (default cachy.service).
 exit_status() {
-  systemctl show --property=ExecMainStatus --value cachy.service
+  systemctl show --property=ExecMainStatus --value "${1:-cachy.service}"
 }
 
 # Path and SHA-256 of every file below $1, sorted.
@@ -54,8 +57,11 @@ on_exit() {
   if [ "$status" -ne 0 ]; then
     echo "--- journal of cachy.service" >&2
     sudo journalctl --no-pager --unit=cachy.service >&2 || true
+    echo "--- journal of cachy-daemon.service" >&2
+    sudo journalctl --no-pager --unit=cachy-daemon.service >&2 || true
   fi
-  sudo systemctl stop cachy.service 2>/dev/null || true
+  sudo systemctl stop cachy.service cachy-daemon.service 2>/dev/null || true
+  sudo systemctl disable cachy.timer 2>/dev/null || true
   sudo rm -rf "$dropin"
   sudo systemctl daemon-reload
   sudo umount "$cache" 2>/dev/null || true
@@ -64,8 +70,10 @@ trap on_exit EXIT
 
 echo "--- install"
 sudo install -m 755 "$binary" /usr/local/bin/cachy
-sudo install -m 644 "$repo/packaging/systemd/cachy.service" "$repo/packaging/systemd/cachy.timer" /etc/systemd/system/
-systemd-analyze verify /etc/systemd/system/cachy.service /etc/systemd/system/cachy.timer
+sudo install -m 644 "$repo/packaging/systemd/cachy.service" "$repo/packaging/systemd/cachy.timer" \
+  "$repo/packaging/systemd/cachy-daemon.service" /etc/systemd/system/
+systemd-analyze verify /etc/systemd/system/cachy.service /etc/systemd/system/cachy.timer \
+  /etc/systemd/system/cachy-daemon.service
 mkdir -p "$cache" "$backing"
 sudo mount -t tmpfs -o size=1G cachy-test-cache "$cache"
 sudo mkdir -p /etc/cachy
@@ -78,6 +86,10 @@ target: 2T
 minimum_age: 0s
 # Reading files for their checksums changes their atimes.
 order: mtime
+# Only for cachy-daemon.service; cachy run ignores it.
+daemon:
+  schedules:
+    - '0 3 * * *'
 EOF
 # No state_dir in the config: the default, /var/lib/cachy, is the directory
 # that StateDirectory= creates.
@@ -144,6 +156,27 @@ for file in big.bin later.txt; do
     || fail "$file did not arrive intact"
 done
 
+echo "--- the daemon warns about the enabled timer and stops cleanly"
+sudo systemctl enable cachy.timer
+mark
+sudo systemctl start cachy-daemon.service
+waiting=
+for _ in $(seq 100); do
+  if grep -q '^cachy: info: next scheduled check at' <<<"$(journal info cachy-daemon.service)"; then
+    waiting=1
+    break
+  fi
+  sleep 0.1
+done
+[ -n "$waiting" ] || fail "the daemon never waited for its scheduled check"
+grep -q '^cachy: warning: cachy.timer is enabled' <<<"$(journal warning cachy-daemon.service)" \
+  || fail "no warning that cachy.timer is enabled too"
+sudo systemctl stop cachy-daemon.service
+[ "$(exit_status cachy-daemon.service)" = 0 ] \
+  || fail "daemon exit status $(exit_status cachy-daemon.service), not 0"
+[ "$(systemctl is-failed cachy-daemon.service)" != failed ] || fail "the stopped daemon's unit failed"
+sudo systemctl disable cachy.timer
+
 echo "--- a refusal fails the unit"
 echo 'treshold: 5G' | sudo tee -a /etc/cachy/cachy.yml >/dev/null
 mark
@@ -155,4 +188,4 @@ fi
 grep -q '^cachy: error: .*unknown field `treshold`' <<<"$(journal err)" || fail "no error naming the unknown key"
 sudo systemctl reset-failed cachy.service
 
-echo "OK: cachy.service runs cachy as documented"
+echo "OK: cachy.service and cachy-daemon.service run cachy as documented"

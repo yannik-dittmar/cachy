@@ -75,13 +75,21 @@ impl Outcome {
     }
 }
 
-/// How `cachy run` was invoked.
+/// How a run was started.
 #[derive(Clone, Copy)]
 pub struct Options {
     /// Write nothing; print what a run would do instead.
     pub dry_run: bool,
+    /// Why cachy starts the run, which the run summary records.
+    /// [`Reason::Drain`] skips the check and moves every eligible move unit.
+    pub reason: Reason,
+}
+
+impl Options {
     /// Skip the check and move every eligible move unit.
-    pub drain: bool,
+    fn drain(self) -> bool {
+        matches!(self.reason, Reason::Drain)
+    }
 }
 
 /// Free space should grow by at least the bytes moved divided by this; less
@@ -122,12 +130,7 @@ pub fn run(
     let started = Instant::now();
     let cache_branch = Branch::open(&config.cache_branch)
         .with_context(|| format!("cannot open cache branch {}", config.cache_branch.display()))?;
-    let reason = if options.drain {
-        Reason::Drain
-    } else {
-        Reason::Manual
-    };
-    let mut summary = Summary::new(reason, &cache_branch.path);
+    let mut summary = Summary::new(options.reason, &cache_branch.path);
     // Before anything writes: another run's moves would look like leftovers
     // to recovery.
     let _lock = InstanceLock::acquire(&config.state_dir, &cache_branch.path)?;
@@ -202,7 +205,7 @@ pub fn run(
     };
     summary.free_before = Some(free_before);
     let below_threshold = free_before < threshold;
-    if !options.drain && !below_threshold && config.max_age.is_none() {
+    if !options.drain() && !below_threshold && config.max_age.is_none() {
         no_work(free_before, threshold, options);
         return Ok(without_run(outcome, summary));
     }
@@ -248,7 +251,7 @@ pub fn run(
         log::info!("move units past the max age of {max_age:?}: {past_max_age}");
     }
 
-    let budget = if options.drain {
+    let budget = if options.drain() {
         log::info!("draining: moving every eligible move unit");
         None
     } else if below_threshold {
@@ -331,7 +334,7 @@ pub fn run(
         Ok(stat) if stopped => summary.free_after = Some(stat.free),
         Ok(stat) => {
             let freed = |free: u64| free.saturating_sub(free_before);
-            let target_missed = |free: u64| below_threshold && !options.drain && free < target;
+            let target_missed = |free: u64| below_threshold && !options.drain() && free < target;
             let frees_missing = |free: u64| freed(free) < moved_bytes / FREED_DIVISOR;
             // Waiting helps the target only while some moved bytes have yet
             // to show as free.

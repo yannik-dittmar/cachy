@@ -1,4 +1,8 @@
+mod ata;
+mod clock;
 mod config;
+mod daemon;
+mod disk;
 mod exclude;
 #[cfg(feature = "fault-injection")]
 mod fault;
@@ -14,6 +18,7 @@ mod proc_scan;
 mod recovery;
 mod run;
 mod scan;
+mod schedule;
 mod stop;
 mod summary;
 mod transaction;
@@ -26,7 +31,9 @@ use anyhow::Context;
 use clap::{Parser, Subcommand};
 
 use config::Config;
+use daemon::Daemon;
 use run::{Options, run};
+use summary::Reason;
 
 /// Exit code when cachy refused to run.
 const EXIT_REFUSED: u8 = 1;
@@ -57,6 +64,13 @@ enum Command {
         /// Override the configured max age, such as `7d`.
         #[arg(long, value_parser = max_age)]
         max_age: Option<Duration>,
+    },
+    /// Perform a check at each time of the configured schedules, and a run
+    /// whenever one finds work, until stopped with SIGTERM.
+    Daemon {
+        /// Path to the YAML configuration file.
+        #[arg(long)]
+        config: PathBuf,
     },
 }
 
@@ -92,6 +106,31 @@ fn probe_fs() -> anyhow::Result<fault::FaultyFs> {
     fault::FaultyFs::probe_from_env()
 }
 
+/// The daemon's clock.
+#[cfg(not(feature = "fault-injection"))]
+fn clock() -> Box<dyn clock::Clock> {
+    Box::new(clock::SystemClock)
+}
+
+/// The daemon's clock: one that a test sets, if the environment asks for it.
+#[cfg(feature = "fault-injection")]
+fn clock() -> Box<dyn clock::Clock> {
+    fault::clock()
+}
+
+/// The state of the daemon's backing disks.
+#[cfg(not(feature = "fault-injection"))]
+fn disk_state(disks: &[config::BackingDisk]) -> anyhow::Result<Box<dyn disk::DiskState>> {
+    Ok(Box::new(disk::SystemDisks::open(disks)?))
+}
+
+/// The state of the daemon's backing disks: scripted by a test, if the
+/// environment asks for it.
+#[cfg(feature = "fault-injection")]
+fn disk_state(disks: &[config::BackingDisk]) -> anyhow::Result<Box<dyn disk::DiskState>> {
+    fault::disk_state(disks)
+}
+
 fn main() -> ExitCode {
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
@@ -120,19 +159,41 @@ fn main() -> ExitCode {
                 }
                 Ok(config)
             });
-            let options = Options { dry_run, drain };
+            let reason = if drain { Reason::Drain } else { Reason::Manual };
+            let options = Options { dry_run, reason };
             let ran = config.and_then(|config| {
                 let outcome = run(&fs()?, &probe_fs()?, &config, options)?;
-                // After the run has released the instance lock, so that a
-                // slow hook never holds up the next run.
-                if let (Some(hook), Some(summary)) = (&config.run_hook, &outcome.summary) {
-                    hook::call(hook, summary);
-                }
+                hook::after(&config, &outcome);
                 Ok(outcome)
             });
             match ran {
                 Ok(outcome) if outcome.succeeded() => ExitCode::SUCCESS,
                 Ok(_) => ExitCode::from(EXIT_MOVE_FAILED),
+                Err(e) => {
+                    log::error!("{e:#}");
+                    ExitCode::from(EXIT_REFUSED)
+                }
+            }
+        }
+        Command::Daemon { config } => {
+            let served = Config::load(&config).and_then(|config| {
+                let disks = match &config.daemon {
+                    Some(daemon) if !daemon.backing_disks.is_empty() => {
+                        Some(disk_state(&daemon.backing_disks)?)
+                    }
+                    _ => None,
+                };
+                Daemon {
+                    fs: &fs()?,
+                    probe_fs: &probe_fs()?,
+                    config: &config,
+                    clock: &*clock(),
+                    disks: disks.as_deref(),
+                }
+                .serve()
+            });
+            match served {
+                Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
                     log::error!("{e:#}");
                     ExitCode::from(EXIT_REFUSED)

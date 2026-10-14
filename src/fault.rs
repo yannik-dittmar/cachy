@@ -30,11 +30,29 @@
 //! that tests that run cachy hundreds of times do not wait each time.
 //! `CACHY_WRITE_DELAY_MS=<ms>` makes every write wait first, so that a test
 //! can watch moves while they copy.
+//!
+//! `CACHY_CLOCK=<file>` gives the daemon a [`ManualClock`]: the time is what
+//! the file holds, such as `2026-01-01T03:00:00Z`, read anew whenever the
+//! daemon looks at the clock, so that a test moves time on by rewriting the
+//! file. `CACHY_SYSTEMD_DIR=<dir>` makes the daemon look for an enabled
+//! `cachy.timer` in `<dir>` rather than in `/etc/systemd/system`.
+//!
+//! `CACHY_DISK_STATE=<file>` gives the daemon [`ScriptedDisks`] instead of
+//! the real backing disks: each line of the file is a disk's ID and `spun_up`
+//! or `asleep`, such as `/dev/disk/by-id/ata-DISK1 spun_up`, read anew whenever
+//! the daemon looks. A disk that the file does not list is asleep. A third
+//! field, the number of requests that the disk completed, such as
+//! `/dev/disk/by-id/ata-DISK1 spun_up 100`, gives it I/O counters, by which
+//! cachy tells its own I/O from others'; a disk without them does only I/O
+//! of others. Each look appends the daemon's time to `<file>.looks`, each
+//! time cachy tells of its own I/O, to `<file>.own_io`, and each time that
+//! I/O settles, to `<file>.settles`.
 
+use std::cell::RefCell;
 use std::ffi::{OsStr, OsString};
 use std::io;
 use std::os::fd::{BorrowedFd, OwnedFd};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -43,6 +61,12 @@ use anyhow::{Context, Result, bail};
 
 use rustix::fs::Timespec;
 
+use jiff::tz::TimeZone;
+use jiff::{Timestamp, Zoned};
+
+use crate::clock::{self, Clock, SystemClock};
+use crate::config::BackingDisk;
+use crate::disk::{Counters, DiskState, OwnIo, SystemDisks};
 use crate::fsops::{FsOps, FsStat, Lease, RealFs, Stat};
 
 const FAULT: &str = "CACHY_FAULT";
@@ -52,6 +76,178 @@ const TRACE: &str = "CACHY_FAULT_TRACE";
 const RETIRE_WAIT: &str = "CACHY_RETIRE_WAIT_MS";
 const FREED_WAIT: &str = "CACHY_FREED_WAIT_MS";
 const WRITE_DELAY: &str = "CACHY_WRITE_DELAY_MS";
+const CLOCK: &str = "CACHY_CLOCK";
+const SYSTEMD_DIR: &str = "CACHY_SYSTEMD_DIR";
+const DISK_STATE: &str = "CACHY_DISK_STATE";
+
+/// How often a [`ManualClock`] that is waiting reads its file.
+const MANUAL_CLOCK_POLL: Duration = Duration::from_millis(5);
+
+/// A clock that tells the time that a file holds; see the module docs.
+pub struct ManualClock {
+    path: PathBuf,
+}
+
+impl ManualClock {
+    fn timestamp(&self) -> Timestamp {
+        let text = std::fs::read_to_string(&self.path)
+            .unwrap_or_else(|e| panic!("{CLOCK}: cannot read {}: {e}", self.path.display()));
+        text.trim()
+            .parse()
+            .unwrap_or_else(|e| panic!("{CLOCK}: `{text}` is not a time: {e}"))
+    }
+}
+
+impl Clock for ManualClock {
+    fn now(&self) -> Zoned {
+        self.timestamp().to_zoned(TimeZone::system())
+    }
+
+    fn sleep_until(&self, time: Timestamp) -> bool {
+        clock::sleep_until(time, MANUAL_CLOCK_POLL, || self.timestamp())
+    }
+}
+
+/// The daemon's clock: a [`ManualClock`] if `CACHY_CLOCK` is set, else the
+/// system's.
+pub fn clock() -> Box<dyn Clock> {
+    match std::env::var_os(CLOCK) {
+        Some(path) => Box::new(ManualClock {
+            path: PathBuf::from(path),
+        }),
+        None => Box::new(SystemClock),
+    }
+}
+
+/// Backing disks whose state a file holds; see the module docs.
+pub struct ScriptedDisks {
+    path: PathBuf,
+    ids: Vec<PathBuf>,
+    /// For each of `ids`.
+    own_io: RefCell<Vec<OwnIo>>,
+}
+
+/// A disk's line of a [`ScriptedDisks`] file.
+struct ScriptedDisk {
+    spun_up: bool,
+    requests: Option<u64>,
+}
+
+impl ScriptedDisks {
+    /// What the file says of each disk, by its index in `ids`; records the
+    /// look at `now` in the file's record with `suffix`.
+    fn look(&self, now: Timestamp, suffix: &str) -> Vec<Option<ScriptedDisk>> {
+        let text = std::fs::read_to_string(&self.path)
+            .unwrap_or_else(|e| panic!("{DISK_STATE}: cannot read {}: {e}", self.path.display()));
+        let mut disks: Vec<Option<ScriptedDisk>> = self.ids.iter().map(|_| None).collect();
+        for line in text.lines() {
+            let (id, spun_up, requests) = match line.split_whitespace().collect::<Vec<_>>()[..] {
+                [] => continue,
+                [id, state] => (id, state, None),
+                [id, state, requests] => match requests.parse() {
+                    Ok(requests) => (id, state, Some(requests)),
+                    Err(_) => (line, "", None),
+                },
+                _ => (line, "", None),
+            };
+            let spun_up = match spun_up {
+                "spun_up" => true,
+                "asleep" => false,
+                _ => panic!("{DISK_STATE}: `{line}` is not `<id> spun_up|asleep [<requests>]`"),
+            };
+            if let Some(i) = self.ids.iter().position(|known| known == Path::new(id)) {
+                disks[i] = Some(ScriptedDisk { spun_up, requests });
+            }
+        }
+        // Once the state is read, so that a test that sees the look can
+        // change the state for the next one.
+        self.record(now, suffix);
+        disks
+    }
+
+    /// Appends `now` to the record next to the file with `suffix`.
+    fn record(&self, now: Timestamp, suffix: &str) {
+        let mut record = self.path.as_os_str().to_owned();
+        record.push(suffix);
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&record)
+            .and_then(|mut file| io::Write::write_all(&mut file, format!("{now}\n").as_bytes()))
+            .unwrap_or_else(|e| panic!("{DISK_STATE}: cannot record to {}: {e}", record.display()));
+    }
+}
+
+impl DiskState for ScriptedDisks {
+    fn asleep(&self, now: Timestamp) -> Vec<PathBuf> {
+        let disks = self.look(now, ".looks");
+        self.ids
+            .iter()
+            .zip(disks)
+            .filter(|(_, disk)| !disk.as_ref().is_some_and(|disk| disk.spun_up))
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
+    fn asleep_but_for_own_io(&self, now: Timestamp) -> Vec<PathBuf> {
+        let disks = self.look(now, ".looks");
+        let mut own_io = self.own_io.borrow_mut();
+        let mut asleep = Vec::new();
+        for ((id, disk), own_io) in self.ids.iter().zip(disks).zip(own_io.iter_mut()) {
+            let spun_up_by_others = disk.is_some_and(|disk| {
+                let others = match disk.requests {
+                    Some(requests) => own_io.look(Counters {
+                        requests,
+                        in_flight: 0,
+                    }),
+                    None => true,
+                };
+                disk.spun_up && others
+            });
+            if !spun_up_by_others {
+                asleep.push(id.clone());
+            }
+        }
+        asleep
+    }
+
+    fn own_io(&self, now: Timestamp) {
+        for own_io in self.own_io.borrow_mut().iter_mut() {
+            own_io.did_io();
+        }
+        self.record(now, ".own_io");
+    }
+
+    fn own_io_settled(&self, now: Timestamp) {
+        let disks = self.look(now, ".settles");
+        for (disk, own_io) in disks.iter().zip(self.own_io.borrow_mut().iter_mut()) {
+            if let Some(requests) = disk.as_ref().and_then(|disk| disk.requests) {
+                own_io.look(Counters {
+                    requests,
+                    in_flight: 0,
+                });
+            }
+        }
+    }
+}
+
+/// The state of `disks`: [`ScriptedDisks`] if `CACHY_DISK_STATE` is set,
+/// else that of the real disks.
+pub fn disk_state(disks: &[BackingDisk]) -> Result<Box<dyn DiskState>> {
+    Ok(match std::env::var_os(DISK_STATE) {
+        Some(path) => Box::new(ScriptedDisks {
+            path: PathBuf::from(path),
+            ids: disks.iter().map(|disk| disk.id.clone()).collect(),
+            own_io: RefCell::new(disks.iter().map(|_| OwnIo::default()).collect()),
+        }),
+        None => Box::new(SystemDisks::open(disks)?),
+    })
+}
+
+/// The directory set by `CACHY_SYSTEMD_DIR`, if any.
+pub fn systemd_dir() -> Option<PathBuf> {
+    std::env::var_os(SYSTEMD_DIR).map(PathBuf::from)
+}
 
 /// The retire wait set by `CACHY_RETIRE_WAIT_MS`, if any.
 pub fn retire_wait() -> Option<Duration> {

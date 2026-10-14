@@ -38,13 +38,14 @@
 //! `cachy.timer` in `<dir>` rather than in `/etc/systemd/system`.
 //!
 //! `CACHY_DISK_STATE=<file>` gives the daemon [`ScriptedDisks`] instead of
-//! the real backing disks: each line of the file is a disk's ID and `awake`
-//! or `asleep`, such as `/dev/disk/by-id/ata-DISK1 awake`, read anew whenever
+//! the real backing disks: each line of the file is a disk's ID and `spun_up`
+//! or `asleep`, such as `/dev/disk/by-id/ata-DISK1 spun_up`, read anew whenever
 //! the daemon looks. A disk that the file does not list is asleep. A third
 //! field, the number of requests that the disk completed, such as
-//! `/dev/disk/by-id/ata-DISK1 awake 100`, gives it I/O counters, by which
+//! `/dev/disk/by-id/ata-DISK1 spun_up 100`, gives it I/O counters, by which
 //! cachy tells its own I/O from others'; a disk without them does only I/O
-//! of others. Each look appends the daemon's time to `<file>.looks`.
+//! of others. Each look appends the daemon's time to `<file>.looks`, and
+//! each time cachy's own I/O settles, to `<file>.settles`.
 
 use std::cell::RefCell;
 use std::ffi::{OsStr, OsString};
@@ -127,19 +128,19 @@ pub struct ScriptedDisks {
 
 /// A disk's line of a [`ScriptedDisks`] file.
 struct ScriptedDisk {
-    awake: bool,
+    spun_up: bool,
     requests: Option<u64>,
 }
 
 impl ScriptedDisks {
     /// What the file says of each disk, by its index in `ids`; records the
-    /// look at `now`.
-    fn look(&self, now: Timestamp) -> Vec<Option<ScriptedDisk>> {
+    /// look at `now` in the file's record with `suffix`.
+    fn look(&self, now: Timestamp, suffix: &str) -> Vec<Option<ScriptedDisk>> {
         let text = std::fs::read_to_string(&self.path)
             .unwrap_or_else(|e| panic!("{DISK_STATE}: cannot read {}: {e}", self.path.display()));
         let mut disks: Vec<Option<ScriptedDisk>> = self.ids.iter().map(|_| None).collect();
         for line in text.lines() {
-            let (id, awake, requests) = match line.split_whitespace().collect::<Vec<_>>()[..] {
+            let (id, spun_up, requests) = match line.split_whitespace().collect::<Vec<_>>()[..] {
                 [] => continue,
                 [id, state] => (id, state, None),
                 [id, state, requests] => match requests.parse() {
@@ -148,19 +149,19 @@ impl ScriptedDisks {
                 },
                 _ => (line, "", None),
             };
-            let awake = match awake {
-                "awake" => true,
+            let spun_up = match spun_up {
+                "spun_up" => true,
                 "asleep" => false,
-                _ => panic!("{DISK_STATE}: `{line}` is not `<id> awake|asleep [<requests>]`"),
+                _ => panic!("{DISK_STATE}: `{line}` is not `<id> spun_up|asleep [<requests>]`"),
             };
             if let Some(i) = self.ids.iter().position(|known| known == Path::new(id)) {
-                disks[i] = Some(ScriptedDisk { awake, requests });
+                disks[i] = Some(ScriptedDisk { spun_up, requests });
             }
         }
         // Once the state is read, so that a test that sees the look can
         // change the state for the next one.
         let mut looks = self.path.as_os_str().to_owned();
-        looks.push(".looks");
+        looks.push(suffix);
         std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -173,21 +174,21 @@ impl ScriptedDisks {
 
 impl DiskState for ScriptedDisks {
     fn asleep(&self, now: Timestamp) -> Vec<PathBuf> {
-        let disks = self.look(now);
+        let disks = self.look(now, ".looks");
         self.ids
             .iter()
             .zip(disks)
-            .filter(|(_, disk)| !disk.as_ref().is_some_and(|disk| disk.awake))
+            .filter(|(_, disk)| !disk.as_ref().is_some_and(|disk| disk.spun_up))
             .map(|(id, _)| id.clone())
             .collect()
     }
 
     fn asleep_but_for_own_io(&self, now: Timestamp) -> Vec<PathBuf> {
-        let disks = self.look(now);
+        let disks = self.look(now, ".looks");
         let mut own_io = self.own_io.borrow_mut();
         let mut asleep = Vec::new();
         for ((id, disk), own_io) in self.ids.iter().zip(disks).zip(own_io.iter_mut()) {
-            let awake = disk.is_some_and(|disk| {
+            let spun_up_by_others = disk.is_some_and(|disk| {
                 let others = match disk.requests {
                     Some(requests) => own_io.look(Counters {
                         requests,
@@ -195,9 +196,9 @@ impl DiskState for ScriptedDisks {
                     }),
                     None => true,
                 };
-                disk.awake && others
+                disk.spun_up && others
             });
-            if !awake {
+            if !spun_up_by_others {
                 asleep.push(id.clone());
             }
         }
@@ -207,6 +208,18 @@ impl DiskState for ScriptedDisks {
     fn own_io(&self) {
         for own_io in self.own_io.borrow_mut().iter_mut() {
             own_io.did_io();
+        }
+    }
+
+    fn own_io_settled(&self, now: Timestamp) {
+        let disks = self.look(now, ".settles");
+        for (disk, own_io) in disks.iter().zip(self.own_io.borrow_mut().iter_mut()) {
+            if let Some(requests) = disk.as_ref().and_then(|disk| disk.requests) {
+                own_io.look(Counters {
+                    requests,
+                    in_flight: 0,
+                });
+            }
         }
     }
 }

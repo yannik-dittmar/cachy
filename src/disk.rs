@@ -13,7 +13,8 @@
 //! The wake trigger asks a different question: whether the backing disks are
 //! awake on others' account. A disk that only cachy's own I/O keeps spun up
 //! is not, so that the trigger cannot keep itself firing; the disk's I/O
-//! counters tell when others use it again ([`OwnIo`]).
+//! counters tell when others use it again, once cachy's own I/O has settled
+//! ([`OwnIo`]).
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
@@ -39,6 +40,11 @@ pub trait DiskState {
     /// Tells that cachy did I/O on the backing disks until now: until they
     /// do I/O of others, it is no sign that they are in use.
     fn own_io(&self);
+
+    /// Tells that cachy's own I/O has reached the backing disks by `now`, so
+    /// that their I/O from here on is others'. Until then, or until the next
+    /// look if that comes first, all of it counts as cachy's.
+    fn own_io_settled(&self, now: Timestamp);
 }
 
 /// The real backing disks.
@@ -54,7 +60,7 @@ struct Disk {
     stat: PathBuf,
     /// Whether its power mode can be read; once it cannot, the I/O counters
     /// tell instead.
-    power_mode: RefCell<bool>,
+    power_mode_readable: RefCell<bool>,
     activity: RefCell<IoActivity>,
     own_io: RefCell<OwnIo>,
 }
@@ -108,16 +114,20 @@ impl Disk {
             id: disk.id.clone(),
             dev: Path::new("/dev").join(name),
             stat: node.join("stat"),
-            power_mode: RefCell::new(true),
-            activity: RefCell::new(IoActivity::new(disk.spindown_timeout.unwrap_or_default())),
+            power_mode_readable: RefCell::new(true),
+            activity: RefCell::new(IoActivity::new(disk.spindown_timeout)),
             own_io: RefCell::new(OwnIo::default()),
         })
     }
 
-    fn look(&self, now: Timestamp) -> Look {
-        let counters = std::fs::read_to_string(&self.stat)
+    fn counters(&self) -> Option<Counters> {
+        std::fs::read_to_string(&self.stat)
             .ok()
-            .and_then(|text| Counters::parse(&text));
+            .and_then(|text| Counters::parse(&text))
+    }
+
+    fn look(&self, now: Timestamp) -> Look {
+        let counters = self.counters();
         let others = {
             let mut own_io = self.own_io.borrow_mut();
             match counters {
@@ -132,7 +142,7 @@ impl Disk {
     }
 
     fn spun_up(&self, counters: Option<Counters>, now: Timestamp) -> bool {
-        if *self.power_mode.borrow() {
+        if *self.power_mode_readable.borrow() {
             match ata::check_power_mode(&self.dev) {
                 Answer::PowerMode(PowerMode::SpunUp(_)) => return true,
                 Answer::PowerMode(PowerMode::Standby) => return false,
@@ -143,12 +153,12 @@ impl Disk {
                         "cannot read the power mode of backing disk {} ({why}); judging by its I/O and spindown timeout instead",
                         self.id.display()
                     );
-                    *self.power_mode.borrow_mut() = false;
+                    *self.power_mode_readable.borrow_mut() = false;
                 }
             }
         }
         match counters {
-            Some(counters) => self.activity.borrow_mut().awake(counters, now),
+            Some(counters) => self.activity.borrow_mut().spun_up(counters, now),
             None => {
                 log::warning!(
                     "cannot read the I/O counters of backing disk {} in {}",
@@ -186,6 +196,14 @@ impl DiskState for SystemDisks {
             disk.own_io.borrow_mut().did_io();
         }
     }
+
+    fn own_io_settled(&self, _now: Timestamp) {
+        for disk in &self.disks {
+            if let Some(counters) = disk.counters() {
+                disk.own_io.borrow_mut().look(counters);
+            }
+        }
+    }
 }
 
 /// A disk's I/O counters, from `/sys/block/<disk>/stat`.
@@ -217,15 +235,11 @@ impl Counters {
     }
 }
 
-/// I/O since the previous look within this long counts as recent, whatever
-/// the spindown timeout.
-const RECENT: Duration = Duration::from_secs(60);
-
 /// When a disk last did I/O, as far as its counters tell, and so whether it
-/// is spun up: it is if it did I/O recently, or more recently than its
-/// spindown timeout.
+/// is spun up: it is if it did I/O since the previous look, or more recently
+/// than its spindown timeout.
 pub struct IoActivity {
-    spindown_timeout: Duration,
+    spindown_timeout: Option<Duration>,
     /// The counters at the previous look, and when that was.
     previous: Option<(Counters, Timestamp)>,
     /// The earliest that the last I/O can have been.
@@ -233,7 +247,7 @@ pub struct IoActivity {
 }
 
 impl IoActivity {
-    pub fn new(spindown_timeout: Duration) -> IoActivity {
+    pub fn new(spindown_timeout: Option<Duration>) -> IoActivity {
         IoActivity {
             spindown_timeout,
             previous: None,
@@ -242,30 +256,46 @@ impl IoActivity {
     }
 
     /// Whether the disk is spun up at `now`, when its counters are
-    /// `counters`. Until the counters have been seen twice, only I/O in
-    /// flight tells.
-    pub fn awake(&mut self, counters: Counters, now: Timestamp) -> bool {
+    /// `counters`.
+    ///
+    /// I/O since the previous look means that it is, unless that look is
+    /// longer ago than the spindown timeout: then the I/O may be too. Without
+    /// I/O since, it is spun up only within the spindown timeout of the last
+    /// I/O, and never without a spindown timeout.
+    ///
+    /// The first look has no previous one to compare the counters with, so
+    /// only I/O in flight tells: taking an idle disk for spun up could make
+    /// cachy wake it, which is what the wake gate is there to avoid, while
+    /// taking it for asleep costs only the time until the next look.
+    pub fn spun_up(&mut self, counters: Counters, now: Timestamp) -> bool {
+        let mut io_since_previous = false;
         if let Some((previous, then)) = self.previous
             && previous.requests != counters.requests
         {
             // Somewhere between then and now; then, to be safe.
             self.last_io = Some(then);
+            io_since_previous = true;
         }
         if counters.in_flight > 0 {
             self.last_io = Some(now);
         }
         self.previous = Some((counters, now));
-        let window = self.spindown_timeout.max(RECENT);
-        self.last_io.is_some_and(|last_io| {
-            Duration::try_from(now.duration_since(last_io)).is_ok_and(|since| since < window)
-        })
+        let within_timeout = |last_io: Timestamp| {
+            self.spindown_timeout.is_some_and(|timeout| {
+                Duration::try_from(now.duration_since(last_io)).is_ok_and(|since| since < timeout)
+            })
+        };
+        counters.in_flight > 0
+            || (io_since_previous && self.spindown_timeout.is_none())
+            || self.last_io.is_some_and(within_timeout)
     }
 }
 
 /// Whether a disk's I/O since cachy's own is others', as far as its I/O
 /// counters tell. cachy's I/O can reach the disk after cachy is done with
 /// it, such as when a filesystem writes its journal back, so the counters'
-/// changes up to the first look after it count as cachy's too.
+/// changes up to the first look after it, such as one once it has settled,
+/// count as cachy's too.
 #[derive(Default)]
 pub struct OwnIo {
     settled: Option<Settled>,
@@ -347,12 +377,34 @@ mod tests {
     }
 
     #[test]
-    fn io_since_a_recent_look_means_spun_up() {
-        let mut disk = IoActivity::new(Duration::ZERO);
-        assert!(!disk.awake(requests(10), at(0)), "nothing known yet");
-        assert!(disk.awake(requests(12), at(0) + Duration::from_secs(30)));
-        // No I/O since: no longer recent.
-        assert!(!disk.awake(requests(12), at(2)));
+    fn without_a_spindown_timeout_io_since_the_previous_look_means_spun_up() {
+        let mut disk = IoActivity::new(None);
+        disk.spun_up(requests(10), at(0));
+        // Looks five minutes apart, as the wake trigger's.
+        assert!(disk.spun_up(requests(12), at(5)));
+        assert!(!disk.spun_up(requests(12), at(10)));
+        assert!(disk.spun_up(requests(13), at(15)));
+    }
+
+    #[test]
+    fn the_first_look_tells_only_by_io_in_flight() {
+        assert!(!IoActivity::new(None).spun_up(requests(10), at(0)));
+        let busy = Counters {
+            requests: 10,
+            in_flight: 1,
+        };
+        assert!(IoActivity::new(None).spun_up(busy, at(0)));
+    }
+
+    #[test]
+    fn with_a_spindown_timeout_io_since_a_look_within_it_means_spun_up() {
+        let mut disk = IoActivity::new(Some(Duration::from_secs(20 * 60)));
+        disk.spun_up(requests(10), at(0));
+        assert!(disk.spun_up(requests(11), at(5)));
+        assert!(disk.spun_up(requests(11), at(10)));
+        // The I/O was between minutes 0 and 5: by minute 20, it may have
+        // spun down.
+        assert!(!disk.spun_up(requests(11), at(20)));
     }
 
     #[test]
@@ -392,32 +444,32 @@ mod tests {
 
     #[test]
     fn io_in_flight_means_spun_up() {
-        let mut disk = IoActivity::new(Duration::ZERO);
+        let mut disk = IoActivity::new(None);
         let busy = Counters {
             requests: 10,
             in_flight: 1,
         };
-        assert!(disk.awake(busy, at(0)));
+        assert!(disk.spun_up(busy, at(0)));
     }
 
     #[test]
     fn a_disk_is_spun_up_until_its_spindown_timeout_after_its_last_io() {
-        let mut disk = IoActivity::new(Duration::from_secs(20 * 60));
-        disk.awake(requests(10), at(0));
-        assert!(disk.awake(requests(11), at(1)));
-        assert!(disk.awake(requests(11), at(15)));
+        let mut disk = IoActivity::new(Some(Duration::from_secs(20 * 60)));
+        disk.spun_up(requests(10), at(0));
+        assert!(disk.spun_up(requests(11), at(1)));
+        assert!(disk.spun_up(requests(11), at(15)));
         // The I/O was between minutes 0 and 1: by minute 20, it may have spun
         // down.
-        assert!(!disk.awake(requests(11), at(20)));
+        assert!(!disk.spun_up(requests(11), at(20)));
     }
 
     #[test]
     fn io_at_an_unknown_time_long_ago_does_not_mean_spun_up() {
-        let mut disk = IoActivity::new(Duration::from_secs(20 * 60));
-        disk.awake(requests(10), at(0));
+        let mut disk = IoActivity::new(Some(Duration::from_secs(20 * 60)));
+        disk.spun_up(requests(10), at(0));
         // Some I/O in the last six hours: it may have spun down since.
-        assert!(!disk.awake(requests(50), at(6 * 60)));
+        assert!(!disk.spun_up(requests(50), at(6 * 60)));
         // More I/O within the last half minute.
-        assert!(disk.awake(requests(51), at(6 * 60) + Duration::from_secs(30)));
+        assert!(disk.spun_up(requests(51), at(6 * 60) + Duration::from_secs(30)));
     }
 }

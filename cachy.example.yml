@@ -171,8 +171,8 @@ keep_empty_dirs: false
 #   # for its power mode (ATA CHECK POWER MODE, which needs CAP_SYS_RAWIO and
 #   # does not wake it); where it cannot, such as behind some USB bridges, it
 #   # judges by the disk's I/O and its spindown timeout, the time it stays
-#   # spun up after its last I/O. Without a spindown timeout, only I/O within
-#   # the last minute counts.
+#   # spun up after its last I/O. Without a spindown timeout, only I/O since
+#   # cachy last looked counts.
 #   backing_disks:
 #     - id: /dev/disk/by-id/ata-WDC_WD80EFAX-68KNBN0_VAG00001
 #       spindown_timeout: 20m

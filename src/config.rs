@@ -65,13 +65,13 @@ pub struct Config {
     pub run_hook: Option<RunHook>,
     /// What `cachy daemon` does; `cachy run` ignores it.
     #[serde(default)]
-    pub daemon: Option<Daemon>,
+    pub daemon: Option<DaemonConfig>,
 }
 
 /// The daemon's settings.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Daemon {
+pub struct DaemonConfig {
     /// The times of the scheduled checks.
     #[serde(default, deserialize_with = "schedules")]
     pub schedules: Vec<Schedule>,
@@ -86,6 +86,30 @@ pub struct Daemon {
     /// awake.
     #[serde(default)]
     pub wake_trigger: Option<WakeTrigger>,
+}
+
+impl DaemonConfig {
+    /// Checks the setting `key`, if set, of something that watches the
+    /// backing disks (it `does` them): it needs backing disks, and its
+    /// duration `duration_key` must be above 0s.
+    fn check_disk_watcher(
+        &self,
+        key: &str,
+        does: &str,
+        duration_key: &str,
+        duration: Option<Duration>,
+    ) -> Result<()> {
+        let Some(duration) = duration else {
+            return Ok(());
+        };
+        if self.backing_disks.is_empty() {
+            bail!("daemon.{key} needs daemon.backing_disks, the disks it {does}");
+        }
+        if duration.is_zero() {
+            bail!("daemon.{key}: {duration_key} must be above 0s");
+        }
+        Ok(())
+    }
 }
 
 /// Where the stable IDs of disks are.
@@ -355,25 +379,11 @@ impl Config {
         {
             bail!("run_hook: timeout must be above 0s");
         }
-        if let Some(daemon) = &config.daemon
-            && let Some(gate) = &daemon.wake_gate
-        {
-            if daemon.backing_disks.is_empty() {
-                bail!("daemon.wake_gate needs daemon.backing_disks, the disks it waits for");
-            }
-            if gate.time_limit.is_zero() {
-                bail!("daemon.wake_gate: time_limit must be above 0s");
-            }
-        }
-        if let Some(daemon) = &config.daemon
-            && let Some(trigger) = &daemon.wake_trigger
-        {
-            if daemon.backing_disks.is_empty() {
-                bail!("daemon.wake_trigger needs daemon.backing_disks, the disks it looks at");
-            }
-            if trigger.check_interval.is_zero() {
-                bail!("daemon.wake_trigger: check_interval must be above 0s");
-            }
+        if let Some(daemon) = &config.daemon {
+            let gate = daemon.wake_gate.as_ref().map(|gate| gate.time_limit);
+            daemon.check_disk_watcher("wake_gate", "waits for", "time_limit", gate)?;
+            let trigger = daemon.wake_trigger.as_ref().map(|t| t.check_interval);
+            daemon.check_disk_watcher("wake_trigger", "looks at", "check_interval", trigger)?;
         }
         Ok(config)
     }

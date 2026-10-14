@@ -389,13 +389,13 @@ fn a_backing_disk_that_does_not_exist_keeps_the_daemon_from_starting() {
 }
 
 /// Sets what the scripted disk state in `path` reports: each disk of
-/// [`DISKS`] is awake if it is in `awake`, else asleep.
+/// [`DISKS`] is spun up if it is in `spun_up`, else asleep.
 #[cfg(feature = "fault-injection")]
-fn set_disks(path: &std::path::Path, awake: &[&str]) {
+fn set_disks(path: &std::path::Path, spun_up: &[&str]) {
     let mut text = String::new();
     for disk in DISKS {
-        let state = if awake.contains(&disk) {
-            "awake"
+        let state = if spun_up.contains(&disk) {
+            "spun_up"
         } else {
             "asleep"
         };
@@ -583,8 +583,21 @@ fn triggered_daemon(fx: &Fixture, config: &str, disks: &std::path::Path) -> comm
 /// `disks`, as the fake records them.
 #[cfg(feature = "fault-injection")]
 fn looks(disks: &std::path::Path) -> Vec<String> {
+    records(disks, ".looks")
+}
+
+/// The times at which the daemon told the scripted disks in `disks` that
+/// its own I/O had settled, as the fake records them.
+#[cfg(feature = "fault-injection")]
+fn settles(disks: &std::path::Path) -> Vec<String> {
+    records(disks, ".settles")
+}
+
+/// The lines of the fake's record next to `disks` with `suffix`.
+#[cfg(feature = "fault-injection")]
+fn records(disks: &std::path::Path, suffix: &str) -> Vec<String> {
     let mut path = disks.as_os_str().to_owned();
-    path.push(".looks");
+    path.push(suffix);
     std::fs::read_to_string(path)
         .unwrap_or_default()
         .lines()
@@ -712,12 +725,12 @@ fn a_wake_triggered_check_above_the_threshold_with_nothing_past_the_max_age_star
 }
 
 /// Sets what the scripted disk state in `path` reports: every disk of
-/// [`DISKS`] awake, with `requests` completed.
+/// [`DISKS`] spun up, with `requests` completed.
 #[cfg(feature = "fault-injection")]
 fn set_disk_io(path: &std::path::Path, requests: u64) {
     let mut text = String::new();
     for disk in DISKS {
-        text += &format!("{disk} awake {requests}\n");
+        text += &format!("{disk} spun_up {requests}\n");
     }
     let staged = path.with_extension("new");
     std::fs::write(&staged, &text).unwrap();
@@ -767,9 +780,62 @@ fn cachys_own_io_does_not_keep_the_wake_trigger_firing() {
     assert_eq!(summaries(&summaries_path).len(), 2);
     assert_eq!(err.matches(TRIGGERED).count(), 2, "stderr:\n{err}");
     assert!(
-        err.contains("awake only by cachy's own I/O"),
+        err.contains("spun up only by cachy's own I/O"),
         "stderr:\n{err}"
     );
+}
+
+/// Waits until the daemon has told the scripted disks in `disks` `n` times
+/// that its own I/O had settled.
+#[cfg(feature = "fault-injection")]
+fn wait_for_settles(daemon: &common::Daemon, disks: &std::path::Path, n: usize) {
+    use std::time::{Duration, Instant};
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while settles(disks).len() < n {
+        assert!(
+            !daemon.exited() && Instant::now() < deadline,
+            "fewer than {n} settles of cachy's own I/O: {:?}; stderr:\n{}",
+            settles(disks),
+            daemon.stderr()
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn while_others_keep_the_backing_disks_busy_the_wake_trigger_checks_every_check_interval() {
+    let fx = Fixture::new();
+    let dir = tempfile::tempdir().unwrap();
+    let disks = dir.path().join("disks");
+    set_disk_io(&disks, 100);
+    // Each check probes the backing branch, but moves nothing.
+    let config = triggered(fx.no_work_config());
+
+    let daemon = triggered_daemon(&fx, &config, &disks);
+    wait_for_looks(&daemon, &disks, 1);
+    for (i, (settled, look)) in [
+        ("2026-01-01T01:01:00Z", "2026-01-01T01:10:00Z"),
+        ("2026-01-01T01:11:00Z", "2026-01-01T01:20:00Z"),
+        ("2026-01-01T01:21:00Z", "2026-01-01T01:30:00Z"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        // A minute after a check, cachy's own I/O has settled.
+        daemon.set_clock(settled);
+        wait_for_settles(&daemon, &disks, i + 1);
+        // Others use the disks.
+        set_disk_io(&disks, 200 + 10 * i as u64);
+        daemon.set_clock(look);
+        wait_for_looks(&daemon, &disks, i + 2);
+    }
+    daemon.wait_for_lines("nothing to do", 4);
+
+    let (status, err) = daemon.stop();
+    assert_eq!(status.code(), Some(0), "stderr:\n{err}");
+    assert_eq!(err.matches(TRIGGERED).count(), 4, "stderr:\n{err}");
 }
 
 #[cfg(feature = "fault-injection")]

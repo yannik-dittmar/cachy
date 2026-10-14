@@ -299,3 +299,256 @@ fn the_daemon_does_not_warn_while_the_timer_is_disabled() {
     let (_, err) = daemon.stop();
     assert!(!err.contains(TIMER_ENABLED), "stderr:\n{err}");
 }
+
+/// Three backing disks, by the stable IDs that the tests' scripted disk
+/// state reports on.
+const DISKS: [&str; 3] = [
+    "/dev/disk/by-id/ata-DISK1",
+    "/dev/disk/by-id/ata-DISK2",
+    "/dev/disk/by-id/ata-DISK3",
+];
+
+/// `config` with the daemon's backing disks set to [`DISKS`] and its
+/// scheduled checks gated, with a time limit of an hour.
+#[cfg(feature = "fault-injection")]
+fn gated(config: String) -> String {
+    let mut config = config + "  backing_disks:\n";
+    for disk in DISKS {
+        config += &format!("    - id: {disk}\n");
+    }
+    config + "  wake_gate:\n    time_limit: 1h\n"
+}
+
+#[test]
+fn a_backing_disk_by_an_unstable_path_is_a_config_error() {
+    let fx = Fixture::new();
+    let dir = tempfile::tempdir().unwrap();
+    let config = scheduled_config(&fx, &["0 3 * * *"], &dir.path().join("summaries"))
+        + "  backing_disks:\n    - id: /dev/sdb\n";
+
+    let err = assert_exit(&common::output(&mut fx.daemon_command(&config)).unwrap(), 1);
+
+    assert!(err.contains("invalid config"), "stderr:\n{err}");
+    assert!(
+        err.contains(
+            "backing disk `/dev/sdb` is not a stable device ID: expected a path in /dev/disk/by-id/"
+        ),
+        "stderr:\n{err}"
+    );
+}
+
+#[test]
+fn a_backing_disk_given_twice_is_a_config_error() {
+    let fx = Fixture::new();
+    let dir = tempfile::tempdir().unwrap();
+    let config = scheduled_config(&fx, &["0 3 * * *"], &dir.path().join("summaries"))
+        + &format!("  backing_disks:\n    - id: {0}\n    - id: {0}\n", DISKS[0]);
+
+    let err = assert_exit(&common::output(&mut fx.daemon_command(&config)).unwrap(), 1);
+
+    assert!(
+        err.contains(&format!("backing disk `{}` is listed twice", DISKS[0])),
+        "stderr:\n{err}"
+    );
+}
+
+#[test]
+fn a_wake_gate_without_backing_disks_is_a_config_error() {
+    let fx = Fixture::new();
+    let dir = tempfile::tempdir().unwrap();
+    let config = scheduled_config(&fx, &["0 3 * * *"], &dir.path().join("summaries"))
+        + "  wake_gate:\n    time_limit: 1h\n";
+
+    let err = assert_exit(&common::output(&mut fx.daemon_command(&config)).unwrap(), 1);
+
+    assert!(
+        err.contains("daemon.wake_gate needs daemon.backing_disks"),
+        "stderr:\n{err}"
+    );
+}
+
+/// On the real disk state, in a build without fault injection as well.
+#[test]
+fn a_backing_disk_that_does_not_exist_keeps_the_daemon_from_starting() {
+    let fx = Fixture::new();
+    let dir = tempfile::tempdir().unwrap();
+    let missing = "/dev/disk/by-id/cachy-test-no-such-disk";
+    let config = scheduled_config(&fx, &["0 3 * * *"], &dir.path().join("summaries"))
+        + &format!("  backing_disks:\n    - id: {missing}\n");
+
+    let err = assert_exit(&common::output(&mut fx.daemon_command(&config)).unwrap(), 1);
+
+    assert!(
+        err.contains(&format!("backing disk {missing}: no such disk")),
+        "stderr:\n{err}"
+    );
+    assert!(!err.contains(WAITING), "stderr:\n{err}");
+}
+
+/// Sets what the scripted disk state in `path` reports: each disk of
+/// [`DISKS`] is awake if it is in `awake`, else asleep.
+#[cfg(feature = "fault-injection")]
+fn set_disks(path: &std::path::Path, awake: &[&str]) {
+    let mut text = String::new();
+    for disk in DISKS {
+        let state = if awake.contains(&disk) {
+            "awake"
+        } else {
+            "asleep"
+        };
+        text += &format!("{disk} {state}\n");
+    }
+    let staged = path.with_extension("new");
+    std::fs::write(&staged, text).unwrap();
+    std::fs::rename(&staged, path).unwrap();
+}
+
+/// The line that the wake gate logs when it starts to hold a scheduled check.
+#[cfg(feature = "fault-injection")]
+const GATE_HOLDS: &str = "waiting for the backing disks to wake";
+
+/// Starts a daemon of `fx` under `config`, at 02:59, whose disk state is
+/// scripted in `disks`, and lets its 03:00 check reach the wake gate.
+#[cfg(feature = "fault-injection")]
+fn daemon_at_the_gate(fx: &Fixture, config: &str, disks: &std::path::Path) -> common::Daemon {
+    let env = [("CACHY_DISK_STATE", disks.to_str().unwrap())];
+    let daemon = fx.start_daemon_with(config, "2026-01-01T02:59:00Z", &env);
+    daemon.wait_for_lines(WAITING, 1);
+    daemon.set_clock("2026-01-01T03:00:00Z");
+    daemon.wait_for_lines(GATE_HOLDS, 1);
+    daemon
+}
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn a_gated_check_waits_until_every_backing_disk_is_awake() {
+    let fx = Fixture::new();
+    let dir = tempfile::tempdir().unwrap();
+    let summaries_path = dir.path().join("summaries");
+    let disks = dir.path().join("disks");
+    set_disks(&disks, &[]);
+    fx.cache_branch_file("a.txt", b"a", 1_000);
+    let config = gated(scheduled_config(&fx, &["0 3 * * *"], &summaries_path));
+
+    let daemon = daemon_at_the_gate(&fx, &config, &disks);
+    let err = daemon.stderr();
+    assert!(
+        err.contains(&format!(
+            "{GATE_HOLDS} until 2026-01-01 04:00 UTC (asleep: {})",
+            DISKS.join(", ")
+        )),
+        "stderr:\n{err}"
+    );
+    // Two disks out of three wake: the backing disks are not awake yet.
+    set_disks(&disks, &DISKS[..2]);
+    daemon.set_clock("2026-01-01T03:10:00Z");
+    daemon.wait_for_lines(&format!("still asleep: {}", DISKS[2]), 1);
+    assert!(fx.on_cache_branch("a.txt").exists());
+
+    set_disks(&disks, &DISKS);
+    daemon.set_clock("2026-01-01T03:20:00Z");
+    daemon.wait_for_lines(&format!("{WAITING} 2026-01-02 03:00"), 1);
+
+    let err = daemon.stderr();
+    assert!(
+        err.contains("the backing disks are awake"),
+        "stderr:\n{err}"
+    );
+    assert!(fx.on_backing_branch("a.txt").exists());
+    let summaries = summaries(&summaries_path);
+    assert_eq!(summaries.len(), 1, "{summaries:?}");
+    assert_eq!(summaries[0]["reason"], "schedule");
+    let (status, err) = daemon.stop();
+    assert_eq!(status.code(), Some(0), "stderr:\n{err}");
+}
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn a_gated_check_goes_on_at_the_time_limit_when_free_space_is_below_the_threshold() {
+    let fx = Fixture::new();
+    let dir = tempfile::tempdir().unwrap();
+    let summaries_path = dir.path().join("summaries");
+    let disks = dir.path().join("disks");
+    // One disk out of three asleep.
+    set_disks(&disks, &DISKS[1..]);
+    fx.cache_branch_file("a.txt", b"a", 1_000);
+    // A threshold of 1T: free space is below it.
+    let config = gated(scheduled_config(&fx, &["0 3 * * *"], &summaries_path));
+    let daemon = daemon_at_the_gate(&fx, &config, &disks);
+
+    daemon.set_clock("2026-01-01T04:00:00Z");
+    daemon.wait_for_lines(&format!("{WAITING} 2026-01-02 03:00"), 1);
+
+    let err = daemon.stderr();
+    assert!(
+        err.contains(
+            "the backing disks did not wake within the wake gate's time limit, but free space is below the threshold ("
+        ),
+        "stderr:\n{err}"
+    );
+    assert!(
+        err.contains("so the scheduled check goes on"),
+        "stderr:\n{err}"
+    );
+    assert!(fx.on_backing_branch("a.txt").exists());
+    assert_eq!(summaries(&summaries_path).len(), 1);
+    let (status, err) = daemon.stop();
+    assert_eq!(status.code(), Some(0), "stderr:\n{err}");
+}
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn a_gated_check_is_skipped_at_the_time_limit_unless_free_space_is_below_the_threshold() {
+    let fx = Fixture::new();
+    let dir = tempfile::tempdir().unwrap();
+    let summaries_path = dir.path().join("summaries");
+    let disks = dir.path().join("disks");
+    set_disks(&disks, &[]);
+    fx.cache_branch_file("a.txt", b"a", 1_000);
+    // A threshold of 0 bytes, and a max age that a.txt is past: at the time
+    // limit, only the threshold counts.
+    let config = gated(scheduled_config(&fx, &["0 3 * * *"], &summaries_path)).replace(
+        "threshold: 1T\ntarget: 2T",
+        "threshold: 0\ntarget: 1\nmax_age: 1d",
+    );
+    let daemon = daemon_at_the_gate(&fx, &config, &disks);
+
+    daemon.set_clock("2026-01-01T04:00:00Z");
+    daemon.wait_for_lines(&format!("{WAITING} 2026-01-02 03:00"), 1);
+
+    let err = daemon.stderr();
+    assert!(
+        err.contains(
+            "skipped the scheduled check: the backing disks did not wake within the wake gate's time limit, and free space"
+        ),
+        "stderr:\n{err}"
+    );
+    assert!(fx.on_cache_branch("a.txt").exists());
+    assert!(summaries(&summaries_path).is_empty());
+    let (status, err) = daemon.stop();
+    assert_eq!(status.code(), Some(0), "stderr:\n{err}");
+}
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn sigterm_at_the_wake_gate_stops_the_daemon() {
+    let fx = Fixture::new();
+    let dir = tempfile::tempdir().unwrap();
+    let disks = dir.path().join("disks");
+    set_disks(&disks, &[]);
+    let config = gated(scheduled_config(
+        &fx,
+        &["0 3 * * *"],
+        &dir.path().join("summaries"),
+    ));
+    let daemon = daemon_at_the_gate(&fx, &config, &disks);
+
+    let (status, err) = daemon.stop();
+
+    assert_eq!(status.code(), Some(0), "stderr:\n{err}");
+    assert!(err.contains("daemon stopped"), "stderr:\n{err}");
+    assert!(
+        !err.contains("the backing disks are awake"),
+        "stderr:\n{err}"
+    );
+}

@@ -1,6 +1,8 @@
+mod ata;
 mod clock;
 mod config;
 mod daemon;
+mod disk;
 mod exclude;
 #[cfg(feature = "fault-injection")]
 mod fault;
@@ -116,6 +118,19 @@ fn clock() -> Box<dyn clock::Clock> {
     fault::clock()
 }
 
+/// The state of the daemon's backing disks.
+#[cfg(not(feature = "fault-injection"))]
+fn disk_state(disks: &[config::BackingDisk]) -> anyhow::Result<Box<dyn disk::DiskState>> {
+    Ok(Box::new(disk::SystemDisks::open(disks)?))
+}
+
+/// The state of the daemon's backing disks: scripted by a test, if the
+/// environment asks for it.
+#[cfg(feature = "fault-injection")]
+fn disk_state(disks: &[config::BackingDisk]) -> anyhow::Result<Box<dyn disk::DiskState>> {
+    fault::disk_state(disks)
+}
+
 fn main() -> ExitCode {
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
@@ -162,11 +177,18 @@ fn main() -> ExitCode {
         }
         Command::Daemon { config } => {
             let served = Config::load(&config).and_then(|config| {
+                let disks = match &config.daemon {
+                    Some(daemon) if !daemon.backing_disks.is_empty() => {
+                        Some(disk_state(&daemon.backing_disks)?)
+                    }
+                    _ => None,
+                };
                 Daemon {
                     fs: &fs()?,
                     probe_fs: &probe_fs()?,
                     config: &config,
                     clock: &*clock(),
+                    disks: disks.as_deref(),
                 }
                 .serve()
             });

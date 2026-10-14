@@ -94,6 +94,12 @@ sudo systemctl enable --now cachy-daemon.service
 
 Schedules are cron expressions of five fields (minute, hour, day of month, month, day of week, with `*`, lists, ranges and steps), or nicknames such as `@hourly` and `@daily`, in the system's time zone. An invalid one is a configuration error. The daemon's checks take the instance lock like any other invocation: a scheduled check that finds a run in progress, such as a manual `cachy run`, is skipped with a warning, and a manual run during a scheduled run refuses to run. If `cachy.timer` is enabled too, the daemon warns at its start. On `SIGTERM` (`systemctl stop`), the daemon stops a run in progress as `cachy run` does and exits. Run summaries of its runs give the reason `schedule`. Its log goes to the journal: `journalctl -u cachy-daemon`.
 
+### Backing disks and the wake gate
+
+To keep a nightly check from waking the HDDs, list them in `daemon.backing_disks`, by their stable IDs in `/dev/disk/by-id/`, and set a `daemon.wake_gate`. The backing disks are awake only while every one of them is spun up. Each scheduled check then waits at the wake gate until they are, looking every 30 seconds, and goes on as soon as they are. When the gate's `time_limit` passes first, the check goes on only if the cache branch's free space is below the `threshold`, so that cache pressure still wins over sleeping disks; otherwise it is skipped, and the log says why.
+
+cachy reads a disk's state with ATA CHECK POWER MODE, which does not wake the disk and which needs `CAP_SYS_RAWIO` (the shipped service runs as root). A disk that does not answer counts as asleep. Where the command cannot get through, such as behind a USB bridge without ATA pass-through, cachy warns once and judges that disk by its I/O counters in `/sys/block/<disk>/stat` instead: it is awake if it did I/O within the last minute, or more recently than its `spindown_timeout`, the time the disk stays spun up after its last I/O (set it to the disk's own standby timer, such as the one `hdparm -S` sets). An ID that is not in `/dev/disk/by-id/`, or listed twice, is a configuration error; one that names no disk keeps the daemon from starting.
+
 ## Configuration
 
 cachy reads one YAML file, given with `--config`; [`cachy.example.yml`](cachy.example.yml) explains every key, with examples. Byte sizes take a `K`, `M`, `G` or `T` suffix (binary: `1G` is 1024³ bytes), and durations an `s`, `m`, `h` or `d` suffix. Unknown keys are refused.
@@ -116,7 +122,7 @@ cachy reads one YAML file, given with `--config`; [`cachy.example.yml`](cachy.ex
 | `exclude` | `[]` | Gitignore patterns for files and directories that stay on the cache branch. |
 | `keep_empty_dirs` | `false` | Keep the cache-branch directories that a run empties, rather than remove them. |
 | `run_hook` | none | A command to execute after each run, with the run summary on stdin. Its keys: `command` (required, executed by `/bin/sh -c`), `on` (the outcomes `moved`, `nothing_moved` and `failed` that call it; default all three) and `timeout` (default `60s`). |
-| `daemon` | none | What `cachy daemon` does; `cachy run` ignores it. Its key: `schedules` (the cron expressions of the times of its checks; see [Daemon](#daemon)). |
+| `daemon` | none | What `cachy daemon` does; `cachy run` ignores it. Its keys: `schedules` (the cron expressions of the times of its checks; see [Daemon](#daemon)), `backing_disks` (the disks under the backing pool, each with an `id` in `/dev/disk/by-id/` and an optional `spindown_timeout`) and `wake_gate` (with a `time_limit`, it holds each scheduled check until the backing disks are awake; needs `backing_disks`; see [Backing disks and the wake gate](#backing-disks-and-the-wake-gate)). |
 
 ### Cache pool requirements
 
@@ -140,7 +146,7 @@ Run cachy as root, as the shipped service does. The in-use guard takes kernel fi
 
 A failing run hook never changes the exit code.
 
-`cachy daemon` exits with `0` once it is stopped, even during a run, and with `1` if it refuses to start, such as on an invalid configuration or one without `daemon.schedules`. Its checks do not end it: a refused or failed one is logged, and the daemon goes on to the next.
+`cachy daemon` exits with `0` once it is stopped, even during a run, and with `1` if it refuses to start, such as on an invalid configuration, one without `daemon.schedules`, or a backing disk that is not there. Its checks do not end it: a refused or failed one is logged, and the daemon goes on to the next.
 
 ## Testing
 

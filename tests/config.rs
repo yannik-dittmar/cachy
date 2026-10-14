@@ -242,6 +242,9 @@ fn example_config_with_its_optional_settings_is_valid() {
         "\n  timeout: 60s\n",
         "\ndaemon:\n",
         "\n    - '0 3 * * *'\n",
+        "\n  backing_disks:\n",
+        "\n      spindown_timeout: 20m\n",
+        "\n    time_limit: 6h\n",
     ] {
         assert!(example.contains(setting), "not uncommented: {setting:?}");
     }

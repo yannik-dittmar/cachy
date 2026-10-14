@@ -165,3 +165,21 @@ keep_empty_dirs: false
 #     - '*/15 8-22 * * *'
 #     # and once at night.
 #     - '0 3 * * *'
+#   # The disks under the backing pool, by their stable IDs in
+#   # /dev/disk/by-id/ (a partition stands for its disk). The backing disks
+#   # are awake only while every one of them is spun up. cachy asks each disk
+#   # for its power mode (ATA CHECK POWER MODE, which needs CAP_SYS_RAWIO and
+#   # does not wake it); where it cannot, such as behind some USB bridges, it
+#   # judges by the disk's I/O and its spindown timeout, the time it stays
+#   # spun up after its last I/O. Without a spindown timeout, only I/O within
+#   # the last minute counts.
+#   backing_disks:
+#     - id: /dev/disk/by-id/ata-WDC_WD80EFAX-68KNBN0_VAG00001
+#       spindown_timeout: 20m
+#     - id: /dev/disk/by-id/ata-WDC_WD80EFAX-68KNBN0_VAG00002
+#   # Holds each scheduled check until the backing disks are awake, so that
+#   # the check does not wake them. After the time limit, the check goes on
+#   # only if free space is below the threshold, and is skipped otherwise.
+#   # Needs backing_disks.
+#   wake_gate:
+#     time_limit: 6h

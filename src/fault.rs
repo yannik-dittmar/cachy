@@ -36,6 +36,11 @@
 //! daemon looks at the clock, so that a test moves time on by rewriting the
 //! file. `CACHY_SYSTEMD_DIR=<dir>` makes the daemon look for an enabled
 //! `cachy.timer` in `<dir>` rather than in `/etc/systemd/system`.
+//!
+//! `CACHY_DISK_STATE=<file>` gives the daemon [`ScriptedDisks`] instead of
+//! the real backing disks: each line of the file is a disk's ID and `awake`
+//! or `asleep`, such as `/dev/disk/by-id/ata-DISK1 awake`, read anew whenever
+//! the daemon looks. A disk that the file does not list is asleep.
 
 use std::ffi::{OsStr, OsString};
 use std::io;
@@ -53,6 +58,8 @@ use jiff::tz::TimeZone;
 use jiff::{Timestamp, Zoned};
 
 use crate::clock::{self, Clock, SystemClock};
+use crate::config::BackingDisk;
+use crate::disk::{DiskState, SystemDisks};
 use crate::fsops::{FsOps, FsStat, Lease, RealFs, Stat};
 
 const FAULT: &str = "CACHY_FAULT";
@@ -64,6 +71,7 @@ const FREED_WAIT: &str = "CACHY_FREED_WAIT_MS";
 const WRITE_DELAY: &str = "CACHY_WRITE_DELAY_MS";
 const CLOCK: &str = "CACHY_CLOCK";
 const SYSTEMD_DIR: &str = "CACHY_SYSTEMD_DIR";
+const DISK_STATE: &str = "CACHY_DISK_STATE";
 
 /// How often a [`ManualClock`] that is waiting reads its file.
 const MANUAL_CLOCK_POLL: Duration = Duration::from_millis(5);
@@ -102,6 +110,46 @@ pub fn clock() -> Box<dyn Clock> {
         }),
         None => Box::new(SystemClock),
     }
+}
+
+/// Backing disks whose state a file holds; see the module docs.
+pub struct ScriptedDisks {
+    path: PathBuf,
+    ids: Vec<PathBuf>,
+}
+
+impl DiskState for ScriptedDisks {
+    fn asleep(&self, _now: Timestamp) -> Vec<PathBuf> {
+        let text = std::fs::read_to_string(&self.path)
+            .unwrap_or_else(|e| panic!("{DISK_STATE}: cannot read {}: {e}", self.path.display()));
+        let awake: Vec<&str> = text
+            .lines()
+            .filter_map(
+                |line| match line.split_whitespace().collect::<Vec<_>>()[..] {
+                    [id, "awake"] => Some(id),
+                    [_, "asleep"] | [] => None,
+                    _ => panic!("{DISK_STATE}: `{line}` is not `<id> awake|asleep`"),
+                },
+            )
+            .collect();
+        self.ids
+            .iter()
+            .filter(|id| !awake.iter().any(|awake| Path::new(awake) == *id))
+            .cloned()
+            .collect()
+    }
+}
+
+/// The state of `disks`: [`ScriptedDisks`] if `CACHY_DISK_STATE` is set,
+/// else that of the real disks.
+pub fn disk_state(disks: &[BackingDisk]) -> Result<Box<dyn DiskState>> {
+    Ok(match std::env::var_os(DISK_STATE) {
+        Some(path) => Box::new(ScriptedDisks {
+            path: PathBuf::from(path),
+            ids: disks.iter().map(|disk| disk.id.clone()).collect(),
+        }),
+        None => Box::new(SystemDisks::open(disks)?),
+    })
 }
 
 /// The directory set by `CACHY_SYSTEMD_DIR`, if any.

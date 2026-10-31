@@ -35,6 +35,8 @@ pub struct Config {
     /// [`Order::Atime`] if unset.
     #[serde(default)]
     pub order: Option<Order>,
+    #[serde(default)]
+    pub placement: PlacementPolicy,
     #[serde(default = "default_minimum_age", deserialize_with = "duration")]
     pub minimum_age: Duration,
     /// Move units unchanged for longer than this count as work for any check,
@@ -288,6 +290,21 @@ impl std::fmt::Display for OpenFileGuard {
             OpenFileGuard::Off => "off",
         })
     }
+}
+
+/// Which of the backing branches with room for a move unit it moves to.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PlacementPolicy {
+    /// A branch that has the move unit's parent directory, if one has room;
+    /// otherwise any branch.
+    #[default]
+    PreferParent,
+    /// Only the branches that have the deepest of the move unit's directories
+    /// that any branch taking new files has, so that everything below a
+    /// directory stays on that directory's branch. A move unit that none of
+    /// them has room for stays on the cache branch.
+    ExistingPath,
 }
 
 /// The kernel lease cachy holds on a move unit while moving it, which decides

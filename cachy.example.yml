@@ -47,6 +47,19 @@ backing_branches:
 threshold: 100G
 target: 200G
 
+# Which backing branch a move goes to, of those with room for it:
+#   prefer_parent - one that already has the file's directory, if one has
+#                   room; otherwise any (default)
+#   existing_path - only those that have the deepest of the file's
+#                   directories that any branch taking new files has, so that
+#                   a directory and everything below it stay on one branch, as
+#                   a share stays on its disk under mergerfs's path-preserving
+#                   create policies; a file that none of them has room for
+#                   stays on the cache branch
+# Among the candidates, the one with the most free space wins. Default:
+# prefer_parent.
+placement: prefer_parent
+
 # Which files a run moves first:
 #   atime - least recently accessed first (default)
 #   mtime - least recently modified first

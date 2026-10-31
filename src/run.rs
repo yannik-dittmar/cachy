@@ -274,7 +274,7 @@ pub fn run(
         past_max_age,
         budget,
     };
-    let mut placement = Placement::new(&backing_branches);
+    let mut placement = Placement::new(&backing_branches, config.placement);
     if options.dry_run {
         outcome.failed = dry_run(
             fs,

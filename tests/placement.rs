@@ -1,9 +1,10 @@
 //! Placement across several backing branches: a move unit goes to a branch
 //! that takes new files (not `RO` or `NC`), keeps its `minfreespace` free and
 //! has room for the whole unit. Among those, a branch that already has the
-//! unit's parent directory wins, then the one with the most free space.
-//! Moves run one at a time per branch, and on different branches in
-//! parallel.
+//! unit's parent directory wins, then the one with the most free space; with
+//! `placement: existing_path`, only the branches with the deepest existing
+//! directory of the unit's path qualify. Moves run one at a time per branch,
+//! and on different branches in parallel.
 
 mod common;
 
@@ -197,6 +198,64 @@ fn move_unit_lands_on_its_parents_branch_if_it_has_room_and_on_the_most_free_oth
     assert!(large.path().join("too-big/b.bin").exists());
     assert!(large.path().join("nowhere/c.bin").exists());
     assert!(!small.path().join("nowhere").exists());
+}
+
+#[test]
+fn existing_path_puts_a_new_directory_on_the_branch_of_its_deepest_existing_directory() {
+    let fx = Fixture::new();
+    let other = fx.extra_backing_branch();
+    fs::create_dir_all(other.path().join("media/tv")).unwrap();
+    fs::create_dir_all(fx.on_backing_branch("media")).unwrap();
+    fx.cache_branch_file("media/tv/new-show/e1.mkv", b"e1", 1_000);
+    fx.cache_branch_file("media/movies/m.mkv", b"m", 1_001);
+    let config = fx.layout_config(&layout(&[
+        spec(fx.backing_branch.path(), ""),
+        spec(other.path(), ""),
+    ])) + "placement: existing_path\n";
+
+    assert_exit(&fx.run(&config), 0);
+
+    assert!(other.path().join("media/tv/new-show/e1.mkv").exists());
+    assert!(fx.on_backing_branch("media/movies/m.mkv").exists());
+    assert!(!fx.on_backing_branch("media/tv").exists());
+}
+
+#[test]
+fn existing_path_leaves_a_move_unit_on_the_cache_branch_if_its_directorys_branch_has_no_room() {
+    let fx = Fixture::new();
+    let full = fx.extra_backing_branch();
+    fs::create_dir_all(full.path().join("media")).unwrap();
+    fx.cache_branch_file("media/show/e1.mkv", b"e1", 1_000);
+    let config = fx.layout_config(&layout(&[
+        spec(full.path(), "=RW,1000T"),
+        spec(fx.backing_branch.path(), ""),
+    ])) + "placement: existing_path\n";
+
+    let err = assert_exit(&fx.run(&config), 0);
+
+    assert!(
+        err.contains("skipped media/show/e1.mkv: no backing branch has room"),
+        "stderr:\n{err}"
+    );
+    assert!(fx.on_cache_branch("media/show/e1.mkv").exists());
+    assert!(Fixture::tree(fx.backing_branch.path()).is_empty());
+}
+
+#[test]
+fn existing_path_ignores_directories_on_branches_that_take_no_new_files() {
+    let fx = Fixture::new();
+    let no_create = fx.extra_backing_branch();
+    fs::create_dir_all(no_create.path().join("media/show")).unwrap();
+    fx.cache_branch_file("media/show/e1.mkv", b"e1", 1_000);
+    let config = fx.layout_config(&layout(&[
+        spec(no_create.path(), "=NC"),
+        spec(fx.backing_branch.path(), ""),
+    ])) + "placement: existing_path\n";
+
+    assert_exit(&fx.run(&config), 0);
+
+    assert!(fx.on_backing_branch("media/show/e1.mkv").exists());
+    assert_eq!(Fixture::tree(no_create.path()), ["media", "media/show"]);
 }
 
 #[test]

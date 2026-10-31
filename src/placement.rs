@@ -9,6 +9,14 @@
 //! placed move units in count as existing, so a directory that a run creates
 //! keeps its files together.
 //!
+//! With `placement: existing_path`, only the eligible branches that have the
+//! deepest of the move unit's directories that any branch taking new files
+//! has are candidates: a file in a directory that no branch has yet follows
+//! the nearest directory above it that one has, and a move unit that none of
+//! those branches has room for is not placed. A directory and everything
+//! below it so stay on one branch, as a share stays on its disk under a
+//! path-preserving create policy.
+//!
 //! A branch that already holds a file at one of the move unit's relpaths, a
 //! stale copy, wins if it is eligible, since the move replaces the stale copy
 //! in place; among several, the usual rules choose. The move removes the
@@ -30,12 +38,14 @@ use std::fmt;
 use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
 
+use crate::config::PlacementPolicy;
 use crate::fsops::FsStat;
 use crate::layout::BackingBranch;
 use crate::transaction::split;
 
 pub struct Placement<'a> {
     branches: &'a [BackingBranch],
+    policy: PlacementPolicy,
     /// Per branch: its free space when the run started, or `None` if it
     /// could not be measured, which keeps any move unit off it.
     start_free: Vec<Option<u64>>,
@@ -73,9 +83,10 @@ impl fmt::Display for Unplaced {
 impl std::error::Error for Unplaced {}
 
 impl<'a> Placement<'a> {
-    pub fn new(branches: &'a [BackingBranch]) -> Placement<'a> {
+    pub fn new(branches: &'a [BackingBranch], policy: PlacementPolicy) -> Placement<'a> {
         Placement {
             branches,
+            policy,
             start_free: branches.iter().map(free).collect(),
             placed: vec![0; branches.len()],
             dirs: HashMap::new(),
@@ -142,23 +153,53 @@ impl<'a> Placement<'a> {
         (left >= branch.minfreespace).then_some(free)
     }
 
-    /// Of the `eligible` branches, with their free space, one that has the
-    /// directory `parent` if any does, and of those the one with the most
-    /// free space.
+    /// Of the `eligible` branches, with their free space, the candidates for a
+    /// move unit in the directory `parent` under the placement policy, and of
+    /// those the one with the most free space.
     fn choose(&mut self, eligible: Vec<(usize, u64)>, parent: &Path) -> Option<usize> {
-        let with_parent: Vec<(usize, u64)> = eligible
-            .iter()
-            .copied()
-            .filter(|&(i, _)| self.has_dir(i, parent))
-            .collect();
-        let candidates = if with_parent.is_empty() {
-            eligible
-        } else {
-            with_parent
+        let candidates: Vec<(usize, u64)> = match self.policy {
+            PlacementPolicy::PreferParent => {
+                let with_parent: Vec<(usize, u64)> = eligible
+                    .iter()
+                    .copied()
+                    .filter(|&(i, _)| self.has_dir(i, parent))
+                    .collect();
+                if with_parent.is_empty() {
+                    eligible
+                } else {
+                    with_parent
+                }
+            }
+            PlacementPolicy::ExistingPath => {
+                let holders = self.deepest_holders(parent);
+                eligible
+                    .into_iter()
+                    .filter(|(i, _)| holders.contains(i))
+                    .collect()
+            }
         };
         // The most free space; of equals, the first listed.
         let (chosen, _) = candidates.into_iter().rev().max_by_key(|&(_, free)| free)?;
         Some(chosen)
+    }
+
+    /// The branches taking new files that have the deepest directory of `dir`,
+    /// itself included, that any of them has. Every one has the root.
+    fn deepest_holders(&mut self, dir: &Path) -> Vec<usize> {
+        let takers: Vec<usize> = (0..self.branches.len())
+            .filter(|&i| self.branches[i].takes_new_files())
+            .collect();
+        for ancestor in dir.ancestors() {
+            let holders: Vec<usize> = takers
+                .iter()
+                .copied()
+                .filter(|&i| self.has_dir(i, ancestor))
+                .collect();
+            if !holders.is_empty() {
+                return holders;
+            }
+        }
+        takers
     }
 
     fn has_dir(&mut self, index: usize, rel: &Path) -> bool {

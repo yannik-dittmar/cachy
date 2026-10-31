@@ -166,6 +166,17 @@ fn unknown_lease_type_is_refused() {
 }
 
 #[test]
+fn unknown_placement_is_refused() {
+    let fx = Fixture::new();
+    let config = fx.config("1G", "2G") + "placement: most_shared\n";
+
+    let err = assert_exit(&fx.run(&config), 1);
+
+    assert!(err.contains("placement"), "stderr:\n{err}");
+    assert!(err.contains("most_shared"), "stderr:\n{err}");
+}
+
+#[test]
 fn malformed_byte_size_is_refused() {
     let fx = Fixture::new();
     let config = fx.config("1.5G", "2G");
